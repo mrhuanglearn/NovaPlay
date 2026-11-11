@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Declarations mirror what the shipped manifest contains (permissions, native player activity, media
+     playback foreground service, non-exported command receiver, flutter_inappwebview / url_launcher /
+     open_file / share_plus components are contributed by their plugins' own manifests). -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+
+    <application
+        android:label="@string/app_name"
+        android:usesCleartextTraffic="true"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round">
+
+        <!-- Theme, NormalTheme meta-data and hardwareAccelerated as in the original's MainActivity (OBSERVED); without a
+             theme the platform default draws an ActionBar over the Flutter view. -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/LaunchTheme"
+            android:hardwareAccelerated="true"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:windowSoftInputMode="adjustResize">
+            <meta-data
+                android:name="io.flutter.embedding.android.NormalTheme"
+                android:resource="@style/NormalTheme" />
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".native_player.NativePlayerActivity"
+            android:exported="false"
+            android:supportsPictureInPicture="true"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden|uiMode"
+            android:theme="@style/NativePlayerTheme" />
+
+        <service
+            android:name=".native_player.media.PlaybackNotificationService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback" />
+
+        <receiver
+            android:name=".native_player.media.PlaybackCommandReceiver"
+            android:exported="false" />
+
+        <meta-data android:name="flutterEmbedding" android:value="2" />
+        <!-- Defaults to true (Flutter's own default). Build with UZV_ENABLE_IMPELLER=false for a Waydroid/ARM-translation test
+             install: Impeller's Vulkan back end crashes inside Mesa's vulkan.radeon.so there. -->
+        <meta-data android:name="io.flutter.embedding.android.EnableImpeller" android:value="${enableImpeller}" />
+    </application>
+</manifest>

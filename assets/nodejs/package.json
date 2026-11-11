@@ -1,0 +1,13 @@
+{
+  "name": "uzv-node-host",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Clean-room reimplementation of the embedded Node.js 'catpaw' host observed in uzn-android v1.1.13",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "node --test \"test/*.test.js\""
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

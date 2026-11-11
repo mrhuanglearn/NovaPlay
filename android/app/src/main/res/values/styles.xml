@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Theme applied to the Android Window while the process is starting when the OS's Dark Mode setting is off -->
+    <style name="LaunchTheme" parent="@android:style/Theme.Light.NoTitleBar">
+        <!-- Show a splash screen on the activity. Automatically removed when
+             the Flutter engine draws its first frame -->
+        <item name="android:windowBackground">@drawable/launch_background</item>
+        <!-- OBSERVED in the original's LaunchTheme/NormalTheme: draw behind a transparent status bar -->
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+    </style>
+    <!-- Theme applied to the Android Window as soon as the process has started.
+         This theme determines the color of the Android Window while your
+         Flutter UI initializes, as well as behind your Flutter UI while its
+         running.
+
+         This Theme is only used starting with V2 of Flutter's Android embedding. -->
+    <style name="NormalTheme" parent="@android:style/Theme.Light.NoTitleBar">
+        <item name="android:windowBackground">?android:colorBackground</item>
+        <!-- OBSERVED in the original's LaunchTheme/NormalTheme: draw behind a transparent status bar -->
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+    </style>
+
+    <!-- OBSERVED in the original (style/NativePlayerTheme): parent Theme.Black.NoTitleBar.Fullscreen, black window
+         background, NativePlayerWindowAnim (slides in from / out to the bottom in 300 ms) and, from API 28, display-cutout
+         mode shortEdges (values-v28). The parent here is the AppCompat equivalent because the page is an
+         AppCompatActivity. Without windowFullscreen a free-form window (Waydroid, desktop mode) left a 48 dp grey strip
+         under the video. -->
+    <style name="NativePlayerTheme" parent="Theme.AppCompat.NoActionBar">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:windowAnimationStyle">@style/NativePlayerWindowAnim</item>
+    </style>
+
+    <style name="NativePlayerWindowAnim" parent="@android:style/Animation.Activity">
+        <item name="android:activityOpenEnterAnimation">@anim/player_slide_in_bottom</item>
+        <item name="android:activityOpenExitAnimation">@anim/player_still</item>
+        <item name="android:activityCloseEnterAnimation">@anim/player_still</item>
+        <item name="android:activityCloseExitAnimation">@anim/player_slide_out_bottom</item>
+    </style>
+</resources>

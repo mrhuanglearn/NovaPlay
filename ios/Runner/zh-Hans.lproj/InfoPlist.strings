@@ -1,0 +1,4 @@
+"CFBundleDisplayName" = "星映";
+"NSLocalNetworkUsageDescription" = "星映需要访问局域网以连接您的 Emby、Jellyfin、WebDAV 或局域网弹幕/订阅服务。";
+"NSPhotoLibraryAddUsageDescription" = "星映需要写入相册权限以保存视频播放截图。";
+"NSPhotoLibraryUsageDescription" = "星映需要访问相册权限以保存视频播放截图。";

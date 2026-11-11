@@ -1,0 +1,966 @@
+{
+  "@@locale": "en",
+  "appName": "NovaPlay",
+  "tabHome": "Home",
+  "tabLive": "Live",
+  "tabCalendar": "Calendar",
+  "tabLibrary": "Library",
+  "tabSettings": "Settings",
+  "pressBackAgainToExit": "Press back again to exit",
+  "loadFailed": "Failed to load",
+  "retry": "Retry",
+  "paste": "Paste",
+  "save": "Save",
+  "cancel": "Cancel",
+  "ok": "OK",
+  "add": "Add",
+  "delete": "Delete",
+  "edit": "Edit",
+  "search": "Search",
+  "all": "All",
+  "goToSettings": "Go to settings",
+  "noData": "No data",
+  "nothingHere": "Nothing here yet",
+  "settingsGroupData": "Data",
+  "settingsGroupPreferences": "Preferences",
+  "settingsGroupTools": "Tools",
+  "settingsSubscriptions": "Subscriptions",
+  "settingsSubscriptionsSub": "Manage sources and auto-update",
+  "settingsLive": "Live",
+  "settingsLiveSub": "Live sources, global EPG and hidden categories",
+  "settingsDanmu": "Danmaku service",
+  "settingsDanmuSub": "Danmaku API address and access token",
+  "settingsMediaServer": "Media servers",
+  "settingsMediaServerSub": "Emby and Jellyfin accounts, browse libraries",
+  "settingsTmdb": "TMDB",
+  "settingsTmdbSub": "API key and scraping proxy",
+  "settingsWebdav": "WebDAV sync",
+  "settingsWebdavSub": "Sync data across devices (choose what to sync)",
+  "settingsBackup": "Backup & restore",
+  "settingsBackupSub": "Pack data as a zip backup or share it; restore from a backup",
+  "settingsPlayer": "Player",
+  "settingsPlayerSub": "Kernel, speed, subtitles and display",
+  "settingsSniffer": "Web video sniffer",
+  "settingsSnifferSub": "Find videos and streams in web pages",
+  "secondsShort": "s",
+  "saved": "Saved",
+  "serverAddress": "Server address",
+  "port": "Port",
+  "tokenOptional": "Token (optional)",
+  "testConnection": "Test connection",
+  "playerGroupPlayback": "Playback",
+  "playerKernel": "Player kernel",
+  "playerHwDecode": "Hardware acceleration",
+  "playerFit": "Picture fill",
+  "playerFitFit": "Original ratio",
+  "playerFitFill": "Stretch to fill",
+  "playerFitZoom": "Crop to fill",
+  "playerDefaultSpeed": "Default speed",
+  "playerLongPressSpeed": "Long-press speed",
+  "playerDoubleTapSeek": "Seek step (seconds)",
+  "playerMpvNote": "MPV needs libmpv.so in the APK. Without it the player page falls back to Exo and says why.",
+  "playerGroupSubtitles": "Subtitles & audio",
+  "playerSubtitleLang": "Preferred subtitle language",
+  "playerSubtitleFont": "Subtitle font",
+  "playerSubtitleFontHint": "A system font name, or a file name in the fonts folder",
+  "playerFontsDir": "Fonts folder (optional)",
+  "playerAudioLang": "Preferred audio language",
+  "playerSubtitleNote": "SRT, WebVTT, TTML and basic ASS/SSA are supported. ASS is drawn by Exo's simple parser, not libass.",
+  "playerGroupBehaviour": "Behaviour",
+  "playerPreferLandscape": "Prefer landscape",
+  "playerAutoPip": "Picture-in-picture in background",
+  "playerPauseInBackground": "Pause in background",
+  "playerSkipNotice": "Skip notice",
+  "playerEpisodeSwitchNotice": "Episode switch notice",
+  "playerHaptics": "Haptic feedback",
+  "playerGroupOverlay": "On-screen info",
+  "playerShowNetSpeed": "Always show network speed",
+  "playerShowStats": "Show frame rate and codec",
+  "playerShowTotalDuration": "Show total duration on the progress bar",
+  "playerHideSeekButtons": "Hide centre seek buttons",
+  "danmuEnable": "Enable danmaku",
+  "danmuSource": "Danmaku service source",
+  "danmuModeOff": "Off",
+  "danmuModeBuiltin": "Local",
+  "danmuModeSubscription": "Subscription",
+  "danmuModeRemote": "Remote",
+  "danmuModeOffNote": "No danmaku server is used.",
+  "danmuModeBuiltinNote": "Runs a danmu_api script you supply inside the Node runtime.",
+  "danmuModeSubscriptionNote": "Uses port 9321 of the active subscription.",
+  "danmuModeRemoteNote": "Your own danmu_api server.",
+  "danmuScriptUrl": "danmu_api script URL (server.cjs)",
+  "danmuDownloadScript": "Download / update script",
+  "danmuScriptDownloaded": "Script downloaded (md5 {md5})",
+  "@danmuScriptDownloaded": {
+    "placeholders": {
+      "md5": {
+        "type": "String"
+      }
+    }
+  },
+  "danmuNotReachable": "Not reachable or not configured",
+  "danmuReachable": "Reachable ({count} results for \"a\")",
+  "@danmuReachable": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "danmuGroupAppearance": "Appearance",
+  "danmuOpacity": "Opacity",
+  "danmuFontSize": "Font size",
+  "danmuScrollSpeed": "Scroll speed",
+  "danmuArea": "Display area",
+  "danmuDelay": "Delay",
+  "danmuTop": "Top comments",
+  "danmuBottom": "Bottom comments",
+  "danmuBlockedWords": "Blocked words",
+  "danmuBlockedWordsHint": "One per line",
+  "connectionOk": "Connection OK",
+  "advanced": "Advanced",
+  "language": "Language",
+  "password": "Password",
+  "restore": "Restore",
+  "copied": "Copied",
+  "clipboardEmpty": "Clipboard is empty",
+  "tmdbConnectionFailed": "Connection failed (check key / address)",
+  "tmdbConnectTitle": "Connect TMDB",
+  "tmdbConnectDescription": "Once connected, posters, overviews and cast are matched automatically and the calendar stays up to date",
+  "tmdbEnable": "Enable TMDB",
+  "tmdbEnableSub": "Posters, episode names and the tracking calendar",
+  "tmdbKeyHint": "TMDB API key (v3) or read access token (v4), detected automatically",
+  "tmdbApiBase": "API address (empty = official)",
+  "tmdbImageBase": "Image address (empty = official)",
+  "tmdbMatchWait": "Detail page match wait (seconds)",
+  "tmdbKeyStorageNote": "The key is stored in plain text in tmdb_settings.json and is included in WebDAV sync and backups.",
+  "webdavAccount": "Account name",
+  "webdavSubFolder": "Sub folder (optional)",
+  "webdavSubFolderHint": "Isolates data when sharing one WebDAV; leave empty to use the root",
+  "webdavSyncNow": "Sync now",
+  "webdavSyncResult": "Uploaded {pushed}, downloaded {pulled} document(s)",
+  "@webdavSyncResult": {
+    "placeholders": {
+      "pushed": {
+        "type": "int"
+      },
+      "pulled": {
+        "type": "int"
+      }
+    }
+  },
+  "webdavNote": "Favorites, history, progress, TMDB matches and key, tracking, player and live settings are synced. The password and the TMDB key are stored in plain text.",
+  "webdavNotConfigured": "Configure WebDAV first",
+  "backupGroupExport": "Export backup",
+  "backupGroupRestore": "Restore from backup",
+  "backupShareFile": "Share backup file",
+  "backupShareFileSub": "One JSON file with every synced document",
+  "backupShareText": "NovaPlay backup",
+  "backupCopy": "Copy backup to clipboard",
+  "backupRestoreClipboard": "Restore from clipboard",
+  "backupRestoreWebdav": "Restore from WebDAV",
+  "backupRestoreWebdavSub": "Takes the remote copy of every document",
+  "backupRestored": "Restored {count} document(s)",
+  "@backupRestored": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "backupSensitiveNote": "Backups may contain accounts, passwords and keys; be careful when sharing them.",
+  "name": "Name",
+  "subscriptions": "Subscriptions",
+  "subscriptionAdd": "Add subscription",
+  "subscriptionsEmptyTitle": "No subscriptions yet",
+  "subscriptionsEmptySubtitle": "Add a subscription to start aggregating your content",
+  "subscriptionDelete": "Delete subscription",
+  "subscriptionDeleteConfirm": "Delete \"{name}\"?",
+  "@subscriptionDeleteConfirm": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "subscriptionKindNetwork": "Network",
+  "subscriptionKindCloud": "Cloud",
+  "subscriptionNetworkHint": "Add a data source to aggregate content",
+  "subscriptionCloudHint": "Connect directly to a catpaw service running elsewhere, no script download",
+  "subscriptionSourceUrl": "Data source URL",
+  "subscriptionCloudAddress": "Cloud service address",
+  "subscriptionNameHint": "Leave empty to derive it from the address",
+  "subscriptionDanmuToken": "Danmaku service token (optional)",
+  "subscriptionDanmuTokenHint": "Path prefix of the subscription's own danmaku server",
+  "subscriptionLock": "Lock",
+  "subscriptionLockSub": "Locked subscriptions are visible only after the lock password is verified",
+  "subscriptionUrlRequired": "Enter the data source URL",
+  "filter": "Filter",
+  "homeCatpawUnavailable": "Cannot connect to the catpaw service",
+  "libraryHistory": "History",
+  "libraryFavorites": "Favorites",
+  "libraryDownloads": "Downloads",
+  "historyEmptySubtitle": "Nothing watched yet, go find something to watch",
+  "favoritesEmptyTitle": "No favorites yet",
+  "favoritesEmptySubtitle": "Find videos you like and favorite them",
+  "downloadsEmptyTitle": "No downloads",
+  "downloadsEmptySubtitle": "No download tasks",
+  "downloadsOtherGroup": "Other",
+  "downloadsDoneCount": "{done}/{total} done",
+  "@downloadsDoneCount": {
+    "placeholders": {
+      "done": {
+        "type": "int"
+      },
+      "total": {
+        "type": "int"
+      }
+    }
+  },
+  "downloadQueued": "Queued",
+  "downloadRunning": "Downloading",
+  "downloadPaused": "Paused",
+  "downloadDone": "Done",
+  "downloadFailed": "Failed",
+  "downloadPause": "Pause",
+  "downloadResume": "Resume",
+  "noResults": "No results",
+  "mediaSeries": "Series",
+  "mediaMovie": "Movie",
+  "tmdbNotEnabledError": "Enable TMDB and enter an API key in Settings first",
+  "tmdbSearchHint": "Search TMDB",
+  "tmdbSearchPrompt": "Type a title and press search",
+  "trackingSeason": "Season",
+  "trackingSeasonNumber": "Season number",
+  "trackingManage": "Tracking",
+  "trackingAdd": "Add series",
+  "trackingAutoSync": "Sync favorites to the calendar",
+  "trackingAutoSyncSub": "Favorited series that TMDB knows join the calendar",
+  "trackingEmpty": "Nothing tracked yet",
+  "trackingFollowed": "Following",
+  "trackingShowSubtitle": "Season {season} · watched {watched}",
+  "@trackingShowSubtitle": {
+    "placeholders": {
+      "season": {
+        "type": "int"
+      },
+      "watched": {
+        "type": "int"
+      }
+    }
+  },
+  "calendarTmdbDisabled": "TMDB is off, so the calendar cannot be updated",
+  "calendarThisWeek": "This week",
+  "calendarNothingThisWeek": "Nothing airs this week",
+  "calendarEpisode": "E{number} {name}",
+  "@calendarEpisode": {
+    "placeholders": {
+      "number": {
+        "type": "int"
+      },
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "markedWatched": "Marked watched",
+  "markedUnwatched": "Marked unwatched",
+  "liveSearchChannels": "Search channels",
+  "liveSettings": "Live settings",
+  "liveEmptyTitle": "No live sources yet",
+  "liveEmptySubtitle": "Add an M3U playlist to start watching",
+  "liveAddSource": "Add live source",
+  "liveEditSource": "Edit live source",
+  "liveNoChannels": "No channels",
+  "liveSourcesGroup": "Live sources",
+  "liveBlockedGroup": "Blocked categories",
+  "liveBlockedCategories": "Blocked categories",
+  "liveBlockedCategoriesSub": "Channels of a blocked category are hidden",
+  "liveM3uUrl": "M3U address",
+  "liveEpgUrl": "XMLTV guide address (optional)",
+  "favorite": "Favorite",
+  "notFound": "Not found",
+  "downloadStarted": "Download started",
+  "addedToCalendar": "Added to the tracking calendar",
+  "detailDirector": "Director: {name}",
+  "@detailDirector": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "detailCast": "Cast: {names}",
+  "@detailCast": {
+    "placeholders": {
+      "names": {
+        "type": "String"
+      }
+    }
+  },
+  "detailMatchTmdb": "Match TMDB",
+  "detailNoLines": "No playable lines",
+  "detailLongPressToDownload": "Long-press an episode to download it.",
+  "searchHint": "Search videos…",
+  "searchPrompt": "Type a keyword to search every site at once",
+  "userName": "User name",
+  "signIn": "Sign in",
+  "signInFailed": "Sign-in failed: {error}",
+  "@signInFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "play": "Play",
+  "embyAddServer": "Add server",
+  "embyServerType": "Type",
+  "embyEmptyTitle": "No servers yet",
+  "embySearchLibrary": "Search library",
+  "embyAccountNotFound": "Account not found",
+  "embyContinueWatching": "Continue watching",
+  "embyLatest": "Latest",
+  "embySeason": "Season {season}",
+  "@embySeason": {
+    "placeholders": {
+      "season": {
+        "type": "int"
+      }
+    }
+  },
+  "embyInProgress": "In progress",
+  "snifferNothingYet": "Nothing sniffed yet. Start playing a video on the page.",
+  "snifferPrompt": "Enter a page address to look for videos",
+  "webAddressHint": "Address",
+  "configChecksumMismatchTitle": "Config checksum mismatch",
+  "configChecksumMismatchBody": "The md5 of index.config.js does not match its checksum file (the author may not have updated the .md5). Use this config anyway?",
+  "done": "Done",
+  "selectAll": "Select all",
+  "deselectAll": "Deselect all",
+  "selectedCount": "{count} selected",
+  "@selectedCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "subscriptionKindLocal": "Local",
+  "subscriptionLocalHint": "Pick a local zip archive as the subscription source. It must contain both index.js and index.config.js.",
+  "subscriptionLocalArchive": "Local archive",
+  "subscriptionPickArchive": "Choose archive",
+  "subscriptionChipNetwork": "URL",
+  "subscriptionChipCloud": "Cloud service",
+  "subscriptionChipLocal": "Local zip",
+  "subscriptionAutoUpdate": "Auto update",
+  "subscriptionAutoUpdateSub": "Sync the latest content on launch",
+  "subscriptionLockSingle": "Locking needs more than one subscription",
+  "subscriptionInstallUntrusted": "Install untrusted subscription",
+  "subscriptionConnectCloud": "Connect cloud service",
+  "subscriptionCantAdd": "Can't add?",
+  "notice": "Notice",
+  "subscriptionCantAddHelp": "Network environments differ. If you can't connect or the download fails, try [turn on your proxy with the proxy tool's TUN mode] or [turn the proxy off], then try again.",
+  "added": "Added",
+  "subscriptionDuplicate": "A subscription with this URL already exists",
+  "subscriptionDownloadFailed": "Failed to download the subscription: {error}",
+  "@subscriptionDownloadFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "subscriptionZipFailed": "Failed to install the local archive: {error}",
+  "@subscriptionZipFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "subscriptionZipRequired": "Choose a zip archive first",
+  "subscriptionLastUpdated": "Last updated",
+  "subscriptionLastUpdatedAt": "Updated {when}",
+  "@subscriptionLastUpdatedAt": {
+    "placeholders": {
+      "when": {
+        "type": "String"
+      }
+    }
+  },
+  "timeJustNow": "just now",
+  "timeMinutesAgo": "{n} min ago",
+  "@timeMinutesAgo": {
+    "placeholders": {
+      "n": {
+        "type": "int"
+      }
+    }
+  },
+  "timeHoursAgo": "{n} h ago",
+  "@timeHoursAgo": {
+    "placeholders": {
+      "n": {
+        "type": "int"
+      }
+    }
+  },
+  "timeDaysAgo": "{n} d ago",
+  "@timeDaysAgo": {
+    "placeholders": {
+      "n": {
+        "type": "int"
+      }
+    }
+  },
+  "subscriptionActivate": "Activate",
+  "subscriptionActive": "Active",
+  "subscriptionSwitchedTo": "Switched to {name}",
+  "@subscriptionSwitchedTo": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "subscriptionCannotDeleteActive": "The active subscription can't be deleted. Switch to another source first.",
+  "subscriptionDeleteSelectedConfirm": "Delete the {count} selected subscriptions? This cannot be undone.",
+  "@subscriptionDeleteSelectedConfirm": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "subscriptionDeleteOneConfirm": "Delete \"{name}\"? This cannot be undone.",
+  "@subscriptionDeleteOneConfirm": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "subscriptionUpToDate": "\"{name}\" is up to date",
+  "@subscriptionUpToDate": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "subscriptionUpdatedOne": "Updated to the latest version",
+  "subscriptionUpdatedCount": "Updated {count} subscriptions",
+  "@subscriptionUpdatedCount": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "subscriptionAllUpToDate": "All subscriptions are up to date",
+  "subscriptionCheckFailed": "Update check failed ({error})",
+  "@subscriptionCheckFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "subscriptionChecking": "Checking for subscription updates…",
+  "subscriptionEdit": "Edit subscription",
+  "subscriptionFingerprint": "Content fingerprint",
+  "subscriptionReplaceZip": "Replace local script",
+  "subscriptionReplaceZipSub": "Choose a zip archive again to overwrite the current local source",
+  "subscriptionNotFound": "Subscription not found",
+  "homeSwitchSite": "Switch site",
+  "homeBlockCategories": "Block categories",
+  "homeHideFilters": "Hide filters",
+  "homeShowFilters": "Show filters",
+  "homeSwitchLayout": "Switch layout",
+  "homeNoBlockableCategories": "This site has no categories left to block",
+  "homePushNotSupported": "This subscription doesn't support push parsing",
+  "homePushTitle": "Push to parse",
+  "homePushHint": "Paste a share link…",
+  "homePushDescription": "Paste a cloud-drive share link or a direct video link to resolve its play lines",
+  "homeNoSites": "No sites available. Add a subscription first.",
+  "detailPlayNow": "Play",
+  "detailEpisodes": "Episodes",
+  "detailIntro": "Synopsis",
+  "detailEpisodeSheetSub": "{line} · {count} episodes",
+  "@detailEpisodeSheetSub": {
+    "placeholders": {
+      "line": {
+        "type": "String"
+      },
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "detailLocateCurrent": "Go to current episode",
+  "detailReverseOrder": "Reverse order",
+  "searchEmptyTitle": "Search videos",
+  "mediaAccountsTitle": "Media server accounts",
+  "mediaEmptySubtitle": "Add an account to browse your Emby library",
+  "mediaAddAccount": "Add account",
+  "mediaServerType": "Server type",
+  "mediaAutoDetect": "Auto-detect",
+  "mediaAddressHint": "e.g. http://192.168.1.10:8096",
+  "mediaPasswordHint": "Optional",
+  "mediaSignInAndSave": "Sign in and save",
+  "mediaAccountExists": "This account already exists",
+  "mediaSignedIn": "Signed in",
+  "mediaAddressRequired": "Enter the server address",
+  "mediaDeleteConfirm": "Delete “{name}”? You will need to sign in again to use this server.",
+  "@mediaDeleteConfirm": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "tmdbConnect": "Connect",
+  "tmdbGetKey": "Get an API key",
+  "tmdbConnected": "Connected to TMDB",
+  "tmdbDisconnect": "Disconnect",
+  "tmdbDisconnectTitle": "Disconnect TMDB?",
+  "tmdbDisconnectBody": "The API key is cleared and TMDB is turned off; the proxy settings are kept.",
+  "tmdbProxyGroup": "Proxy and advanced",
+  "webdavEmptyTitle": "WebDAV sync is not set up",
+  "webdavEmptySubtitle": "Add a server address, account and password to sync your data between devices",
+  "webdavAddConfig": "Add configuration",
+  "webdavConfigTitle": "WebDAV configuration",
+  "webdavEditConfig": "Edit configuration",
+  "webdavIsolation": "Isolation name",
+  "webdavIsolationHint": "Keeps data apart when several people share one WebDAV; empty = root folder",
+  "webdavServiceAddress": "Service address",
+  "webdavServiceAddressHint": "e.g. https://dav.jianguoyun.com/dav/",
+  "webdavAccountLabel": "Account",
+  "webdavAccountHint": "WebDAV user name",
+  "webdavPasswordHint": "App password",
+  "webdavFillRequired": "Fill in the service address, account and password first",
+  "webdavConnectFailed": "WebDAV connection failed",
+  "webdavAuthFailed": "WebDAV authentication failed, check the account and password",
+  "webdavEnableSync": "Enable sync",
+  "webdavEnableSyncSub": "Sync the selected data when the app starts",
+  "webdavSyncing": "Syncing…",
+  "webdavNeverSynced": "Not synced yet",
+  "webdavLastSync": "Last sync {time}",
+  "@webdavLastSync": {
+    "placeholders": {
+      "time": {
+        "type": "String"
+      }
+    }
+  },
+  "webdavSyncDone": "Sync complete",
+  "webdavSyncFailed": "WebDAV sync failed: {error}",
+  "@webdavSyncFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "webdavNoTypes": "No data type selected",
+  "webdavTypesGroup": "What to sync",
+  "webdavTypeFavorites": "Favorites",
+  "webdavTypeFavoritesSub": "Favorites and the calendar auto-sync switch",
+  "webdavTypeHistory": "History and progress",
+  "webdavTypeHistorySub": "Watch history, playback positions and last episodes",
+  "webdavTypeTracking": "Tracked shows",
+  "webdavTypeTrackingSub": "Shows on the calendar",
+  "webdavTypeTmdb": "TMDB",
+  "webdavTypeTmdbSub": "TMDB switch, API key and proxy addresses (replaced as a group) plus match records; the API key is stored in plain text on the WebDAV server",
+  "webdavTypePlayer": "Player settings",
+  "webdavTypePlayerSub": "Player settings and intro/outro records",
+  "webdavTypeLive": "Live TV",
+  "webdavTypeLiveSub": "Live sources, global EPG and hidden categories",
+  "liveGlobalEpg": "Global EPG URL",
+  "liveGlobalEpgHint": "Used when a source has no EPG of its own, e.g. https://example.com/epg.xml.gz",
+  "liveEpgSaved": "EPG URL saved",
+  "liveSourceUrl": "Source URL",
+  "liveNameHint": "e.g. My live TV",
+  "liveM3uOnly": "Only M3U playlists are supported",
+  "liveAutoRefresh": "Auto refresh",
+  "liveRefreshOff": "Off",
+  "liveRefreshAlways": "Every time",
+  "liveRefresh24h": "24 hours",
+  "liveVerifyAndSave": "Verify and save",
+  "liveSourceSaved": "Live source saved",
+  "liveSourceSaveFailed": "Could not save the live source: {error}",
+  "@liveSourceSaveFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "liveSourceExists": "A live source with this address already exists",
+  "liveDeleteConfirm": "Delete the live source “{name}”?",
+  "@liveDeleteConfirm": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "liveSourceDeleted": "Live source deleted",
+  "liveBlockedEmpty": "No hidden categories",
+  "liveBlockPick": "Hide a category",
+  "liveNothingToBlock": "No category left to hide",
+  "liveCategoryBlocked": "Hid “{name}”",
+  "@liveCategoryBlocked": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "liveCategoryUnblocked": "Showing “{name}” again",
+  "@liveCategoryUnblocked": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "liveUserAgentHint": "Custom User-Agent",
+  "danmuStatus": "Status",
+  "danmuStopped": "Stopped",
+  "danmuRunning": "Running: {port}",
+  "@danmuRunning": {
+    "placeholders": {
+      "port": {
+        "type": "String"
+      }
+    }
+  },
+  "danmuNoService": "No danmaku service yet",
+  "danmuNoServiceSub": "Add a network source or a local script below",
+  "danmuOpenWeb": "Open web page",
+  "danmuRestart": "Restart service",
+  "danmuStop": "Stop service",
+  "danmuNotReady": "The service is not ready, cannot open the page",
+  "danmuNetworkSource": "Network source",
+  "danmuLocalScriptTab": "Local script",
+  "danmuSourceUrl": "Source URL (.cjs.md5)",
+  "danmuDownload": "Download script",
+  "danmuLoadLocal": "Load local script",
+  "danmuReplaceLocal": "Replace local script",
+  "danmuLocalLoaded": "Local script loaded",
+  "danmuLocalOnlyCjs": "Only .cjs/.js files (got: {name})",
+  "@danmuLocalOnlyCjs": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "danmuRemoteHint": "http://ip:9321 or http://ip:9321/TOKEN",
+  "danmuShowTop": "Show top danmaku",
+  "danmuShowBottom": "Show bottom danmaku",
+  "danmuShowPositionSub": "When off, these scroll instead",
+  "danmuColor": "Danmaku colour",
+  "danmuColorOriginal": "Own colours",
+  "danmuColorWhite": "White",
+  "danmuColorRandom": "Random (solid)",
+  "danmuLineHeight": "Line spacing",
+  "danmuStroke": "Outline",
+  "danmuBlockedWordsTitle": "Blocked words",
+  "danmuBlockedWordsEmpty": "No blocked words; danmaku containing one are filtered out",
+  "danmuBlockedWordAdd": "Add blocked word",
+  "playerGroupDecode": "Decoding",
+  "playerGroupPicture": "Picture and engine",
+  "playerHwDecodeSub": "Off: software decoding (more compatible, uses more power)",
+  "playerShowTotalDurationSub": "Off: show the remaining time",
+  "playerAutoPipSub": "Keep playing in picture-in-picture when you leave the app",
+  "playerSkipNoticeSub": "Show a banner and a short notice when intros/outros are skipped",
+  "playerEpisodeSwitchNoticeSub": "Show “Switching to episode x” when the episode changes",
+  "playerShowStatsSub": "Costs some performance",
+  "playerShowNetSpeedSub": "See the download speed without opening the info bar",
+  "backupExportItems": "Choose data and export",
+  "backupExportItemsSub": "Packed as a zip into Backups",
+  "backupRestoreFile": "Restore from a backup file",
+  "backupRestoreFileSub": "Overwrite data from a zip backup (older JSON backups work too)",
+  "backupSheetDescription": "Tick the data to export. Subscriptions, settings and accounts may contain account names, passwords or tokens, written in plain text into the backup file.",
+  "backupSensitiveWarning": "The selected data contains accounts, passwords or tokens, written in plain text into the backup file. Keep it safe and share it with care.",
+  "backupExportButton": "Export",
+  "backupGroupUser": "User data",
+  "backupGroupSubscriptions": "Subscriptions and danmaku",
+  "backupGroupPreferences": "Preferences",
+  "backupItemHistory": "Watch history",
+  "backupItemFavorites": "Favorites",
+  "backupItemProgress": "Playback progress",
+  "backupItemLastEpisode": "Last episodes",
+  "backupItemTmdbRefs": "TMDB matches",
+  "backupItemHeadTail": "Intros and outros",
+  "backupItemTracking": "Tracked shows",
+  "backupItemDanmuRefs": "Danmaku matches",
+  "backupItemLive": "Live sources",
+  "backupItemSubscriptions": "Subscription list",
+  "backupItemAppSettings": "App settings (with danmaku service)",
+  "backupItemAccounts": "Media server and WebDAV accounts",
+  "backupRestoreWebdavTitle": "Restore from WebDAV",
+  "webSearchHint": "Enter a URL or search words",
+  "webGo": "Go",
+  "webClearList": "Clear list",
+  "webOpenExternal": "Open in external browser",
+  "webClearCookies": "Clear web cookies",
+  "webCookiesCleared": "WebView cookies cleared",
+  "webUaDefault": "Default",
+  "webUaDesktop": "Desktop Chrome",
+  "webUaCustom": "Custom…",
+  "webReload": "Reload",
+  "webSniffed": "Found media",
+  "languageSystem": "Follow system",
+  "languageZh": "简体中文",
+  "languageEn": "English",
+  "settingsTheme": "Theme",
+  "settingsThemeSub": "Color, dark style, font size",
+  "themeCustomize": "Appearance",
+  "themeModeLabel": "Theme mode",
+  "themeAuto": "Auto",
+  "themeLight": "Light",
+  "themeDark": "Dark",
+  "themeDarkStyle": "Dark background",
+  "themeDarkGray": "Dark grey",
+  "themeDarkBlack": "Pure black",
+  "themeFontSize": "Font size",
+  "settingsFeatures": "Features",
+  "settingsFeaturesSub": "Behaviour and switches",
+  "catpawTimeout": "catpaw service timeout",
+  "catpawTimeoutSub": "How long to wait for catpaw data",
+  "catpawTimeoutField": "Receive timeout (s)",
+  "settingsCleanup": "Clean up data",
+  "settingsCleanupSub": "Choose what to clear",
+  "cleanupDescription": "Tick the items to clear, then tap the button below.",
+  "cleanupGroupCache": "Cache",
+  "cleanupImages": "Image cache",
+  "cleanupTemp": "Temporary files",
+  "cleanupLivePlaylists": "Live playlist cache",
+  "cleanupRun": "Clear selected",
+  "cleanupDone": "Cleared {count} item(s)",
+  "@cleanupDone": {
+    "placeholders": {
+      "count": {
+        "type": "int"
+      }
+    }
+  },
+  "cleanupFailed": "Could not clear: {error}",
+  "@cleanupFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "settingsHomeTabs": "Home pages",
+  "settingsHomeTabsSub": "Choose the pages on the bottom bar and their order",
+  "homeTabsEnabled": "Enabled",
+  "homeTabsDisabled": "Not enabled",
+  "homeTabsHint": "Long-press and drag to reorder",
+  "homeTabsRequired": "Required page, cannot be turned off",
+  "downloadsManage": "Downloads",
+  "mediaManageAccounts": "Manage accounts",
+  "lockPassword": "Lock password",
+  "lockNotSet": "Not set",
+  "lockSet": "Set",
+  "lockEmpty": "Empty password",
+  "lockStateNotSet": "No lock password has been set",
+  "lockStateSet": "A lock password is set",
+  "lockStateEmpty": "The password is empty (no protection)",
+  "lockStepNew": "Enter a new password",
+  "lockStepConfirm": "Enter it again to confirm",
+  "lockStepOld": "Verify the old password",
+  "lockTapHint": "Tap the colour tiles to enter the password",
+  "lockTooShort": "Enter at least one digit",
+  "lockMismatch": "The two entries differ, please try again",
+  "lockWrongOld": "Wrong old password",
+  "lockUpdated": "Lock password updated",
+  "lockCleared": "Lock password cleared",
+  "lockSetEmpty": "Set to an empty password",
+  "lockVerifyTitle": "Verify lock password",
+  "lockFirstTitle": "First lock",
+  "lockFirstBody": "Set a lock password? Without one an empty password is used (no protection).",
+  "lockSkip": "Don't set",
+  "lockClear": "Clear",
+  "lockNext": "Next",
+  "lockConfirm": "Confirm",
+  "lockUnlock": "Unlock",
+  "lockHiddenSubscriptions": "Locked subscriptions are hidden",
+  "lockUnlockSubscriptions": "Unlock subscriptions",
+  "lockRelock": "Lock again",
+  "lockHomeTitle": "Subscription locked",
+  "lockHomeSubtitle": "The current subscription is locked; unlock it to view",
+  "lockBackspace": "Delete",
+  "settingsReset": "Reset app",
+  "settingsResetSub": "Erase all data and restart",
+  "resetConfirmBody": "All local data (subscriptions, history, favourites, settings, fonts, downloads, catpaw instance data and everything else) will be erased and the app restarted, like a factory reset. Exported backup files are kept. This cannot be undone. Continue?",
+  "resetInProgress": "Resetting…",
+  "resetDone": "All data has been erased. The app will now close; please open it again.",
+  "resetFailed": "Reset failed, please try again",
+  "settingsGroupDeveloper": "Developer",
+  "settingsCatpawDebug": "catpaw Debug",
+  "settingsCatpawDebugSub": "Start & manage catpaw instances, view logs",
+  "debugTitle": "catpaw multi-instance",
+  "debugStartTitle": "Start catpaw Runtime",
+  "debugStartSub": "Start the embedded Node runtime to load and manage catpaw instances and generic services",
+  "debugDartPort": "Dart callback port (empty=random)",
+  "debugStartNode": "Start Node",
+  "debugNodeStarting": "Node.js is starting…",
+  "debugNodeRunning": "Node running",
+  "debugLastResult": "Last result",
+  "debugCopyLast": "Copy Last",
+  "debugCopiedLast": "Copied Last",
+  "debugLog": "Logs",
+  "debugNoLogs": "No logs",
+  "debugCopyAllLogs": "Copy all logs",
+  "debugClearLogs": "Clear logs",
+  "debugLogsCleared": "Logs cleared",
+  "debugTabServices": "Generic service",
+  "debugLoadInstance": "Load instance",
+  "debugInstanceName": "Instance name (storage key, defaults to URL account)",
+  "debugPort": "Port (empty=random)",
+  "debugForceRestart": "Force restart if exists",
+  "debugNetAudit": "Network audit (log outbound requests)",
+  "debugServiceLog": "Service log (forward console)",
+  "debugLoadButton": "Load catpaw instance",
+  "debugRunningInstances": "Running instances",
+  "debugNoInstance": "No instance",
+  "debugTest": "Test",
+  "debugStop": "Stop",
+  "debugInstallService": "Install service",
+  "debugServiceUrl": "Generic service index.js URL",
+  "debugServiceName": "Service name (storage key, blank=from URL)",
+  "debugDefaultPort": "Default port (blank=script default)",
+  "debugLoadLocalScript": "Load local script",
+  "debugRegisteredServices": "Registered services",
+  "debugNoService": "No service",
+  "debugStartService": "Start service",
+  "debugStopService": "Stop service",
+  "debugUninstallService": "Uninstall service",
+  "themeColor": "Theme color",
+  "fontCardTitle": "Fonts",
+  "fontDefault": "Default",
+  "fontImport": "Import font",
+  "fontImported": "Font imported",
+  "fontImportFailed": "Font import failed",
+  "fontExists": "This font already exists",
+  "fontDelete": "Delete font",
+  "fontDeleteConfirm": "Delete this font?",
+  "featureLogging": "Logging",
+  "logClear": "Clear logs",
+  "logExport": "Export logs",
+  "logClearConfirm": "Clear all log records?",
+  "logClearAction": "Clear",
+  "logCleared": "Logs cleared",
+  "logClearFailed": "Failed to clear logs",
+  "logNoFile": "No log file",
+  "restoreInProgress": "Restoring…",
+  "restoreDone": "Data restored. The app will exit, please reopen it.",
+  "restoreWriteFailed": "Restore failed. Restarting the app is recommended",
+  "restoreNotBackup": "Not a valid NovaPlay backup file",
+  "restoreFileFailed": "Failed to restore the file: {error}",
+  "@restoreFileFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "backupRestoreSheetDescription": "Choose items to restore. Local data of the same names will be overwritten by the backup.",
+  "backupCreatedAt": "Backup time: {time}",
+  "@backupCreatedAt": {
+    "placeholders": {
+      "time": {
+        "type": "String"
+      }
+    }
+  },
+  "backupSourceVersion": "Source version: v{version} ({platform})",
+  "@backupSourceVersion": {
+    "placeholders": {
+      "version": {
+        "type": "String"
+      },
+      "platform": {
+        "type": "String"
+      }
+    }
+  },
+  "restoreConfirmTitle": "Confirm restore",
+  "restoreConfirmBody": "Selected data will be overwritten by the backup (extra local records will be lost). The app will then exit and needs to be reopened.",
+  "exportDoneTitle": "Export complete",
+  "exportSavedAs": "Backup file saved at: {name}",
+  "@exportSavedAs": {
+    "placeholders": {
+      "name": {
+        "type": "String"
+      }
+    }
+  },
+  "exportShareWarning": "The backup may contain sensitive info such as accounts and passwords. Share with care.",
+  "share": "Share",
+  "exporting": "Exporting…",
+  "exportFailed": "Export failed, please try again",
+  "shareFailed": "Share failed",
+  "reload": "Reload",
+  "catpawTimeoutError": "Timed out connecting to the catpaw service, please try again later",
+  "catpawUnreachable": "Cannot reach the catpaw service, please make sure the local service is running",
+  "catpawBadCertificate": "The catpaw service certificate failed verification",
+  "httpError": "HTTP {code}: {message}",
+  "@httpError": {
+    "placeholders": {
+      "code": {
+        "type": "int"
+      },
+      "message": {
+        "type": "String"
+      }
+    }
+  },
+  "playerLongPressSpeedAdjust": "Slide to adjust the long-press speed",
+  "playerLongPressSpeedAdjustSub": "Off: a long press always uses the fixed speed",
+  "playerMdkNote": "MDK ships with the arm64-v8a build only; elsewhere the player falls back to Exo and says why.",
+  "playerIosAvplayerNote": "AVPlayer uses Apple VideoToolbox hardware decoding with native iOS Picture-in-Picture, AirPlay video routing, and low power draw (best for HLS / MP4).",
+  "playerIosVlcNote": "VLC uses FFmpeg / libvlc for MKV, FLV, AVI, embedded ASS subtitles, and HW/SW decode switching, without iOS system Picture-in-Picture.",
+  "playerHwDecodeIosAvSub": "AVPlayer always uses VideoToolbox hardware decoding; this toggle applies to the VLC kernel",
+  "playerAutoPipIosVlcSub": "iOS system Picture-in-Picture is available only with the AVPlayer kernel",
+  "playerSubtitleFontHintIos": "iOS system font family (e.g. PingFang SC)",
+  "playerSubtitleNoteIos": "Supports embedded subtitle tracks and external SRT, WebVTT, and ASS/SSA (importable from Files or URL inside the player).",
+  "playerReloadNote": "Changing the kernel or hardware acceleration inside the player reloads the video at the current position.",
+  "searchSiteManager": "Search sites",
+  "searchSwitchLayout": "Switch layout",
+  "searchLayoutList": "List",
+  "searchLayoutTop": "Sites on top",
+  "searchLayoutLeft": "Sites on the left",
+  "searchHistory": "Search history",
+  "searchHistoryClear": "Clear search history",
+  "searchHistoryClearConfirm": "Clear all search history?",
+  "searchSearching": "Searching…",
+  "searchFailed": "Search failed: {error}",
+  "searchTwoColumns": "Two columns",
+  "searchOneColumn": "One column",
+  "searchNoSites": "No sites yet. Add a subscription first",
+  "searchSiteTab": "{site} ({count})",
+  "@searchFailed": {
+    "placeholders": {
+      "error": {
+        "type": "String"
+      }
+    }
+  },
+  "@searchSiteTab": {
+    "placeholders": {
+      "site": {
+        "type": "String"
+      },
+      "count": {
+        "type": "int"
+      }
+    }
+  }
+}

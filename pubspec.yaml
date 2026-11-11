@@ -1,0 +1,51 @@
+name: uzv_reimpl
+description: Clean-room reimplementation of the features observed in uzn-android v1.1.13 (see ../ANALYSIS.md).
+publish_to: none
+version: 0.1.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.22.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_localizations:
+    sdk: flutter
+  flutter_riverpod: ^2.5.1
+  go_router: ^14.2.0
+  dio: ^5.4.3
+  path_provider: ^2.1.3
+  path: ^1.9.0
+  crypto: ^3.0.3
+  xml: ^6.5.0
+  intl: ^0.20.3
+  flutter_inappwebview: ^6.1.5
+  share_plus: ^13.3.1
+  wakelock_plus: ^1.8.2
+  url_launcher: ^6.2.6
+  open_file: ^4.0.0
+  logger: ^2.3.0
+  file_picker: ^13.3.2
+  archive: ^4.6.0
+  cupertino_icons: ^1.0.9
+  novaplay_ios:
+    path: packages/novaplay_ios
+  # Embedded Node.js runtime. The original ships its own plugin ("flutter_nodejs_mobile");
+  # here it is hidden behind lib/core/node_bridge.dart so any nodejs-mobile binding can be dropped in.
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+  pigeon: ^22.0.0
+
+flutter:
+  uses-material-design: true
+  # gen-l10n: lib/l10n/app_{en,zh}.arb -> lib/l10n/app_localizations*.dart (see l10n.yaml)
+  generate: true
+  assets:
+    - assets/scripts/sniffer_inject.js
+    # Flutter bundles only the direct children of a listed folder, so every level is listed.
+    - assets/nodejs/
+    - assets/nodejs/src/

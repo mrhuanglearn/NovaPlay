@@ -1,0 +1,1212 @@
+import AVFoundation
+import AVKit
+import CoreImage
+import Photos
+import UIKit
+#if canImport(MobileVLCKit)
+import MobileVLCKit
+#endif
+
+struct IosTrackOption {
+  let index: Int
+  let label: String
+  let language: String?
+  let selected: Bool
+}
+
+protocol IosPlayerKernelDelegate: AnyObject {
+  func kernelDidChangeState(_ state: String)
+  func kernelDidFail(message: String, code: Int?)
+  func kernelDidUpdateSubtitleCue(_ text: String?)
+  func kernelDidUpdateMetrics()
+  func kernelDidFallbackNotice(_ message: String)
+  func kernelPictureInPictureDidCloseSession()
+  func kernelPictureInPictureRestoreUI(completion: @escaping (Bool) -> Void)
+}
+
+private final class AvLayerView: UIView {
+  override static var layerClass: AnyClass { AVPlayerLayer.self }
+  var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
+}
+
+/// Unified video container hosting both `AVPlayerLayer` (for `AVPlayer` + system PiP) and `vlcDrawableView` (for `MobileVLCKit`),
+/// implementing canonical `PlaybackConfig.fitMode` values: `fit` (letterbox), `zoom` (aspect-fill crop), and `fill` (stretch).
+final class PlayerVideoContainerView: UIView {
+  fileprivate let avLayerView = AvLayerView(frame: .zero)
+  fileprivate let vlcDrawableView = UIView(frame: .zero)
+
+  var playerLayer: AVPlayerLayer { avLayerView.playerLayer }
+
+  var fitMode: String = "fit" {
+    didSet { applyFitLayout() }
+  }
+  var naturalVideoSize: CGSize = .zero {
+    didSet { applyFitLayout() }
+  }
+  var usingVlc: Bool = false {
+    didSet {
+      avLayerView.isHidden = usingVlc
+      vlcDrawableView.isHidden = !usingVlc
+      applyFitLayout()
+    }
+  }
+  var onBoundsChangedForVlcFill: ((CGSize) -> Void)?
+
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    backgroundColor = .black
+    clipsToBounds = true
+    avLayerView.backgroundColor = .black
+    vlcDrawableView.backgroundColor = .black
+    vlcDrawableView.isHidden = true
+    addSubview(avLayerView)
+    addSubview(vlcDrawableView)
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    avLayerView.frame = bounds
+    applyFitLayout()
+  }
+
+  func bind(avPlayer: AVPlayer?) {
+    avLayerView.playerLayer.player = avPlayer
+    applyFitLayout()
+  }
+
+  fileprivate func applyFitLayout() {
+    // 1. AVPlayerLayer gravity
+    switch fitMode {
+    case "zoom":
+      avLayerView.playerLayer.videoGravity = .resizeAspectFill
+    case "fill":
+      avLayerView.playerLayer.videoGravity = .resize
+    default:
+      avLayerView.playerLayer.videoGravity = .resizeAspect
+    }
+
+    // 2. VLC drawable frame & aspect ratio
+    guard bounds.width > 0, bounds.height > 0 else {
+      vlcDrawableView.frame = bounds
+      return
+    }
+    switch fitMode {
+    case "zoom":
+      if naturalVideoSize.width > 0, naturalVideoSize.height > 0 {
+        let scale = max(bounds.width / naturalVideoSize.width, bounds.height / naturalVideoSize.height)
+        let w = naturalVideoSize.width * scale
+        let h = naturalVideoSize.height * scale
+        vlcDrawableView.frame = CGRect(
+          x: (bounds.width - w) * 0.5,
+          y: (bounds.height - h) * 0.5,
+          width: w,
+          height: h
+        )
+      } else {
+        vlcDrawableView.frame = bounds
+      }
+      onBoundsChangedForVlcFill?(.zero)
+    case "fill":
+      vlcDrawableView.frame = bounds
+      onBoundsChangedForVlcFill?(bounds.size)
+    default:
+      vlcDrawableView.frame = bounds
+      onBoundsChangedForVlcFill?(.zero)
+    }
+  }
+}
+
+/// Dual-kernel iOS 15+ player facade:
+/// - `avplayer`: Apple `AVPlayer` (VideoToolbox HW decode, native iOS system PiP, native AirPlay, DASH dual-stream, sidecar subtitles)
+/// - `vlc`: `MobileVLCKit` (`libvlc` + FFmpeg multi-format MKV/FLV/AVI/TS/RMVB/ASS, VideoToolbox HW vs FFmpeg SW decode toggle)
+final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
+  weak var delegate: IosPlayerKernelDelegate?
+
+  let videoView = PlayerVideoContainerView(frame: .zero)
+
+  static var isVlcAvailable: Bool {
+    #if canImport(MobileVLCKit)
+    return true
+    #else
+    return false
+    #endif
+  }
+
+  private(set) var activeKernelId: String = "avplayer"
+  var hwDecode: Bool = true
+  var isUsingAvPlayer: Bool { activeKernelId == "avplayer" }
+
+  var activeBackendSummary: String {
+    if isUsingAvPlayer {
+      return "AVPlayer (VT HW)"
+    }
+    return hwDecode ? "VLC (VT HW)" : "VLC (FFmpeg SW)"
+  }
+
+  // MARK: - AVPlayer State
+  private let avPlayer = AVPlayer()
+  private var secondaryAudioPlayer: AVPlayer?
+  private var videoOutput: AVPlayerItemVideoOutput?
+  private var pipController: AVPictureInPictureController?
+  private var pipRestorePending = false
+
+  private var timeObserver: Any?
+  private var statusObs: NSKeyValueObservation?
+  private var timeControlObs: NSKeyValueObservation?
+  private var bufferEmptyObs: NSKeyValueObservation?
+  private var likelyToKeepUpObs: NSKeyValueObservation?
+  private var presentationSizeObs: NSKeyValueObservation?
+  private var endObserver: NSObjectProtocol?
+
+  // MARK: - MobileVLCKit State
+  #if canImport(MobileVLCKit)
+  private var vlcPlayer: VLCMediaPlayer?
+  private var vlcStatsTimer: Timer?
+  private var vlcAspectCString: UnsafeMutablePointer<CChar>?
+  private var vlcPendingStartMs: Int64 = 0
+  private var vlcAppliedInitialSeek: Bool = false
+  #endif
+
+  // MARK: - Shared Metrics & Tracks
+  private(set) var positionMs: Int64 = 0
+  private(set) var durationMs: Int64 = 0
+  private(set) var bufferedMs: Int64 = 0
+  private(set) var videoSize: CGSize = .zero
+  private(set) var downloadBytesPerSec: Double = 0
+  private(set) var videoCodecName: String?
+  private(set) var nominalFps: Double?
+  private(set) var state: String = "idle"
+  private var isSeeking: Bool = false
+  private var shouldAutoPlay: Bool = true
+
+  private var lastBytesTotal: Int64 = -1
+  private var lastBytesSampleTime: TimeInterval = 0
+
+  var speed: Float = 1.0 {
+    didSet {
+      if isUsingAvPlayer {
+        if isPlaying {
+          avPlayer.rate = speed
+          secondaryAudioPlayer?.rate = speed
+        }
+      } else {
+        #if canImport(MobileVLCKit)
+        vlcPlayer?.rate = speed
+        #endif
+      }
+    }
+  }
+
+  var fitMode: String = "fit" {
+    didSet {
+      videoView.fitMode = fitMode
+    }
+  }
+
+  var autoPictureInPicture: Bool = true {
+    didSet {
+      pipController?.canStartPictureInPictureAutomaticallyFromInline = autoPictureInPicture && isUsingAvPlayer
+    }
+  }
+
+  private struct LoadedSidecarSubtitle {
+    let option: SubtitleOption
+    var cues: [SubtitleCue]
+  }
+  private var sidecarSubtitles: [LoadedSidecarSubtitle] = []
+  private var selectedSubtitleIdx: Int = -1
+  private var preferredSubtitleLang: String?
+  private var preferredAudioLang: String?
+  private var selectedAudioIdx: Int = -1
+
+  var isPlaying: Bool {
+    if isUsingAvPlayer {
+      return avPlayer.rate > 0.01 && avPlayer.timeControlStatus == .playing
+    }
+    #if canImport(MobileVLCKit)
+    return vlcPlayer?.isPlaying ?? false
+    #else
+    return false
+    #endif
+  }
+
+  var isInPictureInPicture: Bool {
+    isUsingAvPlayer && (pipController?.isPictureInPictureActive ?? false)
+  }
+
+  init(requestedKernel: String = "avplayer", hwDecode: Bool = true) {
+    self.hwDecode = hwDecode
+    super.init()
+    configureAudioSession()
+    avPlayer.automaticallyWaitsToMinimizeStalling = true
+    videoView.bind(avPlayer: avPlayer)
+    setupPictureInPictureIfSupported()
+    attachAvPeriodicObserver()
+    videoView.onBoundsChangedForVlcFill = { [weak self] fillSize in
+      self?.applyVlcFillAspect(fillSize)
+    }
+    selectKernelBackend(requestedKernel, notifyFallback: false)
+  }
+
+  func selectKernelBackend(_ rawKernel: String, notifyFallback: Bool = true) {
+    let normalized = IosPlayerUiText.normalizeIosKernel(rawKernel)
+    if normalized == "vlc" {
+      #if canImport(MobileVLCKit)
+      if activeKernelId != "vlc" {
+        stopAvPlaybackOnly()
+        activeKernelId = "vlc"
+        videoView.usingVlc = true
+        pipController?.canStartPictureInPictureAutomaticallyFromInline = false
+      }
+      #else
+      activeKernelId = "avplayer"
+      videoView.usingVlc = false
+      pipController?.canStartPictureInPictureAutomaticallyFromInline = autoPictureInPicture
+      if notifyFallback {
+        delegate?.kernelDidFallbackNotice(
+          IosPlayerUiText.t("当前构建未内置 VLC 内核，已自动回退至 AVPlayer", "VLC not bundled in this build; using AVPlayer")
+        )
+      }
+      #endif
+    } else {
+      if activeKernelId != "avplayer" {
+        stopVlcPlaybackOnly()
+        activeKernelId = "avplayer"
+        videoView.usingVlc = false
+        pipController?.canStartPictureInPictureAutomaticallyFromInline = autoPictureInPicture
+      }
+    }
+  }
+
+  private func configureAudioSession() {
+    let session = AVAudioSession.sharedInstance()
+    try? session.setCategory(.playback, mode: .moviePlayback, options: [.allowAirPlay, .allowBluetoothA2DP])
+    try? session.setActive(true)
+  }
+
+  private func setupPictureInPictureIfSupported() {
+    guard AVPictureInPictureController.isPictureInPictureSupported() else { return }
+    if let ctrl = AVPictureInPictureController(playerLayer: videoView.playerLayer) {
+      ctrl.delegate = self
+      ctrl.canStartPictureInPictureAutomaticallyFromInline = autoPictureInPicture && isUsingAvPlayer
+      pipController = ctrl
+    }
+  }
+
+  private func attachAvPeriodicObserver() {
+    let interval = CMTime(seconds: 0.25, preferredTimescale: 600)
+    timeObserver = avPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
+      guard let self = self, self.isUsingAvPlayer else { return }
+      let sec = CMTimeGetSeconds(time)
+      if sec.isFinite && sec >= 0 {
+        self.positionMs = Int64(sec * 1000.0)
+      }
+      if let item = self.avPlayer.currentItem {
+        let dur = CMTimeGetSeconds(item.duration)
+        if dur.isFinite && dur > 0 {
+          self.durationMs = Int64(dur * 1000.0)
+        } else {
+          self.durationMs = 0
+        }
+        if let firstRange = item.loadedTimeRanges.first?.timeRangeValue {
+          let endSec = CMTimeGetSeconds(CMTimeAdd(firstRange.start, firstRange.duration))
+          if endSec.isFinite && endSec >= 0 {
+            self.bufferedMs = Int64(endSec * 1000.0)
+          }
+        }
+        self.sampleAvDownloadSpeed(from: item)
+      }
+      self.updateCurrentSidecarCue()
+      self.delegate?.kernelDidUpdateMetrics()
+    }
+  }
+
+  private func sampleAvDownloadSpeed(from item: AVPlayerItem) {
+    let now = CACurrentMediaTime()
+    guard now - lastBytesSampleTime >= 0.5 else { return }
+    let prevTime = lastBytesSampleTime
+    lastBytesSampleTime = now
+
+    guard let events = item.accessLog()?.events, !events.isEmpty else {
+      downloadBytesPerSec = 0
+      return
+    }
+    let totalBytes = events.reduce(Int64(0)) { acc, ev in
+      acc + max(0, ev.numberOfBytesTransferred)
+    }
+    if lastBytesTotal >= 0 && prevTime > 0 && totalBytes >= lastBytesTotal {
+      let dt = max(0.2, now - prevTime)
+      let delta = Double(totalBytes - lastBytesTotal) / dt
+      if delta > 0 {
+        downloadBytesPerSec = delta
+      } else if let lastEv = events.last, lastEv.observedBitrate.isFinite && lastEv.observedBitrate > 0 && state == "buffering" {
+        downloadBytesPerSec = lastEv.observedBitrate / 8.0
+      } else {
+        downloadBytesPerSec = 0
+      }
+    } else if let lastEv = events.last, lastEv.observedBitrate.isFinite && lastEv.observedBitrate > 0 {
+      downloadBytesPerSec = lastEv.observedBitrate / 8.0
+    } else {
+      downloadBytesPerSec = 0
+    }
+    lastBytesTotal = totalBytes
+  }
+
+  // MARK: - Load Media
+
+  func load(
+    url: String,
+    audioUrl: String?,
+    headers: [String: String],
+    startMs: Int64,
+    subtitles: [SubtitleOption]
+  ) {
+    lastBytesTotal = -1
+    lastBytesSampleTime = 0
+    downloadBytesPerSec = 0
+    positionMs = max(0, startMs)
+    durationMs = 0
+    bufferedMs = 0
+    videoSize = .zero
+    videoCodecName = nil
+    nominalFps = nil
+    selectedSubtitleIdx = -1
+    selectedAudioIdx = -1
+    shouldAutoPlay = true
+    isSeeking = false
+    delegate?.kernelDidUpdateSubtitleCue(nil)
+    updateState("buffering")
+
+    guard let mediaURL = parseMediaURL(url) else {
+      delegate?.kernelDidFail(message: IosPlayerUiText.t("无效的播放地址", "Invalid playback URL"), code: -1)
+      return
+    }
+
+    loadSidecarSubtitles(subtitles, headers: headers)
+
+    if isUsingAvPlayer {
+      stopVlcPlaybackOnly()
+      loadWithAvPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: headers, startMs: startMs)
+    } else {
+      #if canImport(MobileVLCKit)
+      stopAvPlaybackOnly()
+      loadWithVlcPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: headers, startMs: startMs, subtitles: subtitles)
+      #else
+      selectKernelBackend("avplayer", notifyFallback: true)
+      loadWithAvPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: headers, startMs: startMs)
+      #endif
+    }
+  }
+
+  private func loadWithAvPlayer(
+    mediaURL: URL,
+    audioUrl: String?,
+    headers: [String: String],
+    startMs: Int64
+  ) {
+    cleanupAvItemObservers()
+    var assetOptions: [String: Any] = [:]
+    if !headers.isEmpty {
+      assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = headers
+    }
+    let asset = AVURLAsset(url: mediaURL, options: assetOptions)
+    let item = AVPlayerItem(asset: asset)
+    item.audioTimePitchAlgorithm = .timeDomain
+
+    let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
+      kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
+    ])
+    item.add(output)
+    videoOutput = output
+
+    observeAvItem(item, startMs: startMs)
+    avPlayer.replaceCurrentItem(with: item)
+
+    secondaryAudioPlayer?.pause()
+    secondaryAudioPlayer = nil
+    if let audioStr = audioUrl, !audioStr.isEmpty, let aURL = parseMediaURL(audioStr) {
+      let aAsset = AVURLAsset(url: aURL, options: assetOptions)
+      let aItem = AVPlayerItem(asset: aAsset)
+      aItem.audioTimePitchAlgorithm = .timeDomain
+      secondaryAudioPlayer = AVPlayer(playerItem: aItem)
+    }
+  }
+
+  #if canImport(MobileVLCKit)
+  private func loadWithVlcPlayer(
+    mediaURL: URL,
+    audioUrl: String?,
+    headers: [String: String],
+    startMs: Int64,
+    subtitles: [SubtitleOption]
+  ) {
+    stopVlcPlaybackOnly()
+    let player = VLCMediaPlayer()
+    player.delegate = self
+    player.drawable = videoView.vlcDrawableView
+
+    let media = VLCMedia(url: mediaURL)
+    media.addOption(":network-caching=1500")
+    if hwDecode {
+      media.addOption(":videotoolbox")
+    } else {
+      media.addOption(":no-videotoolbox")
+      media.addOption(":avcodec-hw=none")
+      media.addOption(":avcodec-threads=0")
+    }
+    for (k, v) in headers {
+      let lower = k.lowercased()
+      if lower == "user-agent" {
+        media.addOption(":http-user-agent=\(v)")
+      } else if lower == "referer" || lower == "referrer" {
+        media.addOption(":http-referrer=\(v)")
+      }
+    }
+
+    vlcPendingStartMs = max(0, startMs)
+    vlcAppliedInitialSeek = (vlcPendingStartMs == 0)
+    player.media = media
+    vlcPlayer = player
+    videoView.applyFitLayout()
+
+    if let audioStr = audioUrl, !audioStr.isEmpty, let aURL = parseMediaURL(audioStr) {
+      player.addPlaybackSlave(aURL, type: .audio, enforce: true)
+    }
+    for sub in subtitles {
+      if let sURL = parseMediaURL(sub.url), sURL.isFileURL {
+        player.addPlaybackSlave(sURL, type: .subtitle, enforce: false)
+      }
+    }
+
+    player.play()
+    player.rate = speed
+
+    let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+      self?.sampleVlcMetrics()
+    }
+    RunLoop.main.add(timer, forMode: .common)
+    vlcStatsTimer = timer
+  }
+
+  private func sampleVlcMetrics() {
+    guard !isUsingAvPlayer, let player = vlcPlayer else { return }
+    let tMs = Int64(player.time.intValue)
+    if tMs >= 0 {
+      positionMs = tMs
+    }
+    if let len = player.media?.length.intValue, len > 0 {
+      durationMs = Int64(len)
+    }
+    let sz = player.videoSize
+    if sz.width > 0 && sz.height > 0 && sz != videoSize {
+      videoSize = sz
+      videoView.naturalVideoSize = sz
+    }
+    if let media = player.media {
+      let now = CACurrentMediaTime()
+      let totalRead = Int64(max(0, media.numberOfReadBytesOnInput))
+      if lastBytesTotal >= 0 && lastBytesSampleTime > 0 && totalRead >= lastBytesTotal {
+        let dt = max(0.2, now - lastBytesSampleTime)
+        let delta = Double(totalRead - lastBytesTotal) / dt
+        if delta > 0 {
+          downloadBytesPerSec = delta
+        } else if media.inputBitrate > 0 {
+          downloadBytesPerSec = Double(media.inputBitrate) * 125_000.0
+        } else {
+          downloadBytesPerSec = 0
+        }
+      } else if media.inputBitrate > 0 {
+        downloadBytesPerSec = Double(media.inputBitrate) * 125_000.0
+      } else {
+        downloadBytesPerSec = 0
+      }
+      lastBytesTotal = totalRead
+      lastBytesSampleTime = now
+    }
+    updateCurrentSidecarCue()
+    delegate?.kernelDidUpdateMetrics()
+  }
+  #endif
+
+  private func applyVlcFillAspect(_ fillSize: CGSize) {
+    #if canImport(MobileVLCKit)
+    guard let player = vlcPlayer else { return }
+    if let old = vlcAspectCString {
+      free(old)
+      vlcAspectCString = nil
+    }
+    if fillSize.width > 0 && fillSize.height > 0 {
+      let ratio = "\(max(1, Int(fillSize.width.rounded()))):\(max(1, Int(fillSize.height.rounded())))"
+      let dup = strdup(ratio)
+      vlcAspectCString = dup
+      player.videoAspectRatio = dup
+    } else {
+      player.videoAspectRatio = nil
+    }
+    #endif
+  }
+
+  private func parseMediaURL(_ raw: String) -> URL? {
+    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+    if trimmed.hasPrefix("/") {
+      return URL(fileURLWithPath: trimmed)
+    }
+    if let u = URL(string: trimmed), u.scheme != nil {
+      return u
+    }
+    if let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed) {
+      return URL(string: encoded)
+    }
+    return nil
+  }
+
+  private func observeAvItem(_ item: AVPlayerItem, startMs: Int64) {
+    statusObs = item.observe(\.status, options: [.new, .initial]) { [weak self] it, _ in
+      DispatchQueue.main.async {
+        guard let self = self, self.isUsingAvPlayer else { return }
+        switch it.status {
+        case .readyToPlay:
+          self.inspectAvTrackMetadata(on: it)
+          self.applyAvPreferredTracks(on: it)
+          if startMs > 0 {
+            let target = CMTime(value: startMs, timescale: 1000)
+            self.isSeeking = true
+            it.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+              DispatchQueue.main.async {
+                guard let self = self, self.isUsingAvPlayer else { return }
+                self.isSeeking = false
+                if self.shouldAutoPlay {
+                  self.play()
+                } else {
+                  self.syncStateFromAvPlayer()
+                }
+              }
+            }
+          } else if self.shouldAutoPlay {
+            self.play()
+          }
+        case .failed:
+          let detail = it.error?.localizedDescription ?? IosPlayerUiText.t("解码失败", "Decode error")
+          let msg = "AVPlayer " + IosPlayerUiText.t("播放失败", "playback failed") + " (\(detail))"
+          let code = (it.error as NSError?)?.code
+          self.delegate?.kernelDidFail(message: msg, code: code)
+        default:
+          break
+        }
+      }
+    }
+
+    presentationSizeObs = item.observe(\.presentationSize, options: [.new, .initial]) { [weak self] it, _ in
+      DispatchQueue.main.async {
+        guard let self = self, self.isUsingAvPlayer else { return }
+        self.videoSize = it.presentationSize
+        self.videoView.naturalVideoSize = it.presentationSize
+        self.delegate?.kernelDidUpdateMetrics()
+      }
+    }
+
+    bufferEmptyObs = item.observe(\.isPlaybackBufferEmpty, options: [.new]) { [weak self] _, _ in
+      DispatchQueue.main.async { self?.syncStateFromAvPlayer() }
+    }
+
+    likelyToKeepUpObs = item.observe(\.isPlaybackLikelyToKeepUp, options: [.new]) { [weak self] _, _ in
+      DispatchQueue.main.async { self?.syncStateFromAvPlayer() }
+    }
+
+    timeControlObs = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] _, _ in
+      DispatchQueue.main.async { self?.syncStateFromAvPlayer() }
+    }
+
+    endObserver = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemDidPlayToEndTime,
+      object: item,
+      queue: .main
+    ) { [weak self] _ in
+      guard let self = self, self.isUsingAvPlayer else { return }
+      self.secondaryAudioPlayer?.pause()
+      self.updateState("ended")
+    }
+  }
+
+  private func inspectAvTrackMetadata(on item: AVPlayerItem) {
+    guard let vTrack = item.asset.tracks(withMediaType: .video).first else { return }
+    if vTrack.nominalFrameRate > 0 {
+      nominalFps = Double(vTrack.nominalFrameRate)
+    }
+    if let desc = vTrack.formatDescriptions.first {
+      let cfDesc = desc as! CMFormatDescription
+      let subType = CMFormatDescriptionGetMediaSubType(cfDesc)
+      switch subType {
+      case kCMVideoCodecType_HEVC, kCMVideoCodecType_DolbyVisionHEVC:
+        videoCodecName = "HEVC"
+      case kCMVideoCodecType_H264:
+        videoCodecName = "H.264"
+      case kCMVideoCodecType_AV1:
+        videoCodecName = "AV1"
+      case kCMVideoCodecType_VP9:
+        videoCodecName = "VP9"
+      default:
+        let bytes: [CChar] = [
+          CChar((subType >> 24) & 0xFF),
+          CChar((subType >> 16) & 0xFF),
+          CChar((subType >> 8) & 0xFF),
+          CChar(subType & 0xFF),
+          0
+        ]
+        let raw = String(cString: bytes).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !raw.isEmpty { videoCodecName = raw.uppercased() }
+      }
+    }
+  }
+
+  private func syncStateFromAvPlayer() {
+    guard isUsingAvPlayer else { return }
+    if isSeeking {
+      updateState("buffering")
+      return
+    }
+    switch avPlayer.timeControlStatus {
+    case .waitingToPlayAtSpecifiedRate:
+      updateState("buffering")
+    case .playing:
+      updateState("playing")
+    case .paused:
+      if state != "ended" && state != "idle" {
+        updateState("paused")
+      }
+    @unknown default:
+      break
+    }
+  }
+
+  fileprivate func updateState(_ next: String) {
+    guard state != next else { return }
+    state = next
+    delegate?.kernelDidChangeState(next)
+  }
+
+  // MARK: - Playback Controls
+
+  func play() {
+    shouldAutoPlay = true
+    configureAudioSession()
+    if isUsingAvPlayer {
+      avPlayer.playImmediately(atRate: speed)
+      if let sec = secondaryAudioPlayer {
+        sec.seek(to: avPlayer.currentTime(), toleranceBefore: .zero, toleranceAfter: .zero)
+        sec.playImmediately(atRate: speed)
+      }
+      syncStateFromAvPlayer()
+    } else {
+      #if canImport(MobileVLCKit)
+      vlcPlayer?.play()
+      vlcPlayer?.rate = speed
+      updateState("playing")
+      #endif
+    }
+  }
+
+  func pause() {
+    shouldAutoPlay = false
+    if isUsingAvPlayer {
+      avPlayer.pause()
+      secondaryAudioPlayer?.pause()
+    } else {
+      #if canImport(MobileVLCKit)
+      vlcPlayer?.pause()
+      #endif
+    }
+    updateState("paused")
+  }
+
+  func seekTo(_ ms: Int64) {
+    let clamped = durationMs > 0 ? min(max(0, ms), durationMs) : max(0, ms)
+    positionMs = clamped
+    isSeeking = true
+    updateState("buffering")
+
+    if isUsingAvPlayer {
+      let target = CMTime(value: clamped, timescale: 1000)
+      avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+        DispatchQueue.main.async {
+          guard let self = self, self.isUsingAvPlayer else { return }
+          self.isSeeking = false
+          if let sec = self.secondaryAudioPlayer {
+            sec.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+          }
+          self.updateCurrentSidecarCue()
+          if self.shouldAutoPlay {
+            self.avPlayer.playImmediately(atRate: self.speed)
+            self.secondaryAudioPlayer?.playImmediately(atRate: self.speed)
+          }
+          self.syncStateFromAvPlayer()
+        }
+      }
+    } else {
+      #if canImport(MobileVLCKit)
+      if let player = vlcPlayer {
+        player.time = VLCTime(number: NSNumber(value: clamped))
+      }
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+        guard let self = self, !self.isUsingAvPlayer else { return }
+        self.isSeeking = false
+        self.updateCurrentSidecarCue()
+        if self.shouldAutoPlay {
+          self.vlcPlayer?.play()
+          self.vlcPlayer?.rate = self.speed
+          self.updateState("playing")
+        } else {
+          self.updateState("paused")
+        }
+      }
+      #endif
+    }
+  }
+
+  // MARK: - Picture in Picture (iOS Native AVPlayer only)
+
+  var isPictureInPictureSupported: Bool {
+    guard isUsingAvPlayer else { return false }
+    return pipController?.isPictureInPicturePossible == true || AVPictureInPictureController.isPictureInPictureSupported()
+  }
+
+  func togglePictureInPicture() {
+    guard isUsingAvPlayer, let ctrl = pipController else { return }
+    if ctrl.isPictureInPictureActive {
+      ctrl.stopPictureInPicture()
+    } else {
+      ctrl.startPictureInPicture()
+    }
+  }
+
+  func pictureInPictureControllerWillStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+    pipRestorePending = false
+  }
+
+  func pictureInPictureController(
+    _ pictureInPictureController: AVPictureInPictureController,
+    restoreUserInterfaceForPictureInPictureStopWithCompletionHandler completionHandler: @escaping (Bool) -> Void
+  ) {
+    pipRestorePending = true
+    delegate?.kernelPictureInPictureRestoreUI(completion: completionHandler)
+  }
+
+  func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+    if !pipRestorePending {
+      delegate?.kernelPictureInPictureDidCloseSession()
+    }
+    pipRestorePending = false
+  }
+
+  // MARK: - Tracks (Audio & Subtitles)
+
+  func applySubtitlePreferences(lang: String?) {
+    preferredSubtitleLang = lang
+    if isUsingAvPlayer, let item = avPlayer.currentItem {
+      applyAvPreferredTracks(on: item)
+    }
+  }
+
+  func applyAudioPreference(lang: String?) {
+    preferredAudioLang = lang
+    if isUsingAvPlayer, let item = avPlayer.currentItem {
+      applyAvPreferredTracks(on: item)
+    }
+  }
+
+  private func applyAvPreferredTracks(on item: AVPlayerItem) {
+    if let aLang = preferredAudioLang, !aLang.isEmpty,
+       let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .audible) {
+      if let hit = group.options.first(where: { ($0.extendedLanguageTag ?? "").lowercased().hasPrefix(aLang.lowercased()) }) {
+        item.select(hit, in: group)
+        if let idx = group.options.firstIndex(of: hit) { selectedAudioIdx = idx }
+      }
+    }
+    if selectedSubtitleIdx < 0, let sLang = preferredSubtitleLang, !sLang.isEmpty {
+      let embeddedCount = avEmbeddedSubtitleOptions().count
+      if let embIdx = avEmbeddedSubtitleOptions().firstIndex(where: { ($0.extendedLanguageTag ?? "").lowercased().hasPrefix(sLang.lowercased()) }) {
+        selectSubtitle(embIdx)
+      } else if let sideIdx = sidecarSubtitles.firstIndex(where: { ($0.option.language ?? "").lowercased().hasPrefix(sLang.lowercased()) }) {
+        selectSubtitle(embeddedCount + sideIdx)
+      }
+    }
+  }
+
+  private func avEmbeddedSubtitleOptions() -> [AVMediaSelectionOption] {
+    guard isUsingAvPlayer,
+          let item = avPlayer.currentItem,
+          let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) else { return [] }
+    return group.options
+  }
+
+  var subtitlesEnabled: Bool {
+    if isUsingAvPlayer {
+      return selectedSubtitleIdx >= 0
+    }
+    #if canImport(MobileVLCKit)
+    if let cur = vlcPlayer?.currentVideoSubTitleIndex, cur >= 0 {
+      return true
+    }
+    #endif
+    return selectedSubtitleIdx >= 0
+  }
+
+  func subtitleTracks() -> [IosTrackOption] {
+    var list: [IosTrackOption] = []
+    if isUsingAvPlayer {
+      let embedded = avEmbeddedSubtitleOptions()
+      for (i, opt) in embedded.enumerated() {
+        list.append(IosTrackOption(
+          index: i,
+          label: opt.displayName,
+          language: opt.extendedLanguageTag,
+          selected: selectedSubtitleIdx == i
+        ))
+      }
+      for (j, side) in sidecarSubtitles.enumerated() {
+        let idx = embedded.count + j
+        list.append(IosTrackOption(
+          index: idx,
+          label: side.option.name,
+          language: side.option.language,
+          selected: selectedSubtitleIdx == idx
+        ))
+      }
+      return list
+    }
+
+    #if canImport(MobileVLCKit)
+    if let player = vlcPlayer {
+      let names = (player.videoSubTitlesNames as? [String]) ?? []
+      let indexes = (player.videoSubTitlesIndexes as? [NSNumber])?.map { Int($0.int32Value) } ?? []
+      let current = Int(player.currentVideoSubTitleIndex)
+      var embeddedValidCount = 0
+      for (pos, vlcIdx) in indexes.enumerated() where vlcIdx >= 0 {
+        let label = pos < names.count ? names[pos] : "Track \(vlcIdx)"
+        list.append(IosTrackOption(
+          index: vlcIdx,
+          label: label,
+          language: nil,
+          selected: current == vlcIdx && selectedSubtitleIdx < 10_000
+        ))
+        embeddedValidCount += 1
+      }
+      // Also expose remote HTTP sidecar subtitles parsed via SidecarSubtitleParser
+      for (j, side) in sidecarSubtitles.enumerated() {
+        let syntheticIdx = 10_000 + j
+        list.append(IosTrackOption(
+          index: syntheticIdx,
+          label: side.option.name + (embeddedValidCount > 0 ? " (外挂)" : ""),
+          language: side.option.language,
+          selected: selectedSubtitleIdx == syntheticIdx
+        ))
+      }
+    }
+    #endif
+    return list
+  }
+
+  func selectSubtitle(_ index: Int) {
+    selectedSubtitleIdx = index
+    if isUsingAvPlayer {
+      let embedded = avEmbeddedSubtitleOptions()
+      if let item = avPlayer.currentItem,
+         let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) {
+        if index >= 0 && index < embedded.count {
+          item.select(embedded[index], in: group)
+        } else {
+          item.select(nil, in: group)
+        }
+      }
+      updateCurrentSidecarCue()
+      return
+    }
+
+    #if canImport(MobileVLCKit)
+    if let player = vlcPlayer {
+      if index < 0 {
+        player.currentVideoSubTitleIndex = -1
+      } else if index >= 10_000 {
+        player.currentVideoSubTitleIndex = -1
+      } else {
+        player.currentVideoSubTitleIndex = Int32(index)
+      }
+    }
+    updateCurrentSidecarCue()
+    #endif
+  }
+
+  func audioTracks() -> [IosTrackOption] {
+    if isUsingAvPlayer {
+      guard let item = avPlayer.currentItem,
+            let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .audible) else { return [] }
+      let current = item.currentMediaSelection.selectedMediaOption(in: group)
+      return group.options.enumerated().map { idx, opt in
+        IosTrackOption(
+          index: idx,
+          label: opt.displayName,
+          language: opt.extendedLanguageTag,
+          selected: (selectedAudioIdx == idx) || (selectedAudioIdx < 0 && current == opt)
+        )
+      }
+    }
+
+    #if canImport(MobileVLCKit)
+    if let player = vlcPlayer {
+      let names = (player.audioTrackNames as? [String]) ?? []
+      let indexes = (player.audioTrackIndexes as? [NSNumber])?.map { Int($0.int32Value) } ?? []
+      let current = Int(player.currentAudioTrackIndex)
+      var result: [IosTrackOption] = []
+      for (pos, vlcIdx) in indexes.enumerated() where vlcIdx >= 0 {
+        let label = pos < names.count ? names[pos] : "Audio \(vlcIdx)"
+        result.append(IosTrackOption(
+          index: vlcIdx,
+          label: label,
+          language: nil,
+          selected: current == vlcIdx
+        ))
+      }
+      return result
+    }
+    #endif
+    return []
+  }
+
+  func selectAudio(_ index: Int) {
+    selectedAudioIdx = index
+    if isUsingAvPlayer {
+      guard let item = avPlayer.currentItem,
+            let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .audible) else { return }
+      if index >= 0 && index < group.options.count {
+        item.select(group.options[index], in: group)
+      } else if let def = group.defaultOption {
+        item.select(def, in: group)
+      }
+      return
+    }
+
+    #if canImport(MobileVLCKit)
+    vlcPlayer?.currentAudioTrackIndex = Int32(index)
+    #endif
+  }
+
+  private func loadSidecarSubtitles(_ list: [SubtitleOption], headers: [String: String]) {
+    sidecarSubtitles = list.map { LoadedSidecarSubtitle(option: $0, cues: []) }
+    if !list.isEmpty && selectedSubtitleIdx < 0 {
+      selectedSubtitleIdx = isUsingAvPlayer ? avEmbeddedSubtitleOptions().count : 10_000
+    }
+    for (idx, sub) in list.enumerated() {
+      guard let u = parseMediaURL(sub.url) else { continue }
+      if u.isFileURL {
+        let accessed = u.startAccessingSecurityScopedResource()
+        let text = (try? String(contentsOf: u, encoding: .utf8)) ?? (try? String(contentsOf: u, encoding: .utf16))
+        if accessed { u.stopAccessingSecurityScopedResource() }
+        if let text = text {
+          let cues = SidecarSubtitleParser.parse(text)
+          DispatchQueue.main.async { [weak self] in
+            guard let self = self, idx < self.sidecarSubtitles.count else { return }
+            self.sidecarSubtitles[idx].cues = cues
+            self.updateCurrentSidecarCue()
+          }
+        }
+        continue
+      }
+      var req = URLRequest(url: u)
+      for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+      URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+        guard let data = data,
+              let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16) else { return }
+        let cues = SidecarSubtitleParser.parse(text)
+        DispatchQueue.main.async {
+          guard let self = self, idx < self.sidecarSubtitles.count else { return }
+          self.sidecarSubtitles[idx].cues = cues
+          self.updateCurrentSidecarCue()
+        }
+      }.resume()
+    }
+  }
+
+  private func updateCurrentSidecarCue() {
+    let sideIdx: Int
+    if isUsingAvPlayer {
+      sideIdx = selectedSubtitleIdx - avEmbeddedSubtitleOptions().count
+    } else {
+      sideIdx = selectedSubtitleIdx - 10_000
+    }
+    guard sideIdx >= 0 && sideIdx < sidecarSubtitles.count else {
+      delegate?.kernelDidUpdateSubtitleCue(nil)
+      return
+    }
+    let cues = sidecarSubtitles[sideIdx].cues
+    let pos = positionMs
+    let activeLines = cues.filter { pos >= $0.startMs && pos <= $0.endMs }.map { $0.text }
+    delegate?.kernelDidUpdateSubtitleCue(activeLines.isEmpty ? nil : activeLines.joined(separator: "\n"))
+  }
+
+  // MARK: - Screenshot to Photos
+
+  func captureScreenshot(completion: @escaping (Bool, String) -> Void) {
+    if isUsingAvPlayer {
+      guard let output = videoOutput, let item = avPlayer.currentItem else {
+        completion(false, IosPlayerUiText.t("当前画面无法截图", "No video frame available"))
+        return
+      }
+      let time = item.currentTime()
+      guard let pixelBuffer = output.copyPixelBuffer(forItemTime: time, itemTimeForDisplay: nil) else {
+        completion(false, IosPlayerUiText.t("当前画面暂不可截图（可能受 DRM 保护）", "Cannot capture frame right now"))
+        return
+      }
+      let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+      let context = CIContext(options: nil)
+      guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+        completion(false, IosPlayerUiText.t("生成截图失败", "Failed to render frame"))
+        return
+      }
+      saveImageToPhotos(UIImage(cgImage: cgImage), completion: completion)
+      return
+    }
+
+    // VLC drawable capture
+    guard videoView.bounds.width > 0, videoView.bounds.height > 0 else {
+      completion(false, IosPlayerUiText.t("当前画面无法截图", "No video frame available"))
+      return
+    }
+    let renderer = UIGraphicsImageRenderer(bounds: videoView.bounds)
+    let image = renderer.image { _ in
+      videoView.drawHierarchy(in: videoView.bounds, afterScreenUpdates: false)
+    }
+    saveImageToPhotos(image, completion: completion)
+  }
+
+  private func saveImageToPhotos(_ uiImage: UIImage, completion: @escaping (Bool, String) -> Void) {
+    PHPhotoLibrary.requestAuthorization(for: .addOnly) { status in
+      guard status == .authorized || status == .limited else {
+        DispatchQueue.main.async {
+          completion(false, IosPlayerUiText.t("未授予相册写入权限", "Photos permission denied"))
+        }
+        return
+      }
+      PHPhotoLibrary.shared().performChanges({
+        PHAssetChangeRequest.creationRequestForAsset(from: uiImage)
+      }) { ok, err in
+        DispatchQueue.main.async {
+          if ok {
+            completion(true, IosPlayerUiText.t("截图已保存至系统相册", "Screenshot saved to Photos"))
+          } else {
+            completion(false, err?.localizedDescription ?? IosPlayerUiText.t("保存截图失败", "Failed to save screenshot"))
+          }
+        }
+      }
+    }
+  }
+
+  // MARK: - Cleanup
+
+  private func cleanupAvItemObservers() {
+    statusObs?.invalidate(); statusObs = nil
+    presentationSizeObs?.invalidate(); presentationSizeObs = nil
+    bufferEmptyObs?.invalidate(); bufferEmptyObs = nil
+    likelyToKeepUpObs?.invalidate(); likelyToKeepUpObs = nil
+    timeControlObs?.invalidate(); timeControlObs = nil
+    if let obs = endObserver {
+      NotificationCenter.default.removeObserver(obs)
+      endObserver = nil
+    }
+  }
+
+  private func stopAvPlaybackOnly() {
+    cleanupAvItemObservers()
+    if pipController?.isPictureInPictureActive == true {
+      pipController?.stopPictureInPicture()
+    }
+    avPlayer.pause()
+    avPlayer.replaceCurrentItem(with: nil)
+    secondaryAudioPlayer?.pause()
+    secondaryAudioPlayer = nil
+  }
+
+  private func stopVlcPlaybackOnly() {
+    #if canImport(MobileVLCKit)
+    vlcStatsTimer?.invalidate()
+    vlcStatsTimer = nil
+    if let p = vlcPlayer {
+      p.delegate = nil
+      p.stop()
+      p.drawable = nil
+    }
+    vlcPlayer = nil
+    if let cstr = vlcAspectCString {
+      free(cstr)
+      vlcAspectCString = nil
+    }
+    #endif
+  }
+
+  func releaseKernel() {
+    stopAvPlaybackOnly()
+    stopVlcPlaybackOnly()
+    if let obs = timeObserver {
+      avPlayer.removeTimeObserver(obs)
+      timeObserver = nil
+    }
+    pipController?.delegate = nil
+    pipController = nil
+    videoView.bind(avPlayer: nil)
+  }
+}
+
+#if canImport(MobileVLCKit)
+extension IosPlayerKernel: VLCMediaPlayerDelegate {
+  func mediaPlayerStateChanged(_ aNotification: Notification) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self, !self.isUsingAvPlayer, let player = self.vlcPlayer else { return }
+      switch player.state {
+      case .opening, .buffering:
+        if player.isPlaying {
+          self.updateState("playing")
+        } else {
+          self.updateState("buffering")
+        }
+      case .playing:
+        if !self.vlcAppliedInitialSeek && self.vlcPendingStartMs > 0 {
+          self.vlcAppliedInitialSeek = true
+          player.time = VLCTime(number: NSNumber(value: self.vlcPendingStartMs))
+        }
+        player.rate = self.speed
+        self.updateState("playing")
+      case .paused:
+        self.updateState("paused")
+      case .ended:
+        self.updateState("ended")
+      case .error:
+        let msg = "VLC " + IosPlayerUiText.t("播放失败", "playback failed")
+        self.delegate?.kernelDidFail(message: msg, code: -2)
+      case .stopped, .esAdded:
+        break
+      @unknown default:
+        break
+      }
+    }
+  }
+
+  func mediaPlayerTimeChanged(_ aNotification: Notification) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self, !self.isUsingAvPlayer, let player = self.vlcPlayer else { return }
+      let ms = Int64(player.time.intValue)
+      if ms >= 0 { self.positionMs = ms }
+      if let len = player.media?.length.intValue, len > 0 {
+        self.durationMs = Int64(len)
+      }
+      if self.state == "buffering" && player.isPlaying && !self.isSeeking {
+        self.updateState("playing")
+      }
+      self.updateCurrentSidecarCue()
+      self.delegate?.kernelDidUpdateMetrics()
+    }
+  }
+}
+#endif

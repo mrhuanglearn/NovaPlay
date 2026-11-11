@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- OBSERVED in the original (anim/player_slide_in_bottom): translate 100%p -> 0, 300 ms, decelerate_quad. -->
+<translate xmlns:android="http://schemas.android.com/apk/res/android"
+    android:interpolator="@android:interpolator/decelerate_quad"
+    android:duration="300"
+    android:fromYDelta="100%p"
+    android:toYDelta="0%p" />

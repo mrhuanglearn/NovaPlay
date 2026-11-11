@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- OBSERVED in the original (anim/player_slide_out_bottom): translate 0 -> 100%p, 300 ms, accelerate_quad. -->
+<translate xmlns:android="http://schemas.android.com/apk/res/android"
+    android:interpolator="@android:interpolator/accelerate_quad"
+    android:duration="300"
+    android:fromYDelta="0%p"
+    android:toYDelta="100%p" />
