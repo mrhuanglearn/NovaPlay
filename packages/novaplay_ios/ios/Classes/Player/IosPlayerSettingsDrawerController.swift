@@ -133,7 +133,7 @@ final class IosPlayerSettingsDrawerController: UIViewController {
     let p = controller.playbackConfig
     let k = controller.kernel
     let accent = IosPlayerUiText.accentColor(hex: p.accentColorHex)
-    let activeKernel = IosPlayerUiText.normalizeIosKernel(p.kernel)
+    let activeKernel = k.activeKernelId
 
     // 1. 音轨与字幕
     addSectionHeader(IosPlayerUiText.t("音轨与字幕", "Audio & Subtitles"))
@@ -237,9 +237,7 @@ final class IosPlayerSettingsDrawerController: UIViewController {
       accent: accent
     ) { [weak self] in
       guard let self = self else { return }
-      var next = self.controller.playbackConfig
-      next.kernel = "avplayer"
-      self.controller.updatePlayback(next)
+      self.controller.selectPlayerKernel("avplayer")
       self.rebuildRows()
     }
 
@@ -254,9 +252,7 @@ final class IosPlayerSettingsDrawerController: UIViewController {
       accent: accent
     ) { [weak self] in
       guard let self = self else { return }
-      var next = self.controller.playbackConfig
-      next.kernel = "vlc"
-      self.controller.updatePlayback(next)
+      self.controller.selectPlayerKernel("vlc")
       self.rebuildRows()
     }
 

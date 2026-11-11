@@ -136,7 +136,9 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     #endif
   }
 
+  private(set) var preferredKernelId: String = "avplayer"
   private(set) var activeKernelId: String = "avplayer"
+  private(set) var lastDiagnosticReport: String?
   var hwDecode: Bool = true
   var isUsingAvPlayer: Bool { activeKernelId == "avplayer" }
 
@@ -161,6 +163,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   private var likelyToKeepUpObs: NSKeyValueObservation?
   private var presentationSizeObs: NSKeyValueObservation?
   private var endObserver: NSObjectProtocol?
+  private var failedEndObserver: NSObjectProtocol?
+  private var shiftedSidecarIndexForCurrentItem: Bool = false
 
   // MARK: - MobileVLCKit State
   #if canImport(MobileVLCKit)
@@ -169,6 +173,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   private var vlcAspectCString: UnsafeMutablePointer<CChar>?
   private var vlcPendingStartMs: Int64 = 0
   private var vlcAppliedInitialSeek: Bool = false
+  private var vlcLoadedViaProxy: Bool = false
   #endif
 
   // MARK: - Shared Metrics & Tracks
@@ -184,7 +189,26 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   private var shouldAutoPlay: Bool = true
 
   private var lastBytesTotal: Int64 = -1
+  private var lastProxyBytesTotal: Int64 = -1
   private var lastBytesSampleTime: TimeInterval = 0
+
+  private struct ActiveLoadContext {
+    let generation: UInt64
+    let rawUrl: String
+    let cleanUrl: URL
+    let audioUrl: String?
+    let effectiveHeaders: [String: String]
+    let startMs: Int64
+    let subtitles: [SubtitleOption]
+    let proxyToken: String?
+    var proxiedVlcUrl: URL?
+  }
+  private var loadGeneration: UInt64 = 0
+  private var activeLoad: ActiveLoadContext?
+  private var cancelPendingProbe: (() -> Void)?
+  private var didAutoFallbackToVlc: Bool = false
+  private var vlcRetriedDirect: Bool = false
+  private var lastAvFailureSummary: String?
 
   var speed: Float = 1.0 {
     didSet {
@@ -254,22 +278,36 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
 
   func selectKernelBackend(_ rawKernel: String, notifyFallback: Bool = true) {
     let normalized = IosPlayerUiText.normalizeIosKernel(rawKernel)
+    lastAvFailedRawUrl = nil
     if normalized == "vlc" {
+      #if canImport(MobileVLCKit)
+      preferredKernelId = "vlc"
+      applyActiveBackend("vlc")
+      #else
+      preferredKernelId = "avplayer"
+      applyActiveBackend("avplayer")
+      if notifyFallback {
+        delegate?.kernelDidFallbackNotice(
+          IosPlayerUiText.t("当前构建未内置 VLC 内核，已自动回退至 AVPlayer", "VLC not bundled in this build; using AVPlayer")
+        )
+      }
+      #endif
+    } else {
+      preferredKernelId = "avplayer"
+      applyActiveBackend("avplayer")
+    }
+  }
+
+  private var lastAvFailedRawUrl: String?
+
+  private func applyActiveBackend(_ target: String) {
+    if target == "vlc" {
       #if canImport(MobileVLCKit)
       if activeKernelId != "vlc" {
         stopAvPlaybackOnly()
         activeKernelId = "vlc"
         videoView.usingVlc = true
         pipController?.canStartPictureInPictureAutomaticallyFromInline = false
-      }
-      #else
-      activeKernelId = "avplayer"
-      videoView.usingVlc = false
-      pipController?.canStartPictureInPictureAutomaticallyFromInline = autoPictureInPicture
-      if notifyFallback {
-        delegate?.kernelDidFallbackNotice(
-          IosPlayerUiText.t("当前构建未内置 VLC 内核，已自动回退至 AVPlayer", "VLC not bundled in this build; using AVPlayer")
-        )
       }
       #endif
     } else {
@@ -280,6 +318,15 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
         pipController?.canStartPictureInPictureAutomaticallyFromInline = autoPictureInPicture
       }
     }
+  }
+
+  private func switchActiveBackendTemporarilyToVlc(notice: String?) {
+    #if canImport(MobileVLCKit)
+    applyActiveBackend("vlc")
+    if let notice = notice, !notice.isEmpty {
+      delegate?.kernelDidFallbackNotice(notice)
+    }
+    #endif
   }
 
   private func configureAudioSession() {
@@ -318,20 +365,33 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
             self.bufferedMs = Int64(endSec * 1000.0)
           }
         }
-        self.sampleAvDownloadSpeed(from: item)
       }
+      self.sampleAvDownloadSpeed(from: self.avPlayer.currentItem)
       self.updateCurrentSidecarCue()
       self.delegate?.kernelDidUpdateMetrics()
     }
   }
 
-  private func sampleAvDownloadSpeed(from item: AVPlayerItem) {
+  private func sampleAvDownloadSpeed(from item: AVPlayerItem?) {
     let now = CACurrentMediaTime()
     guard now - lastBytesSampleTime >= 0.5 else { return }
     let prevTime = lastBytesSampleTime
     lastBytesSampleTime = now
 
-    guard let events = item.accessLog()?.events, !events.isEmpty else {
+    if activeLoad?.proxyToken != nil {
+      let proxyTotal = IosStreamProxy.shared.totalUpstreamBytesRead()
+      if lastProxyBytesTotal >= 0 && prevTime > 0 && proxyTotal >= lastProxyBytesTotal {
+        let dt = max(0.2, now - prevTime)
+        let delta = Double(proxyTotal - lastProxyBytesTotal) / dt
+        downloadBytesPerSec = delta > 0 ? delta : 0
+      }
+      lastProxyBytesTotal = proxyTotal
+      if downloadBytesPerSec > 0 {
+        return
+      }
+    }
+
+    guard let item = item, let events = item.accessLog()?.events, !events.isEmpty else {
       downloadBytesPerSec = 0
       return
     }
@@ -365,8 +425,14 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     startMs: Int64,
     subtitles: [SubtitleOption]
   ) {
+    loadGeneration &+= 1
+    let gen = loadGeneration
+    cancelPendingProbe?()
+    cancelPendingProbe = nil
+
     lastBytesTotal = -1
-    lastBytesSampleTime = 0
+    lastProxyBytesTotal = IosStreamProxy.shared.totalUpstreamBytesRead()
+    lastBytesSampleTime = CACurrentMediaTime()
     downloadBytesPerSec = 0
     positionMs = max(0, startMs)
     durationMs = 0
@@ -378,40 +444,253 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     selectedAudioIdx = -1
     shouldAutoPlay = true
     isSeeking = false
+    didAutoFallbackToVlc = false
+    vlcRetriedDirect = false
+    lastAvFailureSummary = nil
+    lastDiagnosticReport = nil
     delegate?.kernelDidUpdateSubtitleCue(nil)
+
+    if preferredKernelId == "avplayer" && lastAvFailedRawUrl == url {
+      #if canImport(MobileVLCKit)
+      didAutoFallbackToVlc = true
+      applyActiveBackend("vlc")
+      #else
+      applyActiveBackend("avplayer")
+      #endif
+    } else {
+      applyActiveBackend(preferredKernelId)
+    }
     updateState("buffering")
 
-    guard let mediaURL = parseMediaURL(url) else {
-      delegate?.kernelDidFail(message: IosPlayerUiText.t("无效的播放地址", "Invalid playback URL"), code: -1)
+    let (parsedURL, effectiveHeaders) = IosUrlSanitizer.normalizeUrlAndHeaders(rawUrl: url, headers: headers)
+    guard let mediaURL = parsedURL else {
+      let msg = IosPlayerUiText.t("无效的播放地址", "Invalid playback URL")
+      lastDiagnosticReport = "\(msg)\nrawUrl=\(url.prefix(240))"
+      delegate?.kernelDidFail(message: msg, code: -1)
       return
     }
 
-    loadSidecarSubtitles(subtitles, headers: headers)
+    stopAvPlaybackOnly()
+    stopVlcPlaybackOnly()
+    loadSidecarSubtitles(subtitles, headers: effectiveHeaders)
 
-    if isUsingAvPlayer {
-      stopVlcPlaybackOnly()
-      loadWithAvPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: headers, startMs: startMs)
-    } else {
-      #if canImport(MobileVLCKit)
-      stopAvPlaybackOnly()
-      loadWithVlcPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: headers, startMs: startMs, subtitles: subtitles)
-      #else
-      selectKernelBackend("avplayer", notifyFallback: true)
-      loadWithAvPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: headers, startMs: startMs)
-      #endif
+    let scheme = (mediaURL.scheme ?? "").lowercased()
+    if mediaURL.isFileURL {
+      activeLoad = ActiveLoadContext(
+        generation: gen,
+        rawUrl: url,
+        cleanUrl: mediaURL,
+        audioUrl: audioUrl,
+        effectiveHeaders: effectiveHeaders,
+        startMs: startMs,
+        subtitles: subtitles,
+        proxyToken: nil,
+        proxiedVlcUrl: mediaURL
+      )
+      if isUsingAvPlayer && IosStreamProxy.isLikelyVlcOnlyExtension(mediaURL.pathExtension) {
+        #if canImport(MobileVLCKit)
+        didAutoFallbackToVlc = true
+        let extUpper = mediaURL.pathExtension.uppercased()
+        switchActiveBackendTemporarilyToVlc(
+          notice: IosPlayerUiText.t("检测到 \(extUpper) 格式，已自动切换至 VLC 内核", "Switched to VLC for \(extUpper)")
+        )
+        loadWithVlcPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, subtitles: subtitles, proxyToken: nil)
+        return
+        #endif
+      }
+      if isUsingAvPlayer {
+        loadWithAvPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, proxyToken: nil)
+      } else {
+        #if canImport(MobileVLCKit)
+        loadWithVlcPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, subtitles: subtitles, proxyToken: nil)
+        #else
+        applyActiveBackend("avplayer")
+        loadWithAvPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, proxyToken: nil)
+        #endif
+      }
+      return
     }
+
+    if scheme == "http" || scheme == "https" {
+      let token = IosStreamProxy.shared.registerSession(rootURL: mediaURL, headers: effectiveHeaders)
+      let initialKind = IosStreamProxy.inferredKind(for: mediaURL)
+      let initialFile = IosStreamProxy.inferredFileName(for: mediaURL)
+      let defaultProxied = IosStreamProxy.shared.buildProxyURL(
+        targetURL: mediaURL,
+        token: token,
+        kind: initialKind,
+        fileName: initialFile
+      ) ?? mediaURL
+
+      activeLoad = ActiveLoadContext(
+        generation: gen,
+        rawUrl: url,
+        cleanUrl: mediaURL,
+        audioUrl: audioUrl,
+        effectiveHeaders: effectiveHeaders,
+        startMs: startMs,
+        subtitles: subtitles,
+        proxyToken: token,
+        proxiedVlcUrl: defaultProxied
+      )
+
+      if !isUsingAvPlayer {
+        #if canImport(MobileVLCKit)
+        loadWithVlcPlayer(mediaURL: defaultProxied, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, subtitles: subtitles, proxyToken: token)
+        return
+        #else
+        applyActiveBackend("avplayer")
+        #endif
+      }
+
+      if IosStreamProxy.isLikelyVlcOnlyExtension(mediaURL.pathExtension) {
+        #if canImport(MobileVLCKit)
+        didAutoFallbackToVlc = true
+        let extUpper = mediaURL.pathExtension.uppercased()
+        switchActiveBackendTemporarilyToVlc(
+          notice: IosPlayerUiText.t("检测到 \(extUpper) 格式，已自动切换至 VLC 内核", "Switched to VLC for \(extUpper)")
+        )
+        loadWithVlcPlayer(mediaURL: defaultProxied, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, subtitles: subtitles, proxyToken: token)
+        return
+        #endif
+      }
+
+      cancelPendingProbe = IosStreamProxy.shared.probe(token: token) { [weak self] probeRes in
+        guard let self = self, self.loadGeneration == gen else { return }
+        self.cancelPendingProbe = nil
+
+        var probeHardFailure: (msg: String, code: Int)?
+        if let httpCode = probeRes.statusCode,
+           [401, 403, 404, 410, 451, 500, 502, 503, 504].contains(httpCode) {
+          let shortMsg = IosPlayerUiText.t(
+            "视频播放失败 (上游返回 HTTP \(httpCode)，请尝试切换线路)",
+            "Playback failed (Upstream HTTP \(httpCode), please switch source)"
+          )
+          probeHardFailure = (shortMsg, httpCode)
+        } else if probeRes.container == .html && (probeRes.statusCode ?? 200) < 400 {
+          let shortMsg = IosPlayerUiText.t(
+            "视频播放失败 (上游返回防盗链网页而非视频流，请尝试切换线路)",
+            "Playback failed (Upstream returned HTML page instead of media)"
+          )
+          probeHardFailure = (shortMsg, -11828)
+        } else if probeRes.statusCode == nil, let netErr = probeRes.errorDescription, !netErr.isEmpty {
+          let shortMsg = IosPlayerUiText.t(
+            "视频播放失败 (\(netErr))",
+            "Playback failed (\(netErr))"
+          )
+          probeHardFailure = (shortMsg, -1001)
+        }
+
+        if let failure = probeHardFailure {
+          #if canImport(MobileVLCKit)
+          if !self.didAutoFallbackToVlc {
+            self.didAutoFallbackToVlc = true
+            self.vlcRetriedDirect = true
+            self.lastAvFailureSummary = failure.msg
+            self.switchActiveBackendTemporarilyToVlc(notice: nil)
+            self.loadWithVlcPlayer(
+              mediaURL: mediaURL,
+              audioUrl: audioUrl,
+              headers: effectiveHeaders,
+              startMs: startMs,
+              subtitles: subtitles,
+              proxyToken: nil
+            )
+            return
+          }
+          #endif
+          let diag = IosStreamProxy.shared.diagnosticsSummary(for: token) ?? "code=\(failure.code)"
+          self.lastDiagnosticReport = "\(failure.msg)\n[\(diag)]"
+          self.delegate?.kernelDidFail(message: failure.msg, code: failure.code)
+          return
+        }
+
+        let resolvedKind = probeRes.container.proxyKind
+        let resolvedFile = (probeRes.container == .unknown)
+          ? IosStreamProxy.inferredFileName(for: probeRes.finalURL ?? mediaURL)
+          : probeRes.container.proxyFileName
+        let resolvedProxyURL = IosStreamProxy.shared.buildProxyURL(
+          targetURL: mediaURL,
+          token: token,
+          kind: resolvedKind,
+          fileName: resolvedFile
+        ) ?? defaultProxied
+        self.activeLoad?.proxiedVlcUrl = resolvedProxyURL
+
+        if probeRes.container.requiresVlc {
+          #if canImport(MobileVLCKit)
+          self.didAutoFallbackToVlc = true
+          let fmtLabel = probeRes.container.rawValue.uppercased()
+          self.switchActiveBackendTemporarilyToVlc(
+            notice: IosPlayerUiText.t("检测到 \(fmtLabel) 格式，已自动切换至 VLC 内核", "Switched to VLC for \(fmtLabel)")
+          )
+          self.loadWithVlcPlayer(
+            mediaURL: resolvedProxyURL,
+            audioUrl: audioUrl,
+            headers: effectiveHeaders,
+            startMs: startMs,
+            subtitles: subtitles,
+            proxyToken: token
+          )
+          return
+          #endif
+        }
+
+        self.loadWithAvPlayer(
+          mediaURL: resolvedProxyURL,
+          audioUrl: audioUrl,
+          headers: effectiveHeaders,
+          startMs: startMs,
+          proxyToken: token
+        )
+      }
+      return
+    }
+
+    // Non-HTTP streaming protocols (rtmp://, rtsp://, mms://, udp://) -> VLC
+    activeLoad = ActiveLoadContext(
+      generation: gen,
+      rawUrl: url,
+      cleanUrl: mediaURL,
+      audioUrl: audioUrl,
+      effectiveHeaders: effectiveHeaders,
+      startMs: startMs,
+      subtitles: subtitles,
+      proxyToken: nil,
+      proxiedVlcUrl: mediaURL
+    )
+    #if canImport(MobileVLCKit)
+    if isUsingAvPlayer {
+      didAutoFallbackToVlc = true
+      switchActiveBackendTemporarilyToVlc(
+        notice: IosPlayerUiText.t("检测到 \(scheme.uppercased()) 协议，已自动切换至 VLC 内核", "Switched to VLC for \(scheme.uppercased())")
+      )
+    }
+    stopAvPlaybackOnly()
+    loadWithVlcPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, subtitles: subtitles, proxyToken: nil)
+    #else
+    loadWithAvPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, proxyToken: nil)
+    #endif
   }
 
   private func loadWithAvPlayer(
     mediaURL: URL,
     audioUrl: String?,
     headers: [String: String],
-    startMs: Int64
+    startMs: Int64,
+    proxyToken: String?
   ) {
     cleanupAvItemObservers()
+    shiftedSidecarIndexForCurrentItem = false
     var assetOptions: [String: Any] = [:]
-    if !headers.isEmpty {
+    let isLoopbackProxy = (mediaURL.host == "127.0.0.1")
+    if !isLoopbackProxy && !headers.isEmpty {
       assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = headers
+      if #available(iOS 16.0, *) {
+        if let ua = headers.first(where: { $0.key.lowercased() == "user-agent" })?.value {
+          assetOptions[AVURLAssetHTTPUserAgentKey] = ua
+        }
+      }
     }
     let asset = AVURLAsset(url: mediaURL, options: assetOptions)
     let item = AVPlayerItem(asset: asset)
@@ -428,11 +707,29 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
 
     secondaryAudioPlayer?.pause()
     secondaryAudioPlayer = nil
-    if let audioStr = audioUrl, !audioStr.isEmpty, let aURL = parseMediaURL(audioStr) {
-      let aAsset = AVURLAsset(url: aURL, options: assetOptions)
-      let aItem = AVPlayerItem(asset: aAsset)
-      aItem.audioTimePitchAlgorithm = .timeDomain
-      secondaryAudioPlayer = AVPlayer(playerItem: aItem)
+    if let audioStr = audioUrl, !audioStr.isEmpty {
+      let (parsedAudioURL, audioHeaders) = IosUrlSanitizer.normalizeUrlAndHeaders(rawUrl: audioStr, headers: headers)
+      if let aURL = parsedAudioURL {
+        let finalAudioURL: URL
+        if let token = proxyToken, (aURL.scheme == "http" || aURL.scheme == "https") {
+          finalAudioURL = IosStreamProxy.shared.buildProxyURL(
+            targetURL: aURL,
+            token: token,
+            kind: IosStreamProxy.inferredKind(for: aURL),
+            fileName: "audio.m4a"
+          ) ?? aURL
+        } else {
+          finalAudioURL = aURL
+        }
+        var aOpts: [String: Any] = [:]
+        if finalAudioURL.host != "127.0.0.1" && !audioHeaders.isEmpty {
+          aOpts["AVURLAssetHTTPHeaderFieldsKey"] = audioHeaders
+        }
+        let aAsset = AVURLAsset(url: finalAudioURL, options: aOpts)
+        let aItem = AVPlayerItem(asset: aAsset)
+        aItem.audioTimePitchAlgorithm = .timeDomain
+        secondaryAudioPlayer = AVPlayer(playerItem: aItem)
+      }
     }
   }
 
@@ -442,7 +739,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     audioUrl: String?,
     headers: [String: String],
     startMs: Int64,
-    subtitles: [SubtitleOption]
+    subtitles: [SubtitleOption],
+    proxyToken: String?
   ) {
     stopVlcPlaybackOnly()
     let player = VLCMediaPlayer()
@@ -450,7 +748,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     player.drawable = videoView.vlcDrawableView
 
     let media = VLCMedia(url: mediaURL)
-    media.addOption(":network-caching=1500")
+    media.addOption(":network-caching=2000")
     if hwDecode {
       media.addOption(":videotoolbox")
     } else {
@@ -458,23 +756,40 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
       media.addOption(":avcodec-hw=none")
       media.addOption(":avcodec-threads=0")
     }
-    for (k, v) in headers {
-      let lower = k.lowercased()
-      if lower == "user-agent" {
-        media.addOption(":http-user-agent=\(v)")
-      } else if lower == "referer" || lower == "referrer" {
-        media.addOption(":http-referrer=\(v)")
+    if mediaURL.host != "127.0.0.1" {
+      for (k, v) in headers {
+        let lower = k.lowercased()
+        if lower == "user-agent" {
+          media.addOption(":http-user-agent=\(v)")
+        } else if lower == "referer" || lower == "referrer" {
+          media.addOption(":http-referrer=\(v)")
+        }
       }
     }
 
     vlcPendingStartMs = max(0, startMs)
     vlcAppliedInitialSeek = (vlcPendingStartMs == 0)
+    vlcLoadedViaProxy = (mediaURL.host == "127.0.0.1")
     player.media = media
     vlcPlayer = player
     videoView.applyFitLayout()
 
-    if let audioStr = audioUrl, !audioStr.isEmpty, let aURL = parseMediaURL(audioStr) {
-      player.addPlaybackSlave(aURL, type: .audio, enforce: true)
+    if let audioStr = audioUrl, !audioStr.isEmpty {
+      let (parsedAudioURL, _) = IosUrlSanitizer.normalizeUrlAndHeaders(rawUrl: audioStr, headers: headers)
+      if let aURL = parsedAudioURL {
+        let slaveURL: URL
+        if let token = proxyToken, (aURL.scheme == "http" || aURL.scheme == "https") {
+          slaveURL = IosStreamProxy.shared.buildProxyURL(
+            targetURL: aURL,
+            token: token,
+            kind: IosStreamProxy.inferredKind(for: aURL),
+            fileName: "audio.m4a"
+          ) ?? aURL
+        } else {
+          slaveURL = aURL
+        }
+        player.addPlaybackSlave(slaveURL, type: .audio, enforce: true)
+      }
     }
     for sub in subtitles {
       if let sURL = parseMediaURL(sub.url), sURL.isFileURL {
@@ -506,8 +821,17 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
       videoSize = sz
       videoView.naturalVideoSize = sz
     }
-    if let media = player.media {
-      let now = CACurrentMediaTime()
+    let now = CACurrentMediaTime()
+    if activeLoad?.proxyToken != nil {
+      let proxyTotal = IosStreamProxy.shared.totalUpstreamBytesRead()
+      if lastProxyBytesTotal >= 0 && lastBytesSampleTime > 0 && proxyTotal >= lastProxyBytesTotal {
+        let dt = max(0.2, now - lastBytesSampleTime)
+        let delta = Double(proxyTotal - lastProxyBytesTotal) / dt
+        downloadBytesPerSec = delta > 0 ? delta : 0
+      }
+      lastProxyBytesTotal = proxyTotal
+      lastBytesSampleTime = now
+    } else if let media = player.media {
       let totalRead = Int64(max(0, media.numberOfReadBytesOnInput))
       if lastBytesTotal >= 0 && lastBytesSampleTime > 0 && totalRead >= lastBytesTotal {
         let dt = max(0.2, now - lastBytesSampleTime)
@@ -551,17 +875,39 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   }
 
   private func parseMediaURL(_ raw: String) -> URL? {
-    let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-    if trimmed.hasPrefix("/") {
-      return URL(fileURLWithPath: trimmed)
+    IosUrlSanitizer.normalizeUrlAndHeaders(rawUrl: raw, headers: [:]).url
+  }
+
+  private func describeAvFailure(item: AVPlayerItem) -> (short: String, full: String, code: Int?) {
+    let nsErr = item.error as NSError?
+    let code = nsErr?.code
+    let localized = nsErr?.localizedDescription ?? IosPlayerUiText.t("无法打开", "Cannot open")
+    let proxyDiag = IosStreamProxy.shared.diagnosticsSummary(for: activeLoad?.proxyToken)
+
+    var extraParts: [String] = []
+    if let nsErr = nsErr {
+      extraParts.append("\(nsErr.domain)(\(nsErr.code))")
+      if let under = nsErr.userInfo[NSUnderlyingErrorKey] as? NSError {
+        extraParts.append("underlying=\(under.domain)(\(under.code)): \(under.localizedDescription)")
+      }
     }
-    if let u = URL(string: trimmed), u.scheme != nil {
-      return u
+    if let lastEv = item.errorLog()?.events.last {
+      var evStr = "avLog=\(lastEv.errorDomain)(\(lastEv.errorStatusCode))"
+      if let comment = lastEv.errorComment, !comment.isEmpty {
+        evStr += ":\(comment)"
+      }
+      extraParts.append(evStr)
     }
-    if let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlFragmentAllowed) {
-      return URL(string: encoded)
+    if let proxyDiag = proxyDiag {
+      extraParts.append(proxyDiag)
     }
-    return nil
+
+    var short = "AVPlayer " + IosPlayerUiText.t("播放失败", "playback failed") + " (\(localized))"
+    if let proxyDiag = proxyDiag {
+      short += " [\(proxyDiag)]"
+    }
+    let full = extraParts.isEmpty ? short : "\(short)\n" + extraParts.joined(separator: " | ")
+    return (short, full, code)
   }
 
   private func observeAvItem(_ item: AVPlayerItem, startMs: Int64) {
@@ -570,6 +916,37 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
         guard let self = self, self.isUsingAvPlayer else { return }
         switch it.status {
         case .readyToPlay:
+          if let vTrack = it.asset.tracks(withMediaType: .video).first, !vTrack.isPlayable {
+            #if canImport(MobileVLCKit)
+            if !self.didAutoFallbackToVlc,
+               let ctx = self.activeLoad,
+               ctx.generation == self.loadGeneration {
+              self.didAutoFallbackToVlc = true
+              self.lastAvFailedRawUrl = ctx.rawUrl
+              self.lastAvFailureSummary = "AVAssetTrack.isPlayable=false"
+              let resumeAt = max(ctx.startMs, self.positionMs)
+              self.switchActiveBackendTemporarilyToVlc(
+                notice: IosPlayerUiText.t("当前设备不支持该视频编码硬解，已自动切换至 VLC 内核", "Video codec unsupported by AVPlayer; switched to VLC")
+              )
+              self.loadWithVlcPlayer(
+                mediaURL: ctx.proxiedVlcUrl ?? ctx.cleanUrl,
+                audioUrl: ctx.audioUrl,
+                headers: ctx.effectiveHeaders,
+                startMs: resumeAt,
+                subtitles: ctx.subtitles,
+                proxyToken: ctx.proxyToken
+              )
+              return
+            }
+            #endif
+          }
+          if !self.shiftedSidecarIndexForCurrentItem {
+            self.shiftedSidecarIndexForCurrentItem = true
+            let embCount = self.avEmbeddedSubtitleOptions().count
+            if embCount > 0 && !self.sidecarSubtitles.isEmpty && self.selectedSubtitleIdx >= 0 {
+              self.selectedSubtitleIdx += embCount
+            }
+          }
           self.inspectAvTrackMetadata(on: it)
           self.applyAvPreferredTracks(on: it)
           if startMs > 0 {
@@ -590,10 +967,31 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
             self.play()
           }
         case .failed:
-          let detail = it.error?.localizedDescription ?? IosPlayerUiText.t("解码失败", "Decode error")
-          let msg = "AVPlayer " + IosPlayerUiText.t("播放失败", "playback failed") + " (\(detail))"
-          let code = (it.error as NSError?)?.code
-          self.delegate?.kernelDidFail(message: msg, code: code)
+          let (shortMsg, fullDiag, code) = self.describeAvFailure(item: it)
+          #if canImport(MobileVLCKit)
+          if !self.didAutoFallbackToVlc,
+             let ctx = self.activeLoad,
+             ctx.generation == self.loadGeneration {
+            self.didAutoFallbackToVlc = true
+            self.lastAvFailedRawUrl = ctx.rawUrl
+            self.lastAvFailureSummary = fullDiag
+            let resumeAt = max(ctx.startMs, self.positionMs)
+            self.switchActiveBackendTemporarilyToVlc(
+              notice: IosPlayerUiText.t("AVPlayer 无法打开该片源，已自动切换至 VLC 内核", "AVPlayer cannot open stream; switched to VLC")
+            )
+            self.loadWithVlcPlayer(
+              mediaURL: ctx.proxiedVlcUrl ?? ctx.cleanUrl,
+              audioUrl: ctx.audioUrl,
+              headers: ctx.effectiveHeaders,
+              startMs: resumeAt,
+              subtitles: ctx.subtitles,
+              proxyToken: ctx.proxyToken
+            )
+            return
+          }
+          #endif
+          self.lastDiagnosticReport = fullDiag
+          self.delegate?.kernelDidFail(message: shortMsg, code: code)
         default:
           break
         }
@@ -629,6 +1027,52 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
       guard let self = self, self.isUsingAvPlayer else { return }
       self.secondaryAudioPlayer?.pause()
       self.updateState("ended")
+    }
+
+    failedEndObserver = NotificationCenter.default.addObserver(
+      forName: .AVPlayerItemFailedToPlayToEndTime,
+      object: item,
+      queue: .main
+    ) { [weak self] note in
+      guard let self = self, self.isUsingAvPlayer else { return }
+      let noteErr = note.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
+      let (baseShort, baseFull, baseCode) = self.describeAvFailure(item: item)
+      let shortMsg: String
+      let fullDiag: String
+      let errCode = noteErr?.code ?? baseCode
+      if let noteErr = noteErr, item.error == nil {
+        shortMsg = "AVPlayer " + IosPlayerUiText.t("播放中断", "playback interrupted") + " (\(noteErr.localizedDescription))"
+        fullDiag = "\(shortMsg)\n\(noteErr.domain)(\(noteErr.code)) | \(baseFull)"
+      } else {
+        shortMsg = baseShort
+        fullDiag = baseFull
+      }
+
+      #if canImport(MobileVLCKit)
+      if self.positionMs < 2000,
+         !self.didAutoFallbackToVlc,
+         let ctx = self.activeLoad,
+         ctx.generation == self.loadGeneration {
+        self.didAutoFallbackToVlc = true
+        self.lastAvFailedRawUrl = ctx.rawUrl
+        self.lastAvFailureSummary = fullDiag
+        let resumeAt = max(ctx.startMs, self.positionMs)
+        self.switchActiveBackendTemporarilyToVlc(
+          notice: IosPlayerUiText.t("AVPlayer 分片加载失败，已自动切换至 VLC 内核", "AVPlayer segment failed; switched to VLC")
+        )
+        self.loadWithVlcPlayer(
+          mediaURL: ctx.proxiedVlcUrl ?? ctx.cleanUrl,
+          audioUrl: ctx.audioUrl,
+          headers: ctx.effectiveHeaders,
+          startMs: resumeAt,
+          subtitles: ctx.subtitles,
+          proxyToken: ctx.proxyToken
+        )
+        return
+      }
+      #endif
+      self.lastDiagnosticReport = fullDiag
+      self.delegate?.kernelDidFail(message: shortMsg, code: errCode)
     }
   }
 
@@ -691,15 +1135,29 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
 
   // MARK: - Playback Controls
 
+  private func resumeAvPlaybackWithStallProtection() {
+    if #available(iOS 16.0, *) {
+      avPlayer.defaultRate = speed
+      secondaryAudioPlayer?.defaultRate = speed
+    }
+    avPlayer.play()
+    if abs(speed - 1.0) > 0.001 {
+      avPlayer.rate = speed
+    }
+    if let sec = secondaryAudioPlayer {
+      sec.seek(to: avPlayer.currentTime(), toleranceBefore: .zero, toleranceAfter: .zero)
+      sec.play()
+      if abs(speed - 1.0) > 0.001 {
+        sec.rate = speed
+      }
+    }
+  }
+
   func play() {
     shouldAutoPlay = true
     configureAudioSession()
     if isUsingAvPlayer {
-      avPlayer.playImmediately(atRate: speed)
-      if let sec = secondaryAudioPlayer {
-        sec.seek(to: avPlayer.currentTime(), toleranceBefore: .zero, toleranceAfter: .zero)
-        sec.playImmediately(atRate: speed)
-      }
+      resumeAvPlaybackWithStallProtection()
       syncStateFromAvPlayer()
     } else {
       #if canImport(MobileVLCKit)
@@ -740,8 +1198,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
           }
           self.updateCurrentSidecarCue()
           if self.shouldAutoPlay {
-            self.avPlayer.playImmediately(atRate: self.speed)
-            self.secondaryAudioPlayer?.playImmediately(atRate: self.speed)
+            self.resumeAvPlaybackWithStallProtection()
           }
           self.syncStateFromAvPlayer()
         }
@@ -806,14 +1263,14 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
 
   func applySubtitlePreferences(lang: String?) {
     preferredSubtitleLang = lang
-    if isUsingAvPlayer, let item = avPlayer.currentItem {
+    if isUsingAvPlayer, let item = avPlayer.currentItem, item.status == .readyToPlay {
       applyAvPreferredTracks(on: item)
     }
   }
 
   func applyAudioPreference(lang: String?) {
     preferredAudioLang = lang
-    if isUsingAvPlayer, let item = avPlayer.currentItem {
+    if isUsingAvPlayer, let item = avPlayer.currentItem, item.status == .readyToPlay {
       applyAvPreferredTracks(on: item)
     }
   }
@@ -839,6 +1296,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   private func avEmbeddedSubtitleOptions() -> [AVMediaSelectionOption] {
     guard isUsingAvPlayer,
           let item = avPlayer.currentItem,
+          item.status == .readyToPlay,
           let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) else { return [] }
     return group.options
   }
@@ -915,6 +1373,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     if isUsingAvPlayer {
       let embedded = avEmbeddedSubtitleOptions()
       if let item = avPlayer.currentItem,
+         item.status == .readyToPlay,
          let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .legible) {
         if index >= 0 && index < embedded.count {
           item.select(embedded[index], in: group)
@@ -943,6 +1402,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   func audioTracks() -> [IosTrackOption] {
     if isUsingAvPlayer {
       guard let item = avPlayer.currentItem,
+            item.status == .readyToPlay,
             let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .audible) else { return [] }
       let current = item.currentMediaSelection.selectedMediaOption(in: group)
       return group.options.enumerated().map { idx, opt in
@@ -980,6 +1440,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     selectedAudioIdx = index
     if isUsingAvPlayer {
       guard let item = avPlayer.currentItem,
+            item.status == .readyToPlay,
             let group = item.asset.mediaSelectionGroup(forMediaCharacteristic: .audible) else { return }
       if index >= 0 && index < group.options.count {
         item.select(group.options[index], in: group)
@@ -1116,6 +1577,10 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
       NotificationCenter.default.removeObserver(obs)
       endObserver = nil
     }
+    if let obs = failedEndObserver {
+      NotificationCenter.default.removeObserver(obs)
+      failedEndObserver = nil
+    }
   }
 
   private func stopAvPlaybackOnly() {
@@ -1147,6 +1612,10 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   }
 
   func releaseKernel() {
+    loadGeneration &+= 1
+    cancelPendingProbe?()
+    cancelPendingProbe = nil
+    activeLoad = nil
     stopAvPlaybackOnly()
     stopVlcPlaybackOnly()
     if let obs = timeObserver {
@@ -1183,7 +1652,47 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
       case .ended:
         self.updateState("ended")
       case .error:
-        let msg = "VLC " + IosPlayerUiText.t("播放失败", "playback failed")
+        let proxyDiag = IosStreamProxy.shared.diagnosticsSummary(for: self.activeLoad?.proxyToken)
+        let hasHardHttpErr = (proxyDiag?.contains("HTTP 4") == true) || (proxyDiag?.contains("HTTP 5") == true)
+        if !self.vlcRetriedDirect,
+           !hasHardHttpErr,
+           self.vlcLoadedViaProxy,
+           let ctx = self.activeLoad,
+           ctx.generation == self.loadGeneration {
+          self.vlcRetriedDirect = true
+          let resumeAt = max(ctx.startMs, self.positionMs)
+          self.loadWithVlcPlayer(
+            mediaURL: ctx.cleanUrl,
+            audioUrl: ctx.audioUrl,
+            headers: ctx.effectiveHeaders,
+            startMs: resumeAt,
+            subtitles: ctx.subtitles,
+            proxyToken: nil
+          )
+          return
+        }
+        var msg: String
+        if let avSummary = self.lastAvFailureSummary, avSummary.hasPrefix("视频播放失败") || avSummary.hasPrefix("Playback failed") {
+          msg = avSummary
+        } else if self.lastAvFailureSummary != nil {
+          msg = IosPlayerUiText.t("AVPlayer 与 VLC 均播放失败", "Both AVPlayer and VLC failed to open stream")
+          if let proxyDiag = proxyDiag {
+            msg += " (\(proxyDiag))"
+          }
+        } else {
+          msg = "VLC " + IosPlayerUiText.t("播放失败", "playback failed")
+          if let proxyDiag = proxyDiag {
+            msg += " (\(proxyDiag))"
+          }
+        }
+        var reportLines: [String] = [msg]
+        if let avFail = self.lastAvFailureSummary {
+          reportLines.append("AVPlayer: \(avFail)")
+        }
+        if let host = self.activeLoad?.cleanUrl.host {
+          reportLines.append("targetHost=\(host), ext=\(self.activeLoad?.cleanUrl.pathExtension ?? "")")
+        }
+        self.lastDiagnosticReport = reportLines.joined(separator: "\n")
         self.delegate?.kernelDidFail(message: msg, code: -2)
       case .stopped, .esAdded:
         break

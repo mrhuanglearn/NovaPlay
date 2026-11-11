@@ -531,7 +531,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     errorBodyLabel.font = UIFont.systemFont(ofSize: 13, weight: .regular)
     errorBodyLabel.textColor = UIColor(white: 0.88, alpha: 1.0)
     errorBodyLabel.textAlignment = .center
-    errorBodyLabel.numberOfLines = 4
+    errorBodyLabel.numberOfLines = 6
 
     stylePillButton(errorCancelBtn)
     errorCancelBtn.setTitle(IosPlayerUiText.t("取消", "Dismiss"), for: .normal)
@@ -870,8 +870,8 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   }
 
   @objc private func onTapErrorCopy() {
-    UIPasteboard.general.string = controller.errorMessage ?? ""
-    controllerDidShowToast(IosPlayerUiText.t("已复制错误信息", "Error copied"), long: false)
+    UIPasteboard.general.string = controller.copyableErrorText
+    controllerDidShowToast(IosPlayerUiText.t("已复制完整诊断信息", "Diagnostic info copied"), long: false)
   }
 
   @objc private func onTapErrorRetry() {

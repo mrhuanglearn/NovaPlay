@@ -307,6 +307,37 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     updatePlayback(next)
   }
 
+  var copyableErrorText: String {
+    if let diag = kernel.lastDiagnosticReport, !diag.isEmpty {
+      return diag
+    }
+    return errorMessage ?? ""
+  }
+
+  func selectPlayerKernel(_ targetKernel: String) {
+    let targetNorm = IosPlayerUiText.normalizeIosKernel(targetKernel)
+    let prevActive = kernel.activeKernelId
+    var next = playbackConfig
+    next.kernel = targetNorm
+    playbackConfig = next
+    kernel.selectKernelBackend(targetNorm, notifyFallback: true)
+    if prevActive != kernel.activeKernelId, let payload = lastPayload, let mediaUrl = payload.url {
+      errorMessage = nil
+      failed = false
+      let resumeMs = kernel.positionMs
+      let subs = (payload.subtitles ?? []) + extraSubtitles
+      kernel.load(
+        url: mediaUrl,
+        audioUrl: payload.audioUrl,
+        headers: payload.headers ?? [:],
+        startMs: resumeMs,
+        subtitles: subs
+      )
+    }
+    reportPreferences()
+    uiDelegate?.controllerDidChangeState()
+  }
+
   func updatePlayback(_ next: PlaybackConfig) {
     applyPlaybackChange(next, reportToDart: true)
   }
@@ -316,13 +347,15 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     playbackConfig = next
     let oldNormKernel = IosPlayerUiText.normalizeIosKernel(old.kernel)
     let nextNormKernel = IosPlayerUiText.normalizeIosKernel(next.kernel)
+    let prevActiveKernel = kernel.activeKernelId
     let kernelChanged = (oldNormKernel != nextNormKernel)
-    let hwChanged = (old.hwDecode != next.hwDecode) && (nextNormKernel == "vlc")
+    let hwChanged = (old.hwDecode != next.hwDecode) && (prevActiveKernel == "vlc" || nextNormKernel == "vlc")
 
     kernel.hwDecode = next.hwDecode
     if kernelChanged {
       kernel.selectKernelBackend(next.kernel, notifyFallback: true)
     }
+    let activeKernelSwitched = (prevActiveKernel != kernel.activeKernelId)
     if old.fitMode != next.fitMode {
       kernel.fitMode = next.fitMode
     }
@@ -337,7 +370,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     if old.audioLang != next.audioLang {
       kernel.applyAudioPreference(lang: next.audioLang)
     }
-    if (kernelChanged || hwChanged), let payload = lastPayload, let mediaUrl = payload.url {
+    if (activeKernelSwitched || hwChanged), let payload = lastPayload, let mediaUrl = payload.url {
       let resumeMs = kernel.positionMs
       let subs = (payload.subtitles ?? []) + extraSubtitles
       kernel.load(

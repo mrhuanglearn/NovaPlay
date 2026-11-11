@@ -37,10 +37,6 @@
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
-		<key>NSAllowsArbitraryLoadsInWebContent</key>
-		<true/>
-		<key>NSAllowsLocalNetworking</key>
-		<true/>
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>星映需要访问局域网以连接您的 Emby、Jellyfin、WebDAV 或局域网弹幕/订阅服务。</string>
