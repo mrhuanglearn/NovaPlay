@@ -161,12 +161,27 @@ final class IosMpvEngine {
   private static let obsCacheStall: UInt64 = 4
   private static let obsVideoW: UInt64 = 5
   private static let obsVideoH: UInt64 = 6
+  private var bgObserver: NSObjectProtocol?
 
   init(metalView: MpvMetalView, hwDecode: Bool, fitMode: String, speed: Float) {
     self.metalView = metalView
     self.hwDecode = hwDecode
     self.fitMode = fitMode
     self.speed = speed
+    self.bgObserver = NotificationCenter.default.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      // MPV does not support iOS PiP and must never play or submit Metal frames in background
+      self?.pause()
+    }
+  }
+
+  deinit {
+    if let obs = bgObserver {
+      NotificationCenter.default.removeObserver(obs)
+    }
   }
 
   private func createInitializedHandle(view: MpvMetalView, vo: String) -> (OpaquePointer?, String?) {
@@ -388,7 +403,9 @@ final class IosMpvEngine {
     _ = uzv_ios_mpv_set_property_string(inst, "hwdec", hwDecode ? "videotoolbox" : "no")
     _ = uzv_ios_mpv_set_property_string(inst, "sid", subtitlesDisabledByUser ? "no" : "auto")
     _ = uzv_ios_mpv_set_property_string(inst, "aid", "auto")
-    _ = uzv_ios_mpv_set_property_flag(inst, "pause", false)
+    let inBackground = UIApplication.shared.applicationState == .background
+    userPaused = inBackground
+    _ = uzv_ios_mpv_set_property_flag(inst, "pause", inBackground)
     if speed > 0 {
       _ = uzv_ios_mpv_set_property_double(inst, "speed", Double(speed))
     }
@@ -443,6 +460,10 @@ final class IosMpvEngine {
 
   func play() {
     guard let inst = instance else { return }
+    if UIApplication.shared.applicationState == .background {
+      pause()
+      return
+    }
     userPaused = false
     _ = uzv_ios_mpv_set_property_flag(inst, "pause", false)
     if speed > 0 {
@@ -643,6 +664,10 @@ final class IosMpvEngine {
       for sub in pendingSidecars {
         _ = uzv_ios_mpv_command5(inst, "sub-add", sub.url, "auto", sub.name, sub.language ?? "")
       }
+      if UIApplication.shared.applicationState == .background {
+        userPaused = true
+        _ = uzv_ios_mpv_set_property_flag(inst, "pause", true)
+      }
       refreshVideoMetadata(inst: inst)
       mpvUsbLog.notice("[NovaPlay][MPV] FILE_LOADED codec=\(self.videoCodecName ?? "unknown", privacy: .public) size=\(Int(self.videoSize.width), privacy: .public)x\(Int(self.videoSize.height), privacy: .public)")
       publishStateIfNeeded()
@@ -779,6 +804,10 @@ final class IosMpvEngine {
   }
 
   func destroy() {
+    if let obs = bgObserver {
+      NotificationCenter.default.removeObserver(obs)
+      bgObserver = nil
+    }
     statsTimer?.invalidate()
     statsTimer = nil
     pendingLoadClosure = nil

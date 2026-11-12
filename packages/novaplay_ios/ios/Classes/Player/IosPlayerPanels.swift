@@ -2099,14 +2099,16 @@ final class IosPlayerPanels {
         get: { $0.pauseOnBackground },
         mutate: { $0.pauseOnBackground = $1 }
       )
-      addToggle(
-        card: playCard,
-        icon: IosPlayerIcon.PIP,
-        title: IosPlayerUiText.t("进入后台自动画中画", "Picture-in-picture in background"),
-        subtitle: IosPlayerUiText.t("切到后台时自动开启画中画继续播放（AVPlayer）", "Keep playing in PiP when leaving the app (AVPlayer)"),
-        get: { $0.autoPictureInPicture },
-        mutate: { $0.autoPictureInPicture = $1 }
-      )
+      if curKernel != "mpv" {
+        addToggle(
+          card: playCard,
+          icon: IosPlayerIcon.PIP,
+          title: IosPlayerUiText.t("进入后台自动画中画", "Picture-in-picture in background"),
+          subtitle: IosPlayerUiText.t("切到后台时自动开启画中画继续播放（AVPlayer）", "Keep playing in PiP when leaving the app (AVPlayer)"),
+          get: { $0.autoPictureInPicture },
+          mutate: { $0.autoPictureInPicture = $1 }
+        )
+      }
       addToggle(
         card: playCard,
         icon: IosPlayerIcon.BOLT,

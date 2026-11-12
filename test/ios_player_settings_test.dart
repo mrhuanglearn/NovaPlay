@@ -38,6 +38,7 @@ void main() {
 
     expect(find.text('AVPlayer'), findsOneWidget);
     expect(find.textContaining('Apple VideoToolbox'), findsOneWidget);
+    expect(find.text('进入后台自动画中画'), findsOneWidget);
     // Android-only /storage/emulated/0/Fonts directory row is hidden on iOS
     expect(find.text('字体目录（可选）'), findsNothing);
 
@@ -54,10 +55,12 @@ void main() {
 
     expect(find.text('MPV'), findsOneWidget);
     expect(find.textContaining('libmpv'), findsOneWidget);
-    expect(find.text('iOS 系统画中画仅在 AVPlayer 内核下可用'), findsOneWidget);
+    // Selecting MPV on iOS hides the PiP switch and force-disables autoPictureInPicture
+    expect(find.text('进入后台自动画中画'), findsNothing);
 
     final (savedMpv, _) = await repo.load();
     expect(savedMpv.kernel, 'mpv');
+    expect(savedMpv.autoPictureInPicture, isFalse);
 
     await tester.tap(find.text('播放内核'));
     await tester.pumpAndSettle();
@@ -66,6 +69,8 @@ void main() {
 
     expect(find.text('VLC'), findsOneWidget);
     expect(find.textContaining('FFmpeg / libvlc'), findsOneWidget);
+    expect(find.text('进入后台自动画中画'), findsOneWidget);
+    expect(find.text('iOS 系统画中画仅在 AVPlayer 内核下可用'), findsOneWidget);
 
     final (savedVlc, _) = await repo.load();
     expect(savedVlc.kernel, 'vlc');
@@ -73,10 +78,15 @@ void main() {
 
   testWidgets('iOS normalizes Android WebDAV-synced kernels (mpv -> MPV, mdk -> VLC, exo -> AVPlayer)',
       (tester) async {
-    final p1 = defaultPlaybackConfig()..kernel = 'mpv';
+    final p1 = defaultPlaybackConfig()
+      ..kernel = 'mpv'
+      ..autoPictureInPicture = true;
     await repo.save(p1, defaultDanmakuConfig());
     await pumpIos(tester, screenKey: const ValueKey('k1'));
     expect(find.text('MPV'), findsOneWidget);
+    expect(find.text('进入后台自动画中画'), findsNothing);
+    final (loadedMpv, _) = await repo.load();
+    expect(loadedMpv.autoPictureInPicture, isFalse);
 
     final p2 = defaultPlaybackConfig()..kernel = 'mdk';
     await repo.save(p2, defaultDanmakuConfig());

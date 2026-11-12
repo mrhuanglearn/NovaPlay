@@ -167,6 +167,13 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     self.orientationStep = controller.playbackConfig.isPriorityLandscape ? .landscapeRight : .portrait
     super.init(nibName: nil, bundle: nil)
     controller.uiDelegate = self
+    controller.kernel.isPlayerPageVisibleInline = { [weak self] in
+      guard let self = self else { return false }
+      return !self.dismissedForPiP
+        && !self.isBeingDismissed
+        && self.viewIfLoaded?.window != nil
+        && self.presentedViewController == nil
+    }
   }
 
   required init?(coder: NSCoder) {
@@ -211,9 +218,31 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
     dismissedForPiP = false
+    attachVideoViewToPlayerIfNeeded()
+    controller.kernel.setAutomaticPipInlineAllowed(true)
     applyOrientationStep()
     rebuildControlsIfNeeded(force: builtForLandscape == nil)
     showControls()
+  }
+
+  private func attachVideoViewToPlayerIfNeeded() {
+    guard isViewLoaded else { return }
+    let videoView = controller.kernel.videoView
+    guard videoView.superview !== view else { return }
+    videoView.removeFromSuperview()
+    NativePlayerHost.shared.removeParkedVideoViewHost()
+    videoView.translatesAutoresizingMaskIntoConstraints = false
+    if controller.danmakuView.superview === view {
+      view.insertSubview(videoView, belowSubview: controller.danmakuView)
+    } else {
+      view.addSubview(videoView)
+    }
+    NSLayoutConstraint.activate([
+      videoView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+      videoView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+      videoView.topAnchor.constraint(equalTo: view.topAnchor),
+      videoView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
+    ])
   }
 
   override func viewDidDisappear(_ animated: Bool) {
@@ -238,7 +267,14 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
       queue: .main
     ) { [weak self] _ in
       guard let self = self else { return }
-      if self.controller.playbackConfig.pauseOnBackground && !self.controller.kernel.isInPictureInPicture {
+      let normKernel = IosPlayerUiText.normalizeIosKernel(self.controller.playbackConfig.kernel)
+      if self.controller.kernel.isUsingMpv || normKernel == "mpv" {
+        // MPV does not support iOS PiP and must always pause when entering background
+        self.controller.kernel.pause()
+        self.controller.syncNowPlayingAfterBackgroundPause()
+      } else if self.controller.playbackConfig.pauseOnBackground
+                && !self.controller.kernel.isInPictureInPicture
+                && !self.controller.kernel.willAutoStartPipInBackground {
         self.controller.kernel.pause()
       }
     }
@@ -1353,20 +1389,14 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
       )
       return
     }
-    guard controller.kernel.isPictureInPictureSupported else {
-      controllerDidShowToast(IosPlayerUiText.t("画中画不可用", "Picture-in-picture is not available"), long: false)
+    guard controller.kernel.isPictureInPicturePossibleNow else {
+      controllerDidShowToast(IosPlayerUiText.t("画中画尚未就绪", "Picture-in-picture is not ready yet"), long: false)
       return
     }
-    dismissedForPiP = true
     overlayHost.closeMenu()
     overlayHost.closePanel()
     hideControlsAnimated(false)
-    restorePortraitBeforeExit()
-    controller.kernel.togglePictureInPicture()
-    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-      guard let self = self, self.presentingViewController != nil else { return }
-      self.dismiss(animated: true)
-    }
+    controller.kernel.startManualInAppPictureInPicture()
   }
 
   private func captureScreenshot() {
@@ -2097,8 +2127,32 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     presentSkipBanner(fromMs: fromMs)
   }
 
+  func controllerPictureInPictureDidStart(origin: IosPipOrigin) {
+    guard origin != .autoFromPlayerBackground else {
+      // Auto-PiP triggered by swiping the fullscreen player to background: keep player VC alive underneath
+      return
+    }
+    // Manual / non-background-swipe PiP: park `AVPlayerLayer` in window anchor and close the fullscreen player UI
+    dismissedForPiP = true
+    controller.kernel.setAutomaticPipInlineAllowed(false)
+    NativePlayerHost.shared.parkVideoViewForInAppPiP(controller.kernel.videoView)
+    restorePortraitBeforeExit()
+    if presentingViewController != nil {
+      let isActive = UIApplication.shared.applicationState == .active
+      dismiss(animated: isActive)
+    }
+  }
+
+  func controllerDidPauseFromBackgroundPiPClose() {
+    showControls()
+    refreshControlsState()
+    refreshInfoLayer()
+  }
+
   func controllerRequestRestorePiP(completion: @escaping (Bool) -> Void) {
     dismissedForPiP = false
+    attachVideoViewToPlayerIfNeeded()
+    controller.kernel.setAutomaticPipInlineAllowed(true)
     if presentingViewController != nil {
       completion(true)
       return

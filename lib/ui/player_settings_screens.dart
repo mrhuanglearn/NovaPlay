@@ -47,6 +47,11 @@ class _PlayerSettingsScreenState extends ConsumerState<PlayerSettingsScreen> {
     ref.read(playerConfigRepositoryProvider).load().then((v) {
       if (!mounted) return;
       final (p, d) = v;
+      final isIos = Theme.of(context).platform == TargetPlatform.iOS;
+      if (isIos && _normalizeIosKernel(p.kernel) == 'mpv' && p.autoPictureInPicture) {
+        p.autoPictureInPicture = false;
+        ref.read(playerConfigRepositoryProvider).save(p, d);
+      }
       _subLang.text = p.subtitleLang ?? '';
       _font.text = p.subtitleFontFamily ?? '';
       _fontsDir.text = p.subtitleFontsDir ?? '';
@@ -149,7 +154,12 @@ class _PlayerSettingsScreenState extends ConsumerState<PlayerSettingsScreen> {
                   icon: Icons.view_module_outlined,
                   title: l.playerKernel,
                   subtitle: kernelNames[effectiveKernel] ?? effectiveKernel.toUpperCase(),
-                  onTap: () => _pick<String>(l.playerKernel, effectiveKernel, kernels, (p, v) => p.kernel = v),
+                  onTap: () => _pick<String>(l.playerKernel, effectiveKernel, kernels, (p, v) {
+                    p.kernel = v;
+                    if (isIos && _normalizeIosKernel(v) == 'mpv') {
+                      p.autoPictureInPicture = false;
+                    }
+                  }),
                 ),
                 SettingsTile(
                   icon: Icons.aspect_ratio,
@@ -224,13 +234,14 @@ class _PlayerSettingsScreenState extends ConsumerState<PlayerSettingsScreen> {
                     title: l.playerPauseInBackground,
                     value: p.pauseOnBackground,
                     onChanged: (v) => _change((p) => p.pauseOnBackground = v)),
-                SwitchRow(
-                  icon: Icons.picture_in_picture_alt_outlined,
-                  title: l.playerAutoPip,
-                  subtitle: (isIos && effectiveKernel != 'avplayer') ? l.playerAutoPipIosVlcSub : l.playerAutoPipSub,
-                  value: p.autoPictureInPicture,
-                  onChanged: (v) => _change((p) => p.autoPictureInPicture = v),
-                ),
+                if (!(isIos && effectiveKernel == 'mpv'))
+                  SwitchRow(
+                    icon: Icons.picture_in_picture_alt_outlined,
+                    title: l.playerAutoPip,
+                    subtitle: (isIos && effectiveKernel != 'avplayer') ? l.playerAutoPipIosVlcSub : l.playerAutoPipSub,
+                    value: p.autoPictureInPicture,
+                    onChanged: (v) => _change((p) => p.autoPictureInPicture = v),
+                  ),
                 SwitchRow(
                   icon: Icons.notifications_active_outlined,
                   title: l.playerSkipNotice,

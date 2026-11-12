@@ -9,6 +9,8 @@ protocol IosPlayerControllerUiDelegate: AnyObject {
   func controllerDidUpdateSubtitleCue(_ text: String?)
   func controllerDidUpdateMetrics()
   func controllerDidSkipRange(fromMs: Int64)
+  func controllerPictureInPictureDidStart(origin: IosPipOrigin)
+  func controllerDidPauseFromBackgroundPiPClose()
   func controllerRequestRestorePiP(completion: @escaping (Bool) -> Void)
 }
 
@@ -75,12 +77,16 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     self.episode = Int(request.startEpisodeIndex)
     self.quality = max(0, Int(request.startQualityIndex ?? 0))
     self.pendingStartMs = request.startPositionSeconds * 1000
-    self.playbackConfig = request.playbackConfig
+    var initialPlayback = request.playbackConfig
+    if IosPlayerUiText.normalizeIosKernel(initialPlayback.kernel) == "mpv" {
+      initialPlayback.autoPictureInPicture = false
+    }
+    self.playbackConfig = initialPlayback
     self.danmakuConfig = request.danmakuConfig
-    self.currentSpeed = request.playbackConfig.speed
+    self.currentSpeed = initialPlayback.speed
     self.tmdbMatches = request.tmdbEpisodes ?? []
 
-    IosPlayerUiText.applyLocale(request.playbackConfig.uiLocale)
+    IosPlayerUiText.applyLocale(initialPlayback.uiLocale)
     kernel.delegate = self
     kernel.hwDecode = playbackConfig.hwDecode
     kernel.selectKernelBackend(playbackConfig.kernel, notifyFallback: true)
@@ -329,7 +335,11 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     let prevActive = kernel.activeKernelId
     var next = playbackConfig
     next.kernel = targetNorm
+    if targetNorm == "mpv" {
+      next.autoPictureInPicture = false
+    }
     playbackConfig = next
+    kernel.autoPictureInPicture = next.autoPictureInPicture
     kernel.selectKernelBackend(targetNorm, notifyFallback: true)
     if prevActive != kernel.activeKernelId, let payload = lastPayload, let mediaUrl = payload.url {
       errorMessage = nil
@@ -352,11 +362,15 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     applyPlaybackChange(next, reportToDart: true)
   }
 
-  private func applyPlaybackChange(_ next: PlaybackConfig, reportToDart: Bool) {
+  private func applyPlaybackChange(_ rawNext: PlaybackConfig, reportToDart: Bool) {
     let old = playbackConfig
-    playbackConfig = next
     let oldNormKernel = IosPlayerUiText.normalizeIosKernel(old.kernel)
-    let nextNormKernel = IosPlayerUiText.normalizeIosKernel(next.kernel)
+    let nextNormKernel = IosPlayerUiText.normalizeIosKernel(rawNext.kernel)
+    var next = rawNext
+    if nextNormKernel == "mpv" {
+      next.autoPictureInPicture = false
+    }
+    playbackConfig = next
     let prevActiveKernel = kernel.activeKernelId
     let kernelChanged = (oldNormKernel != nextNormKernel)
     let hwChanged = (old.hwDecode != next.hwDecode) && (prevActiveKernel == "vlc" || nextNormKernel == "vlc")
@@ -634,8 +648,24 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     uiDelegate?.controllerDidShowToast(message, long: true)
   }
 
+  func kernelPictureInPictureDidStart(origin: IosPipOrigin) {
+    uiDelegate?.controllerPictureInPictureDidStart(origin: origin)
+  }
+
+  func kernelPictureInPictureDidPauseInBackground() {
+    state = "paused"
+    danmakuView.paused = true
+    updateNowPlayingInfo(force: true)
+    uiDelegate?.controllerDidPauseFromBackgroundPiPClose()
+  }
+
+  func syncNowPlayingAfterBackgroundPause() {
+    updateNowPlayingInfo(force: true)
+    uiDelegate?.controllerDidChangeState()
+  }
+
   func kernelPictureInPictureDidCloseSession() {
-    // PiP closed via `×`: ensure PageClosedEvent reaches Dart immediately so DetailScreen's "立即播放" is never stuck greyed out
+    // PiP closed in non-auto-background scenarios: completely close the player page & session
     close(completed: false, dismissVC: true)
   }
 
@@ -655,7 +685,14 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     let cc = MPRemoteCommandCenter.shared()
     cc.playCommand.isEnabled = true
     cc.playCommand.addTarget { [weak self] _ in
-      self?.kernel.play()
+      guard let self = self else { return .commandFailed }
+      if (self.kernel.isUsingMpv || IosPlayerUiText.normalizeIosKernel(self.playbackConfig.kernel) == "mpv")
+        && UIApplication.shared.applicationState == .background {
+        self.kernel.pause()
+        self.updateNowPlayingInfo(force: true)
+        return .commandFailed
+      }
+      self.kernel.play()
       return .success
     }
     cc.pauseCommand.isEnabled = true
@@ -665,7 +702,14 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     }
     cc.togglePlayPauseCommand.isEnabled = true
     cc.togglePlayPauseCommand.addTarget { [weak self] _ in
-      self?.togglePause()
+      guard let self = self else { return .commandFailed }
+      if (self.kernel.isUsingMpv || IosPlayerUiText.normalizeIosKernel(self.playbackConfig.kernel) == "mpv")
+        && UIApplication.shared.applicationState == .background {
+        self.kernel.pause()
+        self.updateNowPlayingInfo(force: true)
+        return .commandFailed
+      }
+      self.togglePause()
       return .success
     }
     cc.nextTrackCommand.isEnabled = true

@@ -17,12 +17,22 @@ struct IosTrackOption {
   let selected: Bool
 }
 
+enum IosPipOrigin {
+  case none
+  /// PiP started automatically because the user swiped from the fullscreen player page to the background.
+  case autoFromPlayerBackground
+  /// Any other PiP entry (e.g. manual PiP button in top bar / menu, or non-inline PiP).
+  case other
+}
+
 protocol IosPlayerKernelDelegate: AnyObject {
   func kernelDidChangeState(_ state: String)
   func kernelDidFail(message: String, code: Int?)
   func kernelDidUpdateSubtitleCue(_ text: String?)
   func kernelDidUpdateMetrics()
   func kernelDidFallbackNotice(_ message: String)
+  func kernelPictureInPictureDidStart(origin: IosPipOrigin)
+  func kernelPictureInPictureDidPauseInBackground()
   func kernelPictureInPictureDidCloseSession()
   func kernelPictureInPictureRestoreUI(completion: @escaping (Bool) -> Void)
 }
@@ -259,6 +269,13 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
   private var videoOutput: AVPlayerItemVideoOutput?
   private var pipController: AVPictureInPictureController?
   private var pipRestorePending = false
+  private(set) var pipOrigin: IosPipOrigin = .none
+  private var pendingManualPipRequest = false
+  private var inlineAutomaticPipAllowed = true
+  private var isAppInBackground = (UIApplication.shared.applicationState == .background)
+  private var lastForegroundEntryTime: CFTimeInterval = 0
+  private var appLifecycleObservers: [NSObjectProtocol] = []
+  var isPlayerPageVisibleInline: (() -> Bool)?
 
   private var timeObserver: Any?
   private var statusObs: NSKeyValueObservation?
@@ -349,8 +366,23 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
 
   var autoPictureInPicture: Bool = true {
     didSet {
-      pipController?.canStartPictureInPictureAutomaticallyFromInline = autoPictureInPicture && isUsingAvPlayer
+      refreshAutomaticPipState()
     }
+  }
+
+  func setAutomaticPipInlineAllowed(_ allowed: Bool) {
+    inlineAutomaticPipAllowed = allowed
+    refreshAutomaticPipState()
+  }
+
+  private func refreshAutomaticPipState() {
+    let canAuto = autoPictureInPicture && isUsingAvPlayer && inlineAutomaticPipAllowed && preferredKernelId != "mpv"
+    pipController?.canStartPictureInPictureAutomaticallyFromInline = canAuto
+  }
+
+  var willAutoStartPipInBackground: Bool {
+    autoPictureInPicture && isUsingAvPlayer && inlineAutomaticPipAllowed && preferredKernelId != "mpv"
+      && (pipController?.isPictureInPicturePossible == true)
   }
 
   private struct LoadedSidecarSubtitle {
@@ -386,6 +418,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     avPlayer.automaticallyWaitsToMinimizeStalling = true
     videoView.bind(avPlayer: avPlayer)
     setupPictureInPictureIfSupported()
+    setupAppLifecycleObservers()
     attachAvPeriodicObserver()
     videoView.onBoundsChangedForVlcFill = { [weak self] fillSize in
       self?.applyVlcFillAspect(fillSize)
@@ -475,7 +508,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         stopVlcPlaybackOnly()
         activeKernelId = "mpv"
         videoView.activeBackend = "mpv"
-        pipController?.canStartPictureInPictureAutomaticallyFromInline = false
+        refreshAutomaticPipState()
       }
     case "vlc":
       #if canImport(MobileVLCKit)
@@ -484,7 +517,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         stopMpvPlaybackOnly()
         activeKernelId = "vlc"
         videoView.activeBackend = "vlc"
-        pipController?.canStartPictureInPictureAutomaticallyFromInline = false
+        refreshAutomaticPipState()
       }
       #else
       applyActiveBackend("avplayer")
@@ -495,7 +528,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         stopVlcPlaybackOnly()
         activeKernelId = "avplayer"
         videoView.activeBackend = "avplayer"
-        pipController?.canStartPictureInPictureAutomaticallyFromInline = autoPictureInPicture
+        refreshAutomaticPipState()
       }
     }
   }
@@ -524,9 +557,42 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     guard AVPictureInPictureController.isPictureInPictureSupported() else { return }
     if let ctrl = AVPictureInPictureController(playerLayer: videoView.playerLayer) {
       ctrl.delegate = self
-      ctrl.canStartPictureInPictureAutomaticallyFromInline = autoPictureInPicture && isUsingAvPlayer
       pipController = ctrl
+      refreshAutomaticPipState()
     }
+  }
+
+  private func setupAppLifecycleObservers() {
+    let nc = NotificationCenter.default
+    let bgObs = nc.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      guard let self = self else { return }
+      self.isAppInBackground = true
+      if self.isUsingMpv || self.preferredKernelId == "mpv" {
+        self.pause()
+      }
+    }
+    let fgObs = nc.addObserver(
+      forName: UIApplication.willEnterForegroundNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      guard let self = self else { return }
+      self.isAppInBackground = false
+      self.lastForegroundEntryTime = CACurrentMediaTime()
+    }
+    let activeObs = nc.addObserver(
+      forName: UIApplication.didBecomeActiveNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      guard let self = self else { return }
+      self.isAppInBackground = false
+    }
+    appLifecycleObservers = [bgObs, fgObs, activeObs]
   }
 
   private func attachAvPeriodicObserver() {
@@ -1640,6 +1706,10 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
   }
 
   func play() {
+    if (isUsingMpv || preferredKernelId == "mpv") && UIApplication.shared.applicationState == .background {
+      pause()
+      return
+    }
     shouldAutoPlay = true
     configureAudioSession()
     switch activeKernelId {
@@ -1727,21 +1797,54 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
   // MARK: - Picture in Picture (iOS Native AVPlayer only)
 
   var isPictureInPictureSupported: Bool {
-    guard isUsingAvPlayer else { return false }
+    guard isUsingAvPlayer && preferredKernelId != "mpv" else { return false }
     return pipController?.isPictureInPicturePossible == true || AVPictureInPictureController.isPictureInPictureSupported()
   }
 
-  func togglePictureInPicture() {
-    guard isUsingAvPlayer, let ctrl = pipController else { return }
+  var isPictureInPicturePossibleNow: Bool {
+    isUsingAvPlayer && preferredKernelId != "mpv" && (pipController?.isPictureInPicturePossible == true)
+  }
+
+  func startManualInAppPictureInPicture() {
+    guard isUsingAvPlayer, preferredKernelId != "mpv", let ctrl = pipController else { return }
     if ctrl.isPictureInPictureActive {
       ctrl.stopPictureInPicture()
-    } else {
+    } else if ctrl.isPictureInPicturePossible {
+      pendingManualPipRequest = true
+      pipOrigin = .other
       ctrl.startPictureInPicture()
     }
   }
 
+  func togglePictureInPicture() {
+    startManualInAppPictureInPicture()
+  }
+
   func pictureInPictureControllerWillStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
     pipRestorePending = false
+    if pendingManualPipRequest {
+      pipOrigin = .other
+      pendingManualPipRequest = false
+    } else if pipOrigin == .none {
+      if isPlayerPageVisibleInline?() == true {
+        pipOrigin = .autoFromPlayerBackground
+      } else {
+        pipOrigin = .other
+      }
+    }
+  }
+
+  func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+    delegate?.kernelPictureInPictureDidStart(origin: pipOrigin)
+  }
+
+  func pictureInPictureController(
+    _ pictureInPictureController: AVPictureInPictureController,
+    failedToStartPictureInPictureWithError error: Error
+  ) {
+    pendingManualPipRequest = false
+    pipRestorePending = false
+    pipOrigin = .none
   }
 
   func pictureInPictureController(
@@ -1753,10 +1856,35 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
   }
 
   func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
-    if !pipRestorePending {
-      delegate?.kernelPictureInPictureDidCloseSession()
-    }
+    let stoppedOrigin = pipOrigin
+    let wasRestoring = pipRestorePending
+    pipOrigin = .none
     pipRestorePending = false
+    pendingManualPipRequest = false
+
+    if wasRestoring {
+      return
+    }
+
+    if stoppedOrigin == .autoFromPlayerBackground {
+      let inBg = isAppInBackground || UIApplication.shared.applicationState == .background
+      if inBg {
+        // User swiped from fullscreen player to background (Auto-PiP) and tapped `×` to close PiP:
+        // keep the player screen open in the background and set it to Paused.
+        pause()
+        delegate?.kernelPictureInPictureDidPauseInBackground()
+        return
+      }
+      // If the app just returned from background to foreground with the fullscreen player still visible,
+      // iOS auto-docks inline PiP without calling `restoreUserInterface...`; keep playing inline seamlessly.
+      let justEnteredForeground = (CACurrentMediaTime() - lastForegroundEntryTime) <= 2.0
+      if isPlayerPageVisibleInline?() == true && (avPlayer.rate > 0.01 || justEnteredForeground) {
+        return
+      }
+    }
+
+    // All other PiP cases (e.g. manual PiP closed in-app or in background): close the player page completely.
+    delegate?.kernelPictureInPictureDidCloseSession()
   }
 
   // MARK: - Tracks (Audio & Subtitles)
@@ -2185,6 +2313,11 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
   }
 
   func releaseKernel() {
+    for obs in appLifecycleObservers {
+      NotificationCenter.default.removeObserver(obs)
+    }
+    appLifecycleObservers.removeAll()
+    isPlayerPageVisibleInline = nil
     loadGeneration &+= 1
     cancelPendingProbe?()
     cancelPendingProbe = nil

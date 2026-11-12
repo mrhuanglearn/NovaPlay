@@ -74,6 +74,9 @@ class PlayerConfigRepository {
     final defaultDanmaku = defaultDanmakuConfig();
     final playback = _decode(
         j['playback'], PlaybackConfig.decode, (defaultPlayback.encode() as List<Object?>).length, defaultPlayback);
+    if (defaultTargetPlatform == TargetPlatform.iOS && playback.kernel.trim().toLowerCase() == 'mpv') {
+      playback.autoPictureInPicture = false;
+    }
     final danmaku =
         _decode(j['danmaku'], DanmakuConfig.decode, (defaultDanmaku.encode() as List<Object?>).length, defaultDanmaku);
     AppHaptics.enabled = playback.hapticEnabled;
