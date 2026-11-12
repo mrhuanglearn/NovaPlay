@@ -32,10 +32,14 @@ private final class AvLayerView: UIView {
   var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
 }
 
-/// Unified video container hosting both `AVPlayerLayer` (for `AVPlayer` + system PiP) and `vlcDrawableView` (for `MobileVLCKit`),
+/// Unified video container hosting:
+/// - `avLayerView` (`AVPlayerLayer` for `AVPlayer` + system PiP)
+/// - `mpvMetalView` (`CAMetalLayer` for `libmpv` + `MoltenVK` + VideoToolbox)
+/// - `vlcDrawableView` (drawable view for `MobileVLCKit`)
 /// implementing canonical `PlaybackConfig.fitMode` values: `fit` (letterbox), `zoom` (aspect-fill crop), and `fill` (stretch).
 final class PlayerVideoContainerView: UIView {
   fileprivate let avLayerView = AvLayerView(frame: .zero)
+  fileprivate let mpvMetalView = MpvMetalView(frame: .zero)
   fileprivate let vlcDrawableView = UIView(frame: .zero)
 
   var playerLayer: AVPlayerLayer { avLayerView.playerLayer }
@@ -46,10 +50,11 @@ final class PlayerVideoContainerView: UIView {
   var naturalVideoSize: CGSize = .zero {
     didSet { applyFitLayout() }
   }
-  var usingVlc: Bool = false {
+  var activeBackend: String = "avplayer" {
     didSet {
-      avLayerView.isHidden = usingVlc
-      vlcDrawableView.isHidden = !usingVlc
+      avLayerView.isHidden = (activeBackend != "avplayer")
+      mpvMetalView.isHidden = (activeBackend != "mpv")
+      vlcDrawableView.isHidden = (activeBackend != "vlc")
       applyFitLayout()
     }
   }
@@ -60,9 +65,12 @@ final class PlayerVideoContainerView: UIView {
     backgroundColor = .black
     clipsToBounds = true
     avLayerView.backgroundColor = .black
+    mpvMetalView.backgroundColor = .black
+    mpvMetalView.isHidden = true
     vlcDrawableView.backgroundColor = .black
     vlcDrawableView.isHidden = true
     addSubview(avLayerView)
+    addSubview(mpvMetalView)
     addSubview(vlcDrawableView)
   }
 
@@ -73,6 +81,7 @@ final class PlayerVideoContainerView: UIView {
   override func layoutSubviews() {
     super.layoutSubviews()
     avLayerView.frame = bounds
+    mpvMetalView.frame = bounds
     applyFitLayout()
   }
 
@@ -92,7 +101,10 @@ final class PlayerVideoContainerView: UIView {
       avLayerView.playerLayer.videoGravity = .resizeAspect
     }
 
-    // 2. VLC drawable frame & aspect ratio
+    // 2. MPV Metal view always fills container bounds (aspect/panscan handled inside libmpv)
+    mpvMetalView.frame = bounds
+
+    // 3. VLC drawable frame & aspect ratio
     guard bounds.width > 0, bounds.height > 0 else {
       vlcDrawableView.frame = bounds
       return
@@ -123,13 +135,18 @@ final class PlayerVideoContainerView: UIView {
   }
 }
 
-/// Dual-kernel iOS 15+ player facade:
+/// Triple-kernel iOS 15+ player facade:
 /// - `avplayer`: Apple `AVPlayer` (VideoToolbox HW decode, native iOS system PiP, native AirPlay, DASH dual-stream, sidecar subtitles)
-/// - `vlc`: `MobileVLCKit` (`libvlc` + FFmpeg multi-format MKV/FLV/AVI/TS/RMVB/ASS, VideoToolbox HW vs FFmpeg SW decode toggle)
-final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
+/// - `mpv`: `libmpv` (`vo=gpu-next`, `gpu-context=moltenvk`, `CAMetalLayer`, VideoToolbox HW vs FFmpeg SW decode, ASS/SSA/MKV/FLV/TS/DASH)
+/// - `vlc`: `MobileVLCKit` (`libvlc` + FFmpeg multi-format MKV/FLV/AVI/TS/RMVB/ASS, VideoToolbox HW vs FFmpeg SW decode)
+final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, IosMpvEngineDelegate {
   weak var delegate: IosPlayerKernelDelegate?
 
   let videoView = PlayerVideoContainerView(frame: .zero)
+
+  static var isMpvAvailable: Bool {
+    IosMpvEngine.isAvailable
+  }
 
   static var isVlcAvailable: Bool {
     #if canImport(MobileVLCKit)
@@ -142,14 +159,24 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   private(set) var preferredKernelId: String = "avplayer"
   private(set) var activeKernelId: String = "avplayer"
   private(set) var lastDiagnosticReport: String?
-  var hwDecode: Bool = true
+  var hwDecode: Bool = true {
+    didSet {
+      mpvEngine?.hwDecode = hwDecode
+    }
+  }
   var isUsingAvPlayer: Bool { activeKernelId == "avplayer" }
+  var isUsingMpv: Bool { activeKernelId == "mpv" }
+  var isUsingVlc: Bool { activeKernelId == "vlc" }
 
   var activeBackendSummary: String {
-    if isUsingAvPlayer {
+    switch activeKernelId {
+    case "mpv":
+      return hwDecode ? "MPV (VT HW)" : "MPV (FFmpeg SW)"
+    case "vlc":
+      return hwDecode ? "VLC (VT HW)" : "VLC (FFmpeg SW)"
+    default:
       return "AVPlayer (VT HW)"
     }
-    return hwDecode ? "VLC (VT HW)" : "VLC (FFmpeg SW)"
   }
 
   // MARK: - AVPlayer State
@@ -168,6 +195,11 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   private var endObserver: NSObjectProtocol?
   private var failedEndObserver: NSObjectProtocol?
   private var shiftedSidecarIndexForCurrentItem: Bool = false
+
+  // MARK: - MPV State
+  private var mpvEngine: IosMpvEngine?
+  private var mpvLoadedViaProxy: Bool = false
+  private var mpvRetriedViaProxy: Bool = false
 
   // MARK: - MobileVLCKit State
   #if canImport(MobileVLCKit)
@@ -204,23 +236,29 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     let startMs: Int64
     let subtitles: [SubtitleOption]
     let proxyToken: String?
-    var proxiedVlcUrl: URL?
+    var proxiedUrl: URL?
   }
   private var loadGeneration: UInt64 = 0
   private var activeLoad: ActiveLoadContext?
   private var cancelPendingProbe: (() -> Void)?
+  private var didAutoFallbackFromAv: Bool = false
   private var didAutoFallbackToVlc: Bool = false
   private var vlcRetriedDirect: Bool = false
   private var lastAvFailureSummary: String?
+  private var lastMpvFailureSummary: String?
+  private var lastAvFailedRawUrl: String?
 
   var speed: Float = 1.0 {
     didSet {
-      if isUsingAvPlayer {
+      switch activeKernelId {
+      case "avplayer":
         if isPlaying {
           avPlayer.rate = speed
           secondaryAudioPlayer?.rate = speed
         }
-      } else {
+      case "mpv":
+        mpvEngine?.speed = speed
+      default:
         #if canImport(MobileVLCKit)
         vlcPlayer?.rate = speed
         #endif
@@ -231,6 +269,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   var fitMode: String = "fit" {
     didSet {
       videoView.fitMode = fitMode
+      mpvEngine?.fitMode = fitMode
     }
   }
 
@@ -247,18 +286,23 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   private var sidecarSubtitles: [LoadedSidecarSubtitle] = []
   private var selectedSubtitleIdx: Int = -1
   private var preferredSubtitleLang: String?
+  private var preferredSubtitleFontFamily: String?
   private var preferredAudioLang: String?
   private var selectedAudioIdx: Int = -1
 
   var isPlaying: Bool {
-    if isUsingAvPlayer {
+    switch activeKernelId {
+    case "avplayer":
       return avPlayer.rate > 0.01 && avPlayer.timeControlStatus == .playing
+    case "mpv":
+      return mpvEngine?.isPlaying ?? false
+    default:
+      #if canImport(MobileVLCKit)
+      return vlcPlayer?.isPlaying ?? false
+      #else
+      return false
+      #endif
     }
-    #if canImport(MobileVLCKit)
-    return vlcPlayer?.isPlaying ?? false
-    #else
-    return false
-    #endif
   }
 
   var isInPictureInPicture: Bool {
@@ -282,54 +326,122 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   func selectKernelBackend(_ rawKernel: String, notifyFallback: Bool = true) {
     let normalized = IosPlayerUiText.normalizeIosKernel(rawKernel)
     lastAvFailedRawUrl = nil
-    if normalized == "vlc" {
+    switch normalized {
+    case "mpv":
+      if Self.isMpvAvailable {
+        preferredKernelId = "mpv"
+        applyActiveBackend("mpv")
+      } else if Self.isVlcAvailable {
+        preferredKernelId = "vlc"
+        applyActiveBackend("vlc")
+        if notifyFallback {
+          delegate?.kernelDidFallbackNotice(
+            IosPlayerUiText.t("当前构建未内置 MPV 内核，已自动切换至 VLC", "MPV not bundled in this build; using VLC")
+          )
+        }
+      } else {
+        preferredKernelId = "avplayer"
+        applyActiveBackend("avplayer")
+        if notifyFallback {
+          delegate?.kernelDidFallbackNotice(
+            IosPlayerUiText.t("当前构建未内置 MPV 内核，已自动回退至 AVPlayer", "MPV not bundled in this build; using AVPlayer")
+          )
+        }
+      }
+    case "vlc":
       #if canImport(MobileVLCKit)
       preferredKernelId = "vlc"
       applyActiveBackend("vlc")
       #else
-      preferredKernelId = "avplayer"
-      applyActiveBackend("avplayer")
+      if Self.isMpvAvailable {
+        preferredKernelId = "mpv"
+        applyActiveBackend("mpv")
+      } else {
+        preferredKernelId = "avplayer"
+        applyActiveBackend("avplayer")
+      }
       if notifyFallback {
         delegate?.kernelDidFallbackNotice(
-          IosPlayerUiText.t("当前构建未内置 VLC 内核，已自动回退至 AVPlayer", "VLC not bundled in this build; using AVPlayer")
+          IosPlayerUiText.t("当前构建未内置 VLC 内核，已自动回退", "VLC not bundled in this build; switched kernel")
         )
       }
       #endif
-    } else {
+    default:
       preferredKernelId = "avplayer"
       applyActiveBackend("avplayer")
     }
   }
 
-  private var lastAvFailedRawUrl: String?
+  private func ensureMpvEngine() -> IosMpvEngine {
+    if let existing = mpvEngine {
+      return existing
+    }
+    let engine = IosMpvEngine(
+      metalView: videoView.mpvMetalView,
+      hwDecode: hwDecode,
+      fitMode: fitMode,
+      speed: speed
+    )
+    engine.delegate = self
+    engine.applyAudioPreference(lang: preferredAudioLang)
+    engine.applySubtitlePreferences(lang: preferredSubtitleLang, fontFamily: preferredSubtitleFontFamily)
+    mpvEngine = engine
+    return engine
+  }
 
   private func applyActiveBackend(_ target: String) {
-    if target == "vlc" {
+    switch target {
+    case "mpv":
+      guard Self.isMpvAvailable else {
+        if Self.isVlcAvailable {
+          applyActiveBackend("vlc")
+        } else {
+          applyActiveBackend("avplayer")
+        }
+        return
+      }
+      if activeKernelId != "mpv" {
+        stopAvPlaybackOnly()
+        stopVlcPlaybackOnly()
+        activeKernelId = "mpv"
+        videoView.activeBackend = "mpv"
+        pipController?.canStartPictureInPictureAutomaticallyFromInline = false
+      }
+    case "vlc":
       #if canImport(MobileVLCKit)
       if activeKernelId != "vlc" {
         stopAvPlaybackOnly()
+        stopMpvPlaybackOnly()
         activeKernelId = "vlc"
-        videoView.usingVlc = true
+        videoView.activeBackend = "vlc"
         pipController?.canStartPictureInPictureAutomaticallyFromInline = false
       }
+      #else
+      applyActiveBackend("avplayer")
       #endif
-    } else {
+    default:
       if activeKernelId != "avplayer" {
+        stopMpvPlaybackOnly()
         stopVlcPlaybackOnly()
         activeKernelId = "avplayer"
-        videoView.usingVlc = false
+        videoView.activeBackend = "avplayer"
         pipController?.canStartPictureInPictureAutomaticallyFromInline = autoPictureInPicture
       }
     }
   }
 
-  private func switchActiveBackendTemporarilyToVlc(notice: String?) {
-    #if canImport(MobileVLCKit)
-    applyActiveBackend("vlc")
+  /// Picks the best available software/multi-format kernel (`mpv` preferred, then `vlc`) when `AVPlayer` cannot open a stream.
+  private func preferredFallbackBackendAfterAvPlayer() -> String? {
+    if Self.isMpvAvailable { return "mpv" }
+    if Self.isVlcAvailable { return "vlc" }
+    return nil
+  }
+
+  private func switchActiveBackendTemporarily(to backend: String, notice: String?) {
+    applyActiveBackend(backend)
     if let notice = notice, !notice.isEmpty {
       delegate?.kernelDidFallbackNotice(notice)
     }
-    #endif
   }
 
   private func configureAudioSession() {
@@ -447,19 +559,22 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     selectedAudioIdx = -1
     shouldAutoPlay = true
     isSeeking = false
+    didAutoFallbackFromAv = false
     didAutoFallbackToVlc = false
     vlcRetriedDirect = false
+    mpvLoadedViaProxy = false
+    mpvRetriedViaProxy = false
     lastAvFailureSummary = nil
+    lastMpvFailureSummary = nil
     lastDiagnosticReport = nil
     delegate?.kernelDidUpdateSubtitleCue(nil)
 
-    if preferredKernelId == "avplayer" && lastAvFailedRawUrl == url {
-      #if canImport(MobileVLCKit)
-      didAutoFallbackToVlc = true
-      applyActiveBackend("vlc")
-      #else
-      applyActiveBackend("avplayer")
-      #endif
+    if preferredKernelId == "avplayer",
+       lastAvFailedRawUrl == url,
+       let fb = preferredFallbackBackendAfterAvPlayer() {
+      didAutoFallbackFromAv = true
+      if fb == "vlc" { didAutoFallbackToVlc = true }
+      applyActiveBackend(fb)
     } else {
       applyActiveBackend(preferredKernelId)
     }
@@ -475,6 +590,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     }
 
     stopAvPlaybackOnly()
+    stopMpvPlaybackOnly()
     stopVlcPlaybackOnly()
     loadSidecarSubtitles(subtitles, headers: effectiveHeaders)
 
@@ -486,6 +602,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     playerUsbLog.notice(
       "[NovaPlay][Player] load backend=\(activeBackend, privacy: .public) scheme=\(scheme, privacy: .public) host=\(targetHost, privacy: .public) ext=\(targetExt, privacy: .public) startMs=\(startMs, privacy: .public) headerKeys=[\(headerKeys, privacy: .public)]"
     )
+
     if mediaURL.isFileURL {
       activeLoad = ActiveLoadContext(
         generation: gen,
@@ -496,29 +613,29 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
         startMs: startMs,
         subtitles: subtitles,
         proxyToken: nil,
-        proxiedVlcUrl: mediaURL
+        proxiedUrl: mediaURL
       )
-      if isUsingAvPlayer && IosStreamProxy.isLikelyVlcOnlyExtension(mediaURL.pathExtension) {
-        #if canImport(MobileVLCKit)
-        didAutoFallbackToVlc = true
+      if isUsingAvPlayer,
+         IosStreamProxy.isLikelyVlcOnlyExtension(mediaURL.pathExtension),
+         let fb = preferredFallbackBackendAfterAvPlayer() {
+        didAutoFallbackFromAv = true
+        if fb == "vlc" { didAutoFallbackToVlc = true }
         let extUpper = mediaURL.pathExtension.uppercased()
-        switchActiveBackendTemporarilyToVlc(
-          notice: IosPlayerUiText.t("检测到 \(extUpper) 格式，已自动切换至 VLC 内核", "Switched to VLC for \(extUpper)")
+        let fbLabel = fb.uppercased()
+        switchActiveBackendTemporarily(
+          to: fb,
+          notice: IosPlayerUiText.t("检测到 \(extUpper) 格式，已自动切换至 \(fbLabel) 内核", "Switched to \(fbLabel) for \(extUpper)")
         )
-        loadWithVlcPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, subtitles: subtitles, proxyToken: nil)
-        return
-        #endif
       }
-      if isUsingAvPlayer {
-        loadWithAvPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, proxyToken: nil)
-      } else {
-        #if canImport(MobileVLCKit)
-        loadWithVlcPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, subtitles: subtitles, proxyToken: nil)
-        #else
-        applyActiveBackend("avplayer")
-        loadWithAvPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, proxyToken: nil)
-        #endif
-      }
+      dispatchActiveBackendLoad(
+        directOrProxiedURL: mediaURL,
+        cleanURL: mediaURL,
+        audioUrl: audioUrl,
+        headers: effectiveHeaders,
+        startMs: startMs,
+        subtitles: subtitles,
+        proxyToken: nil
+      )
       return
     }
 
@@ -542,28 +659,71 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
         startMs: startMs,
         subtitles: subtitles,
         proxyToken: token,
-        proxiedVlcUrl: defaultProxied
+        proxiedUrl: defaultProxied
       )
 
-      if !isUsingAvPlayer {
+      // MPV sends arbitrary HTTP headers (Cookie, Referer, User-Agent, Origin) natively via FFmpeg libavformat,
+      // and avoids double-proxying CatPaw's 127.0.0.1:2333 chunk proxy.
+      if isUsingMpv {
+        loadWithMpvPlayer(
+          mediaURL: mediaURL,
+          audioUrl: audioUrl,
+          headers: effectiveHeaders,
+          startMs: startMs,
+          subtitles: subtitles,
+          viaProxy: false
+        )
+        return
+      }
+
+      if isUsingVlc {
         #if canImport(MobileVLCKit)
-        loadWithVlcPlayer(mediaURL: defaultProxied, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, subtitles: subtitles, proxyToken: token)
+        loadWithVlcPlayer(
+          mediaURL: defaultProxied,
+          audioUrl: audioUrl,
+          headers: effectiveHeaders,
+          startMs: startMs,
+          subtitles: subtitles,
+          proxyToken: token
+        )
         return
         #else
         applyActiveBackend("avplayer")
         #endif
       }
 
-      if IosStreamProxy.isLikelyVlcOnlyExtension(mediaURL.pathExtension) {
-        #if canImport(MobileVLCKit)
-        didAutoFallbackToVlc = true
+      if IosStreamProxy.isLikelyVlcOnlyExtension(mediaURL.pathExtension),
+         let fb = preferredFallbackBackendAfterAvPlayer() {
+        didAutoFallbackFromAv = true
+        if fb == "vlc" { didAutoFallbackToVlc = true }
         let extUpper = mediaURL.pathExtension.uppercased()
-        switchActiveBackendTemporarilyToVlc(
-          notice: IosPlayerUiText.t("检测到 \(extUpper) 格式，已自动切换至 VLC 内核", "Switched to VLC for \(extUpper)")
+        let fbLabel = fb.uppercased()
+        switchActiveBackendTemporarily(
+          to: fb,
+          notice: IosPlayerUiText.t("检测到 \(extUpper) 格式，已自动切换至 \(fbLabel) 内核", "Switched to \(fbLabel) for \(extUpper)")
         )
-        loadWithVlcPlayer(mediaURL: defaultProxied, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, subtitles: subtitles, proxyToken: token)
+        if fb == "mpv" {
+          loadWithMpvPlayer(
+            mediaURL: mediaURL,
+            audioUrl: audioUrl,
+            headers: effectiveHeaders,
+            startMs: startMs,
+            subtitles: subtitles,
+            viaProxy: false
+          )
+        } else {
+          #if canImport(MobileVLCKit)
+          loadWithVlcPlayer(
+            mediaURL: defaultProxied,
+            audioUrl: audioUrl,
+            headers: effectiveHeaders,
+            startMs: startMs,
+            subtitles: subtitles,
+            proxyToken: token
+          )
+          #endif
+        }
         return
-        #endif
       }
 
       cancelPendingProbe = IosStreamProxy.shared.probe(token: token) { [weak self] probeRes in
@@ -593,23 +753,37 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
         }
 
         if let failure = probeHardFailure {
-          #if canImport(MobileVLCKit)
-          if !self.didAutoFallbackToVlc {
-            self.didAutoFallbackToVlc = true
-            self.vlcRetriedDirect = true
+          if !self.didAutoFallbackFromAv, let fb = self.preferredFallbackBackendAfterAvPlayer() {
+            self.didAutoFallbackFromAv = true
+            if fb == "vlc" {
+              self.didAutoFallbackToVlc = true
+              self.vlcRetriedDirect = true
+            }
             self.lastAvFailureSummary = failure.msg
-            self.switchActiveBackendTemporarilyToVlc(notice: nil)
-            self.loadWithVlcPlayer(
-              mediaURL: mediaURL,
-              audioUrl: audioUrl,
-              headers: effectiveHeaders,
-              startMs: startMs,
-              subtitles: subtitles,
-              proxyToken: nil
-            )
+            self.switchActiveBackendTemporarily(to: fb, notice: nil)
+            if fb == "mpv" {
+              self.loadWithMpvPlayer(
+                mediaURL: mediaURL,
+                audioUrl: audioUrl,
+                headers: effectiveHeaders,
+                startMs: startMs,
+                subtitles: subtitles,
+                viaProxy: false
+              )
+            } else {
+              #if canImport(MobileVLCKit)
+              self.loadWithVlcPlayer(
+                mediaURL: mediaURL,
+                audioUrl: audioUrl,
+                headers: effectiveHeaders,
+                startMs: startMs,
+                subtitles: subtitles,
+                proxyToken: nil
+              )
+              #endif
+            }
             return
           }
-          #endif
           let diag = IosStreamProxy.shared.diagnosticsSummary(for: token) ?? "code=\(failure.code)"
           self.lastDiagnosticReport = "\(failure.msg)\n[\(diag)]"
           self.delegate?.kernelDidFail(message: failure.msg, code: failure.code)
@@ -626,25 +800,39 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
           kind: resolvedKind,
           fileName: resolvedFile
         ) ?? defaultProxied
-        self.activeLoad?.proxiedVlcUrl = resolvedProxyURL
+        self.activeLoad?.proxiedUrl = resolvedProxyURL
 
-        if probeRes.container.requiresVlc {
-          #if canImport(MobileVLCKit)
-          self.didAutoFallbackToVlc = true
+        if probeRes.container.requiresVlc, let fb = self.preferredFallbackBackendAfterAvPlayer() {
+          self.didAutoFallbackFromAv = true
+          if fb == "vlc" { self.didAutoFallbackToVlc = true }
           let fmtLabel = probeRes.container.rawValue.uppercased()
-          self.switchActiveBackendTemporarilyToVlc(
-            notice: IosPlayerUiText.t("检测到 \(fmtLabel) 格式，已自动切换至 VLC 内核", "Switched to VLC for \(fmtLabel)")
+          let fbLabel = fb.uppercased()
+          self.switchActiveBackendTemporarily(
+            to: fb,
+            notice: IosPlayerUiText.t("检测到 \(fmtLabel) 格式，已自动切换至 \(fbLabel) 内核", "Switched to \(fbLabel) for \(fmtLabel)")
           )
-          self.loadWithVlcPlayer(
-            mediaURL: resolvedProxyURL,
-            audioUrl: audioUrl,
-            headers: effectiveHeaders,
-            startMs: startMs,
-            subtitles: subtitles,
-            proxyToken: token
-          )
+          if fb == "mpv" {
+            self.loadWithMpvPlayer(
+              mediaURL: mediaURL,
+              audioUrl: audioUrl,
+              headers: effectiveHeaders,
+              startMs: startMs,
+              subtitles: subtitles,
+              viaProxy: false
+            )
+          } else {
+            #if canImport(MobileVLCKit)
+            self.loadWithVlcPlayer(
+              mediaURL: resolvedProxyURL,
+              audioUrl: audioUrl,
+              headers: effectiveHeaders,
+              startMs: startMs,
+              subtitles: subtitles,
+              proxyToken: token
+            )
+            #endif
+          }
           return
-          #endif
         }
 
         self.loadWithAvPlayer(
@@ -658,7 +846,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
       return
     }
 
-    // Non-HTTP streaming protocols (rtmp://, rtsp://, mms://, udp://) -> VLC
+    // Non-HTTP streaming protocols (rtmp://, rtsp://, mms://, udp://) -> MPV or VLC
     activeLoad = ActiveLoadContext(
       generation: gen,
       rawUrl: url,
@@ -668,20 +856,76 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
       startMs: startMs,
       subtitles: subtitles,
       proxyToken: nil,
-      proxiedVlcUrl: mediaURL
+      proxiedUrl: mediaURL
     )
-    #if canImport(MobileVLCKit)
-    if isUsingAvPlayer {
-      didAutoFallbackToVlc = true
-      switchActiveBackendTemporarilyToVlc(
-        notice: IosPlayerUiText.t("检测到 \(scheme.uppercased()) 协议，已自动切换至 VLC 内核", "Switched to VLC for \(scheme.uppercased())")
+    if isUsingAvPlayer, let fb = preferredFallbackBackendAfterAvPlayer() {
+      didAutoFallbackFromAv = true
+      if fb == "vlc" { didAutoFallbackToVlc = true }
+      let fbLabel = fb.uppercased()
+      switchActiveBackendTemporarily(
+        to: fb,
+        notice: IosPlayerUiText.t("检测到 \(scheme.uppercased()) 协议，已自动切换至 \(fbLabel) 内核", "Switched to \(fbLabel) for \(scheme.uppercased())")
       )
     }
-    stopAvPlaybackOnly()
-    loadWithVlcPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, subtitles: subtitles, proxyToken: nil)
-    #else
-    loadWithAvPlayer(mediaURL: mediaURL, audioUrl: audioUrl, headers: effectiveHeaders, startMs: startMs, proxyToken: nil)
-    #endif
+    dispatchActiveBackendLoad(
+      directOrProxiedURL: mediaURL,
+      cleanURL: mediaURL,
+      audioUrl: audioUrl,
+      headers: effectiveHeaders,
+      startMs: startMs,
+      subtitles: subtitles,
+      proxyToken: nil
+    )
+  }
+
+  private func dispatchActiveBackendLoad(
+    directOrProxiedURL: URL,
+    cleanURL: URL,
+    audioUrl: String?,
+    headers: [String: String],
+    startMs: Int64,
+    subtitles: [SubtitleOption],
+    proxyToken: String?
+  ) {
+    switch activeKernelId {
+    case "mpv":
+      loadWithMpvPlayer(
+        mediaURL: cleanURL,
+        audioUrl: audioUrl,
+        headers: headers,
+        startMs: startMs,
+        subtitles: subtitles,
+        viaProxy: false
+      )
+    case "vlc":
+      #if canImport(MobileVLCKit)
+      loadWithVlcPlayer(
+        mediaURL: directOrProxiedURL,
+        audioUrl: audioUrl,
+        headers: headers,
+        startMs: startMs,
+        subtitles: subtitles,
+        proxyToken: proxyToken
+      )
+      #else
+      applyActiveBackend("avplayer")
+      loadWithAvPlayer(
+        mediaURL: directOrProxiedURL,
+        audioUrl: audioUrl,
+        headers: headers,
+        startMs: startMs,
+        proxyToken: proxyToken
+      )
+      #endif
+    default:
+      loadWithAvPlayer(
+        mediaURL: directOrProxiedURL,
+        audioUrl: audioUrl,
+        headers: headers,
+        startMs: startMs,
+        proxyToken: proxyToken
+      )
+    }
   }
 
   private func loadWithAvPlayer(
@@ -694,8 +938,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     cleanupAvItemObservers()
     shiftedSidecarIndexForCurrentItem = false
     var assetOptions: [String: Any] = [:]
-    let isLoopbackProxy = (mediaURL.host == "127.0.0.1")
-    if !isLoopbackProxy && !headers.isEmpty {
+    let isOwnProxy = IosStreamProxy.shared.isOwnProxyURL(mediaURL)
+    if !isOwnProxy && !headers.isEmpty {
       assetOptions["AVURLAssetHTTPHeaderFieldsKey"] = headers
       if #available(iOS 16.0, *) {
         if let ua = headers.first(where: { $0.key.lowercased() == "user-agent" })?.value {
@@ -733,7 +977,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
           finalAudioURL = aURL
         }
         var aOpts: [String: Any] = [:]
-        if finalAudioURL.host != "127.0.0.1" && !audioHeaders.isEmpty {
+        if !IosStreamProxy.shared.isOwnProxyURL(finalAudioURL) && !audioHeaders.isEmpty {
           aOpts["AVURLAssetHTTPHeaderFieldsKey"] = audioHeaders
         }
         let aAsset = AVURLAsset(url: finalAudioURL, options: aOpts)
@@ -742,6 +986,30 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
         secondaryAudioPlayer = AVPlayer(playerItem: aItem)
       }
     }
+  }
+
+  private func loadWithMpvPlayer(
+    mediaURL: URL,
+    audioUrl: String?,
+    headers: [String: String],
+    startMs: Int64,
+    subtitles: [SubtitleOption],
+    viaProxy: Bool
+  ) {
+    let engine = ensureMpvEngine()
+    mpvLoadedViaProxy = viaProxy
+    let effectiveHeaders = IosStreamProxy.shared.isOwnProxyURL(mediaURL) ? [:] : headers
+    let loadUrlString = mediaURL.isFileURL ? mediaURL.path : mediaURL.absoluteString
+    engine.hwDecode = hwDecode
+    engine.fitMode = fitMode
+    engine.speed = speed
+    engine.load(
+      url: loadUrlString,
+      audioUrl: audioUrl,
+      headers: effectiveHeaders,
+      startMs: startMs,
+      subtitles: subtitles
+    )
   }
 
   #if canImport(MobileVLCKit)
@@ -767,7 +1035,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
       media.addOption(":avcodec-hw=none")
       media.addOption(":avcodec-threads=0")
     }
-    if mediaURL.host != "127.0.0.1" {
+    let isOwnProxy = IosStreamProxy.shared.isOwnProxyURL(mediaURL)
+    if !isOwnProxy {
       for (k, v) in headers {
         let lower = k.lowercased()
         if lower == "user-agent" {
@@ -780,7 +1049,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
 
     vlcPendingStartMs = max(0, startMs)
     vlcAppliedInitialSeek = (vlcPendingStartMs == 0)
-    vlcLoadedViaProxy = (mediaURL.host == "127.0.0.1")
+    vlcLoadedViaProxy = isOwnProxy
     player.media = media
     vlcPlayer = player
     videoView.applyFitLayout()
@@ -819,7 +1088,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   }
 
   private func sampleVlcMetrics() {
-    guard !isUsingAvPlayer, let player = vlcPlayer else { return }
+    guard isUsingVlc, let player = vlcPlayer else { return }
     let tMs = Int64(player.time.intValue)
     if tMs >= 0 {
       positionMs = tMs
@@ -833,7 +1102,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
       videoView.naturalVideoSize = sz
     }
     let now = CACurrentMediaTime()
-    if activeLoad?.proxyToken != nil {
+    if activeLoad?.proxyToken != nil && vlcLoadedViaProxy {
       let proxyTotal = IosStreamProxy.shared.totalUpstreamBytesRead()
       if lastProxyBytesTotal >= 0 && lastBytesSampleTime > 0 && proxyTotal >= lastProxyBytesTotal {
         let dt = max(0.2, now - lastBytesSampleTime)
@@ -866,6 +1135,119 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     delegate?.kernelDidUpdateMetrics()
   }
   #endif
+
+  // MARK: - IosMpvEngineDelegate
+
+  func mpvEngineDidChangeState(_ nextState: String) {
+    guard isUsingMpv else { return }
+    if nextState == "playing" && !shouldAutoPlay {
+      mpvEngine?.pause()
+      return
+    }
+    updateState(nextState)
+  }
+
+  func mpvEngineDidUpdateMetrics() {
+    guard isUsingMpv, let engine = mpvEngine else { return }
+    positionMs = engine.positionMs
+    if engine.durationMs > 0 {
+      durationMs = engine.durationMs
+    }
+    if engine.videoSize.width > 0 && engine.videoSize.height > 0 && engine.videoSize != videoSize {
+      videoSize = engine.videoSize
+      videoView.naturalVideoSize = engine.videoSize
+    }
+    if let codec = engine.videoCodecName, !codec.isEmpty {
+      videoCodecName = codec
+    }
+    if let fps = engine.nominalFps, fps > 0 {
+      nominalFps = fps
+    }
+    if mpvLoadedViaProxy, activeLoad?.proxyToken != nil {
+      let now = CACurrentMediaTime()
+      if now - lastBytesSampleTime >= 0.45 {
+        let proxyTotal = IosStreamProxy.shared.totalUpstreamBytesRead()
+        if lastProxyBytesTotal >= 0 && lastBytesSampleTime > 0 && proxyTotal >= lastProxyBytesTotal {
+          let dt = max(0.2, now - lastBytesSampleTime)
+          let delta = Double(proxyTotal - lastProxyBytesTotal) / dt
+          downloadBytesPerSec = delta > 0 ? delta : engine.downloadBytesPerSec
+        }
+        lastProxyBytesTotal = proxyTotal
+        lastBytesSampleTime = now
+      }
+    } else {
+      downloadBytesPerSec = engine.downloadBytesPerSec
+    }
+    updateCurrentSidecarCue()
+    delegate?.kernelDidUpdateMetrics()
+  }
+
+  func mpvEngineDidFail(message: String, diagnostic: String, code: Int) {
+    guard isUsingMpv else { return }
+    let proxyDiag = IosStreamProxy.shared.diagnosticsSummary(for: activeLoad?.proxyToken)
+    let hasHardHttpErr = (proxyDiag?.contains("HTTP 4") == true) || (proxyDiag?.contains("HTTP 5") == true)
+
+    // 1. Retry once via IosStreamProxy if direct HTTP open failed
+    if !mpvLoadedViaProxy,
+       !mpvRetriedViaProxy,
+       !hasHardHttpErr,
+       let ctx = activeLoad,
+       ctx.generation == loadGeneration,
+       let proxied = ctx.proxiedUrl,
+       !ctx.cleanUrl.isFileURL {
+      playerUsbLog.notice("[NovaPlay][Player] MPV direct open failed -> retrying via IosStreamProxy")
+      mpvRetriedViaProxy = true
+      let resumeAt = max(ctx.startMs, positionMs)
+      loadWithMpvPlayer(
+        mediaURL: proxied,
+        audioUrl: ctx.audioUrl,
+        headers: ctx.effectiveHeaders,
+        startMs: resumeAt,
+        subtitles: ctx.subtitles,
+        viaProxy: true
+      )
+      return
+    }
+
+    lastMpvFailureSummary = diagnostic
+    // 2. Fallback to VLC if available and not yet attempted
+    #if canImport(MobileVLCKit)
+    if !didAutoFallbackToVlc,
+       let ctx = activeLoad,
+       ctx.generation == loadGeneration {
+      playerUsbLog.notice("[NovaPlay][Player] MPV failed -> falling back to VLC")
+      didAutoFallbackToVlc = true
+      let resumeAt = max(ctx.startMs, positionMs)
+      switchActiveBackendTemporarily(
+        to: "vlc",
+        notice: IosPlayerUiText.t("MPV 无法打开该片源，已自动切换至 VLC 内核", "MPV failed; switched to VLC")
+      )
+      loadWithVlcPlayer(
+        mediaURL: ctx.proxiedUrl ?? ctx.cleanUrl,
+        audioUrl: ctx.audioUrl,
+        headers: ctx.effectiveHeaders,
+        startMs: resumeAt,
+        subtitles: ctx.subtitles,
+        proxyToken: ctx.proxyToken
+      )
+      return
+    }
+    #endif
+
+    var finalMsg = message
+    if let proxyDiag = proxyDiag, !finalMsg.contains(proxyDiag) {
+      finalMsg += " (\(proxyDiag))"
+    }
+    var reportLines: [String] = [diagnostic]
+    if let avFail = lastAvFailureSummary {
+      reportLines.append("AVPlayer: \(avFail)")
+    }
+    if let proxyDiag = proxyDiag {
+      reportLines.append(proxyDiag)
+    }
+    lastDiagnosticReport = reportLines.joined(separator: "\n")
+    delegate?.kernelDidFail(message: finalMsg, code: code)
+  }
 
   private func applyVlcFillAspect(_ fillSize: CGSize) {
     #if canImport(MobileVLCKit)
@@ -921,36 +1303,69 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     return (short, full, code)
   }
 
+  private func fallbackFromAvPlayer(
+    ctx: ActiveLoadContext,
+    failureSummary: String,
+    zhNoticePrefix: String,
+    enNoticePrefix: String
+  ) -> Bool {
+    guard !didAutoFallbackFromAv,
+          ctx.generation == loadGeneration,
+          let fb = preferredFallbackBackendAfterAvPlayer() else {
+      return false
+    }
+    didAutoFallbackFromAv = true
+    if fb == "vlc" { didAutoFallbackToVlc = true }
+    lastAvFailedRawUrl = ctx.rawUrl
+    lastAvFailureSummary = failureSummary
+    let resumeAt = max(ctx.startMs, positionMs)
+    let fbLabel = fb.uppercased()
+    switchActiveBackendTemporarily(
+      to: fb,
+      notice: IosPlayerUiText.t("\(zhNoticePrefix)，已自动切换至 \(fbLabel) 内核", "\(enNoticePrefix); switched to \(fbLabel)")
+    )
+    if fb == "mpv" {
+      loadWithMpvPlayer(
+        mediaURL: ctx.cleanUrl,
+        audioUrl: ctx.audioUrl,
+        headers: ctx.effectiveHeaders,
+        startMs: resumeAt,
+        subtitles: ctx.subtitles,
+        viaProxy: false
+      )
+    } else {
+      #if canImport(MobileVLCKit)
+      loadWithVlcPlayer(
+        mediaURL: ctx.proxiedUrl ?? ctx.cleanUrl,
+        audioUrl: ctx.audioUrl,
+        headers: ctx.effectiveHeaders,
+        startMs: resumeAt,
+        subtitles: ctx.subtitles,
+        proxyToken: ctx.proxyToken
+      )
+      #endif
+    }
+    return true
+  }
+
   private func observeAvItem(_ item: AVPlayerItem, startMs: Int64) {
     statusObs = item.observe(\.status, options: [.new, .initial]) { [weak self] it, _ in
       DispatchQueue.main.async {
         guard let self = self, self.isUsingAvPlayer else { return }
         switch it.status {
         case .readyToPlay:
-          if let vTrack = it.asset.tracks(withMediaType: .video).first, !vTrack.isPlayable {
-            #if canImport(MobileVLCKit)
-            if !self.didAutoFallbackToVlc,
-               let ctx = self.activeLoad,
-               ctx.generation == self.loadGeneration {
-              playerUsbLog.notice("[NovaPlay][Player] AVPlayer video track unplayable -> fallback to VLC")
-              self.didAutoFallbackToVlc = true
-              self.lastAvFailedRawUrl = ctx.rawUrl
-              self.lastAvFailureSummary = "AVAssetTrack.isPlayable=false"
-              let resumeAt = max(ctx.startMs, self.positionMs)
-              self.switchActiveBackendTemporarilyToVlc(
-                notice: IosPlayerUiText.t("当前设备不支持该视频编码硬解，已自动切换至 VLC 内核", "Video codec unsupported by AVPlayer; switched to VLC")
-              )
-              self.loadWithVlcPlayer(
-                mediaURL: ctx.proxiedVlcUrl ?? ctx.cleanUrl,
-                audioUrl: ctx.audioUrl,
-                headers: ctx.effectiveHeaders,
-                startMs: resumeAt,
-                subtitles: ctx.subtitles,
-                proxyToken: ctx.proxyToken
-              )
+          if let vTrack = it.asset.tracks(withMediaType: .video).first,
+             !vTrack.isPlayable,
+             let ctx = self.activeLoad {
+            playerUsbLog.notice("[NovaPlay][Player] AVPlayer video track unplayable -> fallback")
+            if self.fallbackFromAvPlayer(
+              ctx: ctx,
+              failureSummary: "AVAssetTrack.isPlayable=false",
+              zhNoticePrefix: "当前设备不支持该视频编码硬解",
+              enNoticePrefix: "Video codec unsupported by AVPlayer"
+            ) {
               return
             }
-            #endif
           }
           if !self.shiftedSidecarIndexForCurrentItem {
             self.shiftedSidecarIndexForCurrentItem = true
@@ -984,28 +1399,15 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
           let (shortMsg, fullDiag, code) = self.describeAvFailure(item: it)
           let safeDiag = fullDiag.replacingOccurrences(of: "\n", with: " | ")
           playerUsbLog.error("[NovaPlay][Player] AVPlayer failed: \(safeDiag, privacy: .public)")
-          #if canImport(MobileVLCKit)
-          if !self.didAutoFallbackToVlc,
-             let ctx = self.activeLoad,
-             ctx.generation == self.loadGeneration {
-            self.didAutoFallbackToVlc = true
-            self.lastAvFailedRawUrl = ctx.rawUrl
-            self.lastAvFailureSummary = fullDiag
-            let resumeAt = max(ctx.startMs, self.positionMs)
-            self.switchActiveBackendTemporarilyToVlc(
-              notice: IosPlayerUiText.t("AVPlayer 无法打开该片源，已自动切换至 VLC 内核", "AVPlayer cannot open stream; switched to VLC")
-            )
-            self.loadWithVlcPlayer(
-              mediaURL: ctx.proxiedVlcUrl ?? ctx.cleanUrl,
-              audioUrl: ctx.audioUrl,
-              headers: ctx.effectiveHeaders,
-              startMs: resumeAt,
-              subtitles: ctx.subtitles,
-              proxyToken: ctx.proxyToken
-            )
+          if let ctx = self.activeLoad,
+             self.fallbackFromAvPlayer(
+               ctx: ctx,
+               failureSummary: fullDiag,
+               zhNoticePrefix: "AVPlayer 无法打开该片源",
+               enNoticePrefix: "AVPlayer cannot open stream"
+             ) {
             return
           }
-          #endif
           self.lastDiagnosticReport = fullDiag
           self.delegate?.kernelDidFail(message: shortMsg, code: code)
         default:
@@ -1064,29 +1466,16 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
         fullDiag = baseFull
       }
 
-      #if canImport(MobileVLCKit)
       if self.positionMs < 2000,
-         !self.didAutoFallbackToVlc,
          let ctx = self.activeLoad,
-         ctx.generation == self.loadGeneration {
-        self.didAutoFallbackToVlc = true
-        self.lastAvFailedRawUrl = ctx.rawUrl
-        self.lastAvFailureSummary = fullDiag
-        let resumeAt = max(ctx.startMs, self.positionMs)
-        self.switchActiveBackendTemporarilyToVlc(
-          notice: IosPlayerUiText.t("AVPlayer 分片加载失败，已自动切换至 VLC 内核", "AVPlayer segment failed; switched to VLC")
-        )
-        self.loadWithVlcPlayer(
-          mediaURL: ctx.proxiedVlcUrl ?? ctx.cleanUrl,
-          audioUrl: ctx.audioUrl,
-          headers: ctx.effectiveHeaders,
-          startMs: resumeAt,
-          subtitles: ctx.subtitles,
-          proxyToken: ctx.proxyToken
-        )
+         self.fallbackFromAvPlayer(
+           ctx: ctx,
+           failureSummary: fullDiag,
+           zhNoticePrefix: "AVPlayer 分片加载失败",
+           enNoticePrefix: "AVPlayer segment failed"
+         ) {
         return
       }
-      #endif
       self.lastDiagnosticReport = fullDiag
       self.delegate?.kernelDidFail(message: shortMsg, code: errCode)
     }
@@ -1172,10 +1561,13 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
   func play() {
     shouldAutoPlay = true
     configureAudioSession()
-    if isUsingAvPlayer {
+    switch activeKernelId {
+    case "avplayer":
       resumeAvPlaybackWithStallProtection()
       syncStateFromAvPlayer()
-    } else {
+    case "mpv":
+      mpvEngine?.play()
+    default:
       #if canImport(MobileVLCKit)
       vlcPlayer?.play()
       vlcPlayer?.rate = speed
@@ -1186,10 +1578,13 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
 
   func pause() {
     shouldAutoPlay = false
-    if isUsingAvPlayer {
+    switch activeKernelId {
+    case "avplayer":
       avPlayer.pause()
       secondaryAudioPlayer?.pause()
-    } else {
+    case "mpv":
+      mpvEngine?.pause()
+    default:
       #if canImport(MobileVLCKit)
       vlcPlayer?.pause()
       #endif
@@ -1203,7 +1598,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     isSeeking = true
     updateState("buffering")
 
-    if isUsingAvPlayer {
+    switch activeKernelId {
+    case "avplayer":
       let target = CMTime(value: clamped, timescale: 1000)
       avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
         DispatchQueue.main.async {
@@ -1219,13 +1615,17 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
           self.syncStateFromAvPlayer()
         }
       }
-    } else {
+    case "mpv":
+      isSeeking = false
+      mpvEngine?.seekTo(clamped)
+      updateCurrentSidecarCue()
+    default:
       #if canImport(MobileVLCKit)
       if let player = vlcPlayer {
         player.time = VLCTime(number: NSNumber(value: clamped))
       }
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-        guard let self = self, !self.isUsingAvPlayer else { return }
+        guard let self = self, self.isUsingVlc else { return }
         self.isSeeking = false
         self.updateCurrentSidecarCue()
         if self.shouldAutoPlay {
@@ -1277,8 +1677,10 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
 
   // MARK: - Tracks (Audio & Subtitles)
 
-  func applySubtitlePreferences(lang: String?) {
+  func applySubtitlePreferences(lang: String?, fontFamily: String? = nil) {
     preferredSubtitleLang = lang
+    preferredSubtitleFontFamily = fontFamily
+    mpvEngine?.applySubtitlePreferences(lang: lang, fontFamily: fontFamily)
     if isUsingAvPlayer, let item = avPlayer.currentItem, item.status == .readyToPlay {
       applyAvPreferredTracks(on: item)
     }
@@ -1286,8 +1688,33 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
 
   func applyAudioPreference(lang: String?) {
     preferredAudioLang = lang
+    mpvEngine?.applyAudioPreference(lang: lang)
     if isUsingAvPlayer, let item = avPlayer.currentItem, item.status == .readyToPlay {
       applyAvPreferredTracks(on: item)
+    }
+  }
+
+  /// Adds an external subtitle track without restarting video playback when supported (`mpv` / `avplayer` sidecar / `vlc` slave).
+  func addExternalSubtitleHot(_ sub: SubtitleOption, headers: [String: String]) {
+    let newIndex = sidecarSubtitles.count
+    sidecarSubtitles.append(LoadedSidecarSubtitle(option: sub, cues: []))
+    fetchSidecarSubtitleAt(idx: newIndex, sub: sub, headers: headers)
+    if isUsingMpv {
+      mpvEngine?.addExternalSubtitle(sub)
+      selectedSubtitleIdx = -1
+      delegate?.kernelDidUpdateSubtitleCue(nil)
+    } else if isUsingAvPlayer {
+      selectedSubtitleIdx = avEmbeddedSubtitleOptions().count + newIndex
+      updateCurrentSidecarCue()
+    } else {
+      #if canImport(MobileVLCKit)
+      if let u = parseMediaURL(sub.url), u.isFileURL {
+        vlcPlayer?.addPlaybackSlave(u, type: .subtitle, enforce: true)
+      } else {
+        selectedSubtitleIdx = 10_000 + newIndex
+      }
+      updateCurrentSidecarCue()
+      #endif
     }
   }
 
@@ -1321,6 +1748,9 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     if isUsingAvPlayer {
       return selectedSubtitleIdx >= 0
     }
+    if isUsingMpv {
+      return (mpvEngine?.subtitlesEnabled ?? false) || selectedSubtitleIdx >= 10_000
+    }
     #if canImport(MobileVLCKit)
     if let cur = vlcPlayer?.currentVideoSubTitleIndex, cur >= 0 {
       return true
@@ -1353,6 +1783,10 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
       return list
     }
 
+    if isUsingMpv {
+      return mpvEngine?.subtitleTracks() ?? []
+    }
+
     #if canImport(MobileVLCKit)
     if let player = vlcPlayer {
       let names = (player.videoSubTitlesNames as? [String]) ?? []
@@ -1369,7 +1803,6 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
         ))
         embeddedValidCount += 1
       }
-      // Also expose remote HTTP sidecar subtitles parsed via SidecarSubtitleParser
       for (j, side) in sidecarSubtitles.enumerated() {
         let syntheticIdx = 10_000 + j
         list.append(IosTrackOption(
@@ -1401,11 +1834,15 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
       return
     }
 
+    if isUsingMpv {
+      mpvEngine?.selectSubtitle(index)
+      delegate?.kernelDidUpdateSubtitleCue(nil)
+      return
+    }
+
     #if canImport(MobileVLCKit)
     if let player = vlcPlayer {
-      if index < 0 {
-        player.currentVideoSubTitleIndex = -1
-      } else if index >= 10_000 {
+      if index < 0 || index >= 10_000 {
         player.currentVideoSubTitleIndex = -1
       } else {
         player.currentVideoSubTitleIndex = Int32(index)
@@ -1429,6 +1866,10 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
           selected: (selectedAudioIdx == idx) || (selectedAudioIdx < 0 && current == opt)
         )
       }
+    }
+
+    if isUsingMpv {
+      return mpvEngine?.audioTracks() ?? []
     }
 
     #if canImport(MobileVLCKit)
@@ -1466,6 +1907,11 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
       return
     }
 
+    if isUsingMpv {
+      mpvEngine?.selectAudio(index)
+      return
+    }
+
     #if canImport(MobileVLCKit)
     vlcPlayer?.currentAudioTrackIndex = Int32(index)
     #endif
@@ -1473,41 +1919,49 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
 
   private func loadSidecarSubtitles(_ list: [SubtitleOption], headers: [String: String]) {
     sidecarSubtitles = list.map { LoadedSidecarSubtitle(option: $0, cues: []) }
-    if !list.isEmpty && selectedSubtitleIdx < 0 {
+    if !list.isEmpty && selectedSubtitleIdx < 0 && !isUsingMpv {
       selectedSubtitleIdx = isUsingAvPlayer ? avEmbeddedSubtitleOptions().count : 10_000
     }
     for (idx, sub) in list.enumerated() {
-      guard let u = parseMediaURL(sub.url) else { continue }
-      if u.isFileURL {
-        let accessed = u.startAccessingSecurityScopedResource()
-        let text = (try? String(contentsOf: u, encoding: .utf8)) ?? (try? String(contentsOf: u, encoding: .utf16))
-        if accessed { u.stopAccessingSecurityScopedResource() }
-        if let text = text {
-          let cues = SidecarSubtitleParser.parse(text)
-          DispatchQueue.main.async { [weak self] in
-            guard let self = self, idx < self.sidecarSubtitles.count else { return }
-            self.sidecarSubtitles[idx].cues = cues
-            self.updateCurrentSidecarCue()
-          }
-        }
-        continue
-      }
-      var req = URLRequest(url: u)
-      for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
-      URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
-        guard let data = data,
-              let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16) else { return }
+      fetchSidecarSubtitleAt(idx: idx, sub: sub, headers: headers)
+    }
+  }
+
+  private func fetchSidecarSubtitleAt(idx: Int, sub: SubtitleOption, headers: [String: String]) {
+    guard let u = parseMediaURL(sub.url) else { return }
+    if u.isFileURL {
+      let accessed = u.startAccessingSecurityScopedResource()
+      let text = (try? String(contentsOf: u, encoding: .utf8)) ?? (try? String(contentsOf: u, encoding: .utf16))
+      if accessed { u.stopAccessingSecurityScopedResource() }
+      if let text = text {
         let cues = SidecarSubtitleParser.parse(text)
-        DispatchQueue.main.async {
+        DispatchQueue.main.async { [weak self] in
           guard let self = self, idx < self.sidecarSubtitles.count else { return }
           self.sidecarSubtitles[idx].cues = cues
           self.updateCurrentSidecarCue()
         }
-      }.resume()
+      }
+      return
     }
+    var req = URLRequest(url: u)
+    for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
+    URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+      guard let data = data,
+            let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16) else { return }
+      let cues = SidecarSubtitleParser.parse(text)
+      DispatchQueue.main.async {
+        guard let self = self, idx < self.sidecarSubtitles.count else { return }
+        self.sidecarSubtitles[idx].cues = cues
+        self.updateCurrentSidecarCue()
+      }
+    }.resume()
   }
 
   private func updateCurrentSidecarCue() {
+    if isUsingMpv {
+      delegate?.kernelDidUpdateSubtitleCue(nil)
+      return
+    }
     let sideIdx: Int
     if isUsingAvPlayer {
       sideIdx = selectedSubtitleIdx - avEmbeddedSubtitleOptions().count
@@ -1547,7 +2001,12 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
       return
     }
 
-    // VLC drawable capture
+    if isUsingMpv, let mpvImg = mpvEngine?.captureVideoFrame() {
+      saveImageToPhotos(mpvImg, completion: completion)
+      return
+    }
+
+    // Drawable hierarchy fallback (VLC / Metal view)
     guard videoView.bounds.width > 0, videoView.bounds.height > 0 else {
       completion(false, IosPlayerUiText.t("当前画面无法截图", "No video frame available"))
       return
@@ -1610,6 +2069,10 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     secondaryAudioPlayer = nil
   }
 
+  private func stopMpvPlaybackOnly() {
+    mpvEngine?.stopPlayback()
+  }
+
   private func stopVlcPlaybackOnly() {
     #if canImport(MobileVLCKit)
     vlcStatsTimer?.invalidate()
@@ -1633,6 +2096,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     cancelPendingProbe = nil
     activeLoad = nil
     stopAvPlaybackOnly()
+    mpvEngine?.destroy()
+    mpvEngine = nil
     stopVlcPlaybackOnly()
     if let obs = timeObserver {
       avPlayer.removeTimeObserver(obs)
@@ -1648,7 +2113,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
 extension IosPlayerKernel: VLCMediaPlayerDelegate {
   func mediaPlayerStateChanged(_ aNotification: Notification) {
     DispatchQueue.main.async { [weak self] in
-      guard let self = self, !self.isUsingAvPlayer, let player = self.vlcPlayer else { return }
+      guard let self = self, self.isUsingVlc, let player = self.vlcPlayer else { return }
       switch player.state {
       case .opening, .buffering:
         if player.isPlaying {
@@ -1696,8 +2161,8 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
         var msg: String
         if let avSummary = self.lastAvFailureSummary, avSummary.hasPrefix("视频播放失败") || avSummary.hasPrefix("Playback failed") {
           msg = avSummary
-        } else if self.lastAvFailureSummary != nil {
-          msg = IosPlayerUiText.t("AVPlayer 与 VLC 均播放失败", "Both AVPlayer and VLC failed to open stream")
+        } else if self.lastAvFailureSummary != nil || self.lastMpvFailureSummary != nil {
+          msg = IosPlayerUiText.t("多内核尝试均播放失败", "All playback kernels failed to open stream")
           if let proxyDiag = proxyDiag {
             msg += " (\(proxyDiag))"
           }
@@ -1711,6 +2176,9 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
         var reportLines: [String] = [msg]
         if let avFail = self.lastAvFailureSummary {
           reportLines.append("AVPlayer: \(avFail)")
+        }
+        if let mpvFail = self.lastMpvFailureSummary {
+          reportLines.append("MPV: \(mpvFail)")
         }
         if let host = self.activeLoad?.cleanUrl.host {
           reportLines.append("targetHost=\(host), ext=\(self.activeLoad?.cleanUrl.pathExtension ?? "")")
@@ -1727,7 +2195,7 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
 
   func mediaPlayerTimeChanged(_ aNotification: Notification) {
     DispatchQueue.main.async { [weak self] in
-      guard let self = self, !self.isUsingAvPlayer, let player = self.vlcPlayer else { return }
+      guard let self = self, self.isUsingVlc, let player = self.vlcPlayer else { return }
       let ms = Int64(player.time.intValue)
       if ms >= 0 { self.positionMs = ms }
       if let len = player.media?.length.intValue, len > 0 {

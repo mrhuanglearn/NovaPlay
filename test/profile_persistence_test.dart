@@ -9,7 +9,7 @@ import 'package:uzv_reimpl/core/json_store.dart';
 import 'package:uzv_reimpl/features/catpaw/dart_callback_server.dart';
 import 'package:uzv_reimpl/features/subscription/subscription.dart';
 
-Future<Map<String, dynamic>> _postMsg(int port, Map<String, Object?> payload) async {
+Future<Object?> _postMsgRaw(int port, Map<String, Object?> payload) async {
   final client = HttpClient();
   try {
     final req = await client.post('127.0.0.1', port, '/msg');
@@ -17,10 +17,15 @@ Future<Map<String, dynamic>> _postMsg(int port, Map<String, Object?> payload) as
     req.add(utf8.encode(jsonEncode(payload)));
     final res = await req.close();
     final text = await utf8.decoder.bind(res).join();
-    return (jsonDecode(text) as Map).cast<String, dynamic>();
+    return jsonDecode(text);
   } finally {
     client.close(force: true);
   }
+}
+
+Future<Map<String, dynamic>> _postMsg(int port, Map<String, Object?> payload) async {
+  final decoded = await _postMsgRaw(port, payload);
+  return (decoded as Map).cast<String, dynamic>();
 }
 
 ProviderContainer _makeContainer(Directory dir) {
@@ -33,7 +38,25 @@ ProviderContainer _makeContainer(Directory dir) {
 }
 
 void main() {
-  test('saveProfile via POST /msg {action, opt} persists and queryProfile restores it after cold restart', () async {
+  test('empty queryProfile returns raw {} object (never wrapped in {ok, code, data})', () async {
+    final tempDir = await Directory.systemTemp.createTemp('uzv-profile-empty-');
+    addTearDown(() => tempDir.delete(recursive: true));
+
+    final c = _makeContainer(tempDir);
+    addTearDown(c.dispose);
+    await c
+        .read(subscriptionRepositoryProvider)
+        .save([const Subscription(key: 'sub_empty', name: 'Empty', indexJsUrl: 'https://example.com/index.js')]);
+    final port = await c.read(dartCallbackServerProvider).start();
+
+    final emptyReply = await _postMsg(port, {'action': 'queryProfile'});
+    expect(emptyReply, isEmpty);
+    expect(emptyReply.containsKey('ok'), isFalse);
+    expect(emptyReply.containsKey('data'), isFalse);
+  });
+
+  test('saveProfile via POST /msg {action, opt} persists and queryProfile returns raw profile map after cold restart',
+      () async {
     final tempDir = await Directory.systemTemp.createTemp('uzv-profile-test-');
     addTearDown(() => tempDir.delete(recursive: true));
 
@@ -48,8 +71,8 @@ void main() {
     final saveReply = await _postMsg(port1, {
       'action': 'saveProfile',
       'opt': {
-        'quark': '__puus=cookie_value_123',
-        'uc': 'uc_cookie_456',
+        'quark': {'cookie': '__puus=cookie_value_123'},
+        'uc': {'cookie': 'uc_cookie_456'},
         'pan123': {'username': 'user@example.com', 'password': 'pw'},
       },
     });
@@ -57,23 +80,70 @@ void main() {
     await srv1.stop();
     c1.dispose();
 
-    // Verify file actually landed on disk in subscription_profiles.json (not {"null": null}).
+    // Verify file actually landed on disk in subscription_profiles.json cleanly without envelope keys.
     final onDisk = await JsonStore('subscription_profiles.json', baseDir: tempDir).read<Map<String, dynamic>>({});
     expect(onDisk.containsKey('null'), isFalse);
     expect(onDisk['sub_alpha'], isA<Map>());
 
-    // Launch #2 (full app exit + cold restart): CatPaw calls POST /msg {"action":"queryProfile"} with NO name!
+    // Launch #2 (full app exit + cold restart): CatPaw calls POST /msg {"action":"queryProfile"} and expects raw JSON!
     final c2 = _makeContainer(tempDir);
     addTearDown(c2.dispose);
     final srv2 = c2.read(dartCallbackServerProvider);
     final port2 = await srv2.start();
 
     final queryReply = await _postMsg(port2, {'action': 'queryProfile'});
-    expect(queryReply['ok'], isTrue);
-    expect(queryReply['data'], {
-      'quark': '__puus=cookie_value_123',
-      'uc': 'uc_cookie_456',
+    expect(queryReply.containsKey('ok'), isFalse);
+    expect(queryReply.containsKey('code'), isFalse);
+    expect(queryReply.containsKey('data'), isFalse);
+    expect(queryReply, {
+      'quark': {'cookie': '__puus=cookie_value_123'},
+      'uc': {'cookie': 'uc_cookie_456'},
       'pan123': {'username': 'user@example.com', 'password': 'pw'},
+    });
+  });
+
+  test('heals Russian-doll {ok, code, data} corrupted subscription_profiles.json captured on iOS live USB', () async {
+    final tempDir = await Directory.systemTemp.createTemp('uzv-profile-heal-');
+    addTearDown(() => tempDir.delete(recursive: true));
+
+    // Seed exact nested corruption shape observed on USB syslog when previous builds wrapped queryProfile in {ok, code, data}.
+    await JsonStore('subscription_profiles.json', baseDir: tempDir).write({
+      'sub_corrupt': {
+        'ok': true,
+        'code': 0,
+        'data': {
+          'ok': true,
+          'code': 0,
+          'data': {
+            'spider': {'thread': 6},
+            'guazi': {'token': 'gz_tok'},
+          },
+          'quark': {'cookie': 'stale_ck', 'thread': 8},
+        },
+        'quark': {'cookie': 'latest_ck'},
+      },
+    });
+
+    final c = _makeContainer(tempDir);
+    addTearDown(c.dispose);
+    await c
+        .read(subscriptionRepositoryProvider)
+        .save([const Subscription(key: 'sub_corrupt', name: 'Heal', indexJsUrl: 'https://example.com/index.js')]);
+    final port = await c.read(dartCallbackServerProvider).start();
+
+    final healed = await _postMsg(port, {'action': 'queryProfile'});
+    expect(healed, {
+      'spider': {'thread': 6},
+      'guazi': {'token': 'gz_tok'},
+      'quark': {'cookie': 'latest_ck', 'thread': 8},
+    });
+
+    // Ensure healed profile was persisted back to disk without envelope keys.
+    final persisted = await JsonStore('subscription_profiles.json', baseDir: tempDir).read<Map<String, dynamic>>({});
+    expect(persisted['sub_corrupt'], {
+      'spider': {'thread': 6},
+      'guazi': {'token': 'gz_tok'},
+      'quark': {'cookie': 'latest_ck', 'thread': 8},
     });
   });
 
@@ -109,11 +179,11 @@ void main() {
     });
 
     final sub2Reply = await _postMsg(port, {'action': 'queryProfile'});
-    expect(sub2Reply['data'], {'quark': 'other_q'});
+    expect(sub2Reply, {'quark': 'other_q'});
 
     await c.read(activeSubscriptionKeyProvider.notifier).select('sub_1');
     final sub1Reply = await _postMsg(port, {'action': 'queryProfile'});
-    expect(sub1Reply['data'], {'quark': 'ck_q', 'ali': 'tk_a'});
+    expect(sub1Reply, {'quark': 'ck_q', 'ali': 'tk_a'});
   });
 
   test('saveProfile with non-Map opt (JSON string) round-trips intact via resolveCall and queryProfile', () async {
@@ -133,8 +203,8 @@ void main() {
     expect(r1.args, {'value': rawEncoded});
 
     await _postMsg(port, {'action': 'saveProfile', 'opt': rawEncoded});
-    final res = await _postMsg(port, {'action': 'queryProfile'});
-    expect(res['data'], rawEncoded);
+    final res = await _postMsgRaw(port, {'action': 'queryProfile'});
+    expect(res, rawEncoded);
   });
 
   test('named profile slots {name, profile} round-trip cleanly', () async {
@@ -159,7 +229,7 @@ void main() {
       'action': 'queryProfile',
       'opt': {'name': 'quarkSlot'},
     });
-    expect(res['data'], {'cookie': 'slot_ck'});
+    expect(res, {'cookie': 'slot_ck'});
   });
 
   test('SubscriptionInstaller.invalidateScript removes script markers while preserving Temp/_redirect user data',

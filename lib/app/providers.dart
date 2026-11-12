@@ -1,9 +1,11 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -214,11 +216,37 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
   }
   final int port;
   try {
+    String? profileFilePath;
+    try {
+      final profileStore = ref.read(subscriptionProfilesStoreProvider);
+      final allProfiles = Map<String, dynamic>.of(await profileStore.read<Map<String, dynamic>>(<String, dynamic>{}));
+      final rawEntry = allProfiles[sub.key] ?? allProfiles['default'];
+      final sanitized = sanitizeSubscriptionProfile(rawEntry);
+      if (rawEntry != null && jsonEncode(sanitized) != jsonEncode(rawEntry)) {
+        allProfiles[sub.key] = sanitized;
+        await profileStore.write(allProfiles);
+      }
+      final baseDir = await profileStore.resolveBaseDir();
+      final safeSubName = sub.key.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+      final profileDir = Directory(p.join(baseDir.path, 'subscription_profiles'));
+      await profileDir.create(recursive: true);
+      final pf = File(p.join(profileDir.path, '$safeSubName.json'));
+      if (!await pf.exists() || sanitized != null) {
+        final seed = sanitized is Map ? sanitized : (sanitized ?? <String, dynamic>{});
+        final tmp = File('${pf.path}.tmp');
+        await tmp.writeAsString(jsonEncode(seed), flush: true);
+        await tmp.rename(pf.path);
+      }
+      profileFilePath = pf.path;
+    } catch (_) {
+      profileFilePath = null;
+    }
     port = await catpaw.startAndWait(
       name: sub.key,
       scriptPath: installed.scriptPath,
       configPath: installed.configPath,
       force: true,
+      env: profileFilePath == null ? null : {'profile_path': profileFilePath},
     );
   } catch (_) {
     // A broken download must not be reused: 重试 downloads it again while keeping Temp/_redirect instance data intact.
@@ -352,6 +380,48 @@ bool webviewReplacesTop(Uri top, bool Function(DetailQuery q) detailLoading) =>
     top.path == '/video/detail' &&
     detailLoading((siteKey: top.queryParameters['site'], vodId: top.queryParameters['id'] ?? ''));
 
+/// Unwraps any accidental `{"ok": true, "code": 0, "data": ...}` envelope layers while preserving newer top-level site
+/// keys (`quark`, `spider`, `guazi`, ...) merged on top of older inner layers.
+Object? sanitizeSubscriptionProfile(Object? raw) {
+  if (raw is! Map) return raw;
+  final map = raw.cast<String, dynamic>();
+  final isEnvelope = map['ok'] is bool && map['code'] is num && map.containsKey('data');
+  if (isEnvelope) {
+    final inner = sanitizeSubscriptionProfile(map['data']);
+    final base = inner is Map ? Map<String, dynamic>.of(inner.cast<String, dynamic>()) : <String, dynamic>{};
+    final outer = <String, dynamic>{};
+    for (final entry in map.entries) {
+      final k = entry.key;
+      if (k == 'ok' || k == 'code' || k == 'data' || k == 'error') continue;
+      outer[k] = sanitizeSubscriptionProfile(entry.value);
+    }
+    return mergeProfileMaps(base, outer);
+  }
+  return <String, dynamic>{
+    for (final entry in map.entries)
+      entry.key: entry.value is Map
+          ? Map<String, dynamic>.of((entry.value as Map).cast<String, dynamic>())
+          : entry.value,
+  };
+}
+
+Map<String, dynamic> mergeProfileMaps(Map<String, dynamic> older, Map<String, dynamic> newer) {
+  final out = Map<String, dynamic>.of(older);
+  for (final entry in newer.entries) {
+    final prevVal = out[entry.key];
+    final nextVal = entry.value;
+    if (prevVal is Map && nextVal is Map) {
+      out[entry.key] = {
+        ...prevVal.cast<String, dynamic>(),
+        ...nextVal.cast<String, dynamic>(),
+      };
+    } else {
+      out[entry.key] = nextVal;
+    }
+  }
+  return out;
+}
+
 final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCallbackServer>((ref) {
   final history = ref.watch(historyRepositoryProvider);
   final profiles = ref.watch(subscriptionProfilesStoreProvider);
@@ -374,6 +444,21 @@ final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCal
     return 'default';
   }
 
+  Future<void> syncSidecarProfileFile(String subKey, Object? value) async {
+    try {
+      final baseDir = await profiles.resolveBaseDir();
+      final safeSubName = subKey.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+      final dir = Directory(p.join(baseDir.path, 'subscription_profiles'));
+      await dir.create(recursive: true);
+      final pf = File(p.join(dir.path, '$safeSubName.json'));
+      final tmp = File('${pf.path}.tmp');
+      await tmp.writeAsString(jsonEncode(value ?? <String, dynamic>{}), flush: true);
+      await tmp.rename(pf.path);
+    } catch (_) {
+      // Ignore in pure memory/mocked environments without disk baseDir.
+    }
+  }
+
   // Every payload field name below is INFERRED (only the action names were observed), hence the alias lists.
   final server = DartCallbackServer(handlers: {
     DartActions.toast: (args) async {
@@ -392,16 +477,35 @@ final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCal
     DartActions.queryHistory: (args) async => [for (final e in await history.all()) e.toJson()],
     DartActions.queryProfile: (args) async {
       final subKey = await activeProfileSubKey();
-      final all = await profiles.read<Map<String, dynamic>>(<String, dynamic>{});
+      final all = Map<String, dynamic>.of(await profiles.read<Map<String, dynamic>>(<String, dynamic>{}));
       final slot = args['name'];
       if (slot is String && slot.isNotEmpty && args.length == 1) {
-        final scoped = all['$subKey:$slot'];
-        if (scoped != null) return scoped;
-        if (all.containsKey(slot)) return all[slot];
+        final scopedKey = all.containsKey('$subKey:$slot') ? '$subKey:$slot' : (all.containsKey(slot) ? slot : null);
+        if (scopedKey != null) {
+          final rawSlot = all[scopedKey];
+          final healedSlot = sanitizeSubscriptionProfile(rawSlot);
+          if (jsonEncode(healedSlot) != jsonEncode(rawSlot)) {
+            all[scopedKey] = healedSlot;
+            await profiles.write(all);
+          }
+          return RawJsonResponse(healedSlot ?? <String, dynamic>{});
+        }
+        return const RawJsonResponse(<String, dynamic>{});
       }
-      if (all.containsKey(subKey)) return all[subKey];
-      if (subKey != 'default' && all.containsKey('default')) return all['default'];
-      return null;
+      final targetKey = all.containsKey(subKey)
+          ? subKey
+          : (subKey != 'default' && all.containsKey('default') ? 'default' : null);
+      if (targetKey != null) {
+        final rawEntry = all[targetKey];
+        final healed = sanitizeSubscriptionProfile(rawEntry);
+        if (jsonEncode(healed) != jsonEncode(rawEntry)) {
+          all[targetKey] = healed;
+          await profiles.write(all);
+          await syncSidecarProfileFile(targetKey, healed);
+        }
+        return RawJsonResponse(healed ?? <String, dynamic>{});
+      }
+      return const RawJsonResponse(<String, dynamic>{});
     },
     DartActions.saveProfile: (args) async {
       try {
@@ -412,25 +516,28 @@ final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCal
         }
         final slot = args['name'];
         if (slot is String && slot.isNotEmpty && args.containsKey('profile') && args.length == 2) {
-          all['$subKey:$slot'] = args['profile'];
+          all['$subKey:$slot'] = sanitizeSubscriptionProfile(args['profile']);
         } else if (args.length == 1 && args.containsKey('value')) {
-          all[subKey] = args['value'];
+          all[subKey] = sanitizeSubscriptionProfile(args['value']);
+          await syncSidecarProfileFile(subKey, all[subKey]);
         } else if (args.length == 1 && args.containsKey('profile')) {
-          final inner = args['profile'];
-          final prev = all[subKey];
+          final inner = sanitizeSubscriptionProfile(args['profile']);
+          final prev = sanitizeSubscriptionProfile(all[subKey]);
           if (inner is Map && inner.isNotEmpty && prev is Map) {
-            all[subKey] = {...prev.cast<String, dynamic>(), ...inner.cast<String, dynamic>()};
+            all[subKey] = mergeProfileMaps(prev.cast<String, dynamic>(), inner.cast<String, dynamic>());
           } else {
             all[subKey] = inner;
           }
+          await syncSidecarProfileFile(subKey, all[subKey]);
         } else {
-          final incoming = Map<String, dynamic>.of(args);
-          final prev = all[subKey];
-          if (incoming.isNotEmpty && prev is Map) {
-            all[subKey] = {...prev.cast<String, dynamic>(), ...incoming};
+          final sanitizedIncoming = sanitizeSubscriptionProfile(Map<String, dynamic>.of(args));
+          final prev = sanitizeSubscriptionProfile(all[subKey]);
+          if (sanitizedIncoming is Map && sanitizedIncoming.isNotEmpty && prev is Map) {
+            all[subKey] = mergeProfileMaps(prev.cast<String, dynamic>(), sanitizedIncoming.cast<String, dynamic>());
           } else {
-            all[subKey] = incoming;
+            all[subKey] = sanitizedIncoming;
           }
+          await syncSidecarProfileFile(subKey, all[subKey]);
         }
         await profiles.write(all);
         return true;

@@ -132,7 +132,8 @@ class _WebScreenState extends ConsumerState<WebScreen> {
       _customAgent = text;
     }
     setState(() => _agentKey = picked);
-    await _web?.setSettings(settings: InAppWebViewSettings(userAgent: _userAgent ?? ''));
+    final updatedSettings = ref.read(snifferServiceProvider).webViewSettings..userAgent = _userAgent ?? '';
+    await _web?.setSettings(settings: updatedSettings);
     await _web?.reload();
   }
 

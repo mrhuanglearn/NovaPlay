@@ -18,9 +18,14 @@ class JsonStore {
   final Directory? _baseDir;
   Future<void> _queue = Future<void>.value();
 
-  Future<File> _file() async {
+  Future<Directory> resolveBaseDir() async {
     final dir = _baseDir ?? await getApplicationSupportDirectory();
     await dir.create(recursive: true);
+    return dir;
+  }
+
+  Future<File> _file() async {
+    final dir = await resolveBaseDir();
     return File(p.join(dir.path, fileName));
   }
 

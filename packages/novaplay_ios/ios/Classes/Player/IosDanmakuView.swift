@@ -21,7 +21,11 @@ final class IosDanmakuView: UIView {
 
   private var config: DanmakuConfig?
   weak var kernel: IosPlayerKernel?
-  var paused: Bool = false
+  var paused: Bool = false {
+    didSet {
+      syncDisplayLinkPaused()
+    }
+  }
 
   private var active: [ActiveComment] = []
   private var cursor: Int = 0
@@ -41,10 +45,15 @@ final class IosDanmakuView: UIView {
   }
 
   func startDisplayLink() {
-    guard displayLink == nil else { return }
-    let link = CADisplayLink(target: DisplayLinkProxy(target: self), selector: #selector(DisplayLinkProxy.tick))
-    link.add(to: .main, forMode: .common)
-    displayLink = link
+    if displayLink == nil {
+      let link = CADisplayLink(target: DisplayLinkProxy(target: self), selector: #selector(DisplayLinkProxy.tick))
+      if #available(iOS 15.0, *) {
+        link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+      }
+      link.add(to: .main, forMode: .common)
+      displayLink = link
+    }
+    syncDisplayLinkPaused()
   }
 
   func stopDisplayLink() {
@@ -52,8 +61,17 @@ final class IosDanmakuView: UIView {
     displayLink = nil
   }
 
+  private func syncDisplayLinkPaused() {
+    let shouldRun = (config?.enabled ?? false) && !comments.isEmpty && !paused
+    displayLink?.isPaused = !shouldRun
+  }
+
   func configure(_ cfg: DanmakuConfig) {
     config = cfg
+    if !cfg.enabled && !active.isEmpty {
+      active.removeAll()
+    }
+    syncDisplayLinkPaused()
     setNeedsDisplay()
   }
 
@@ -61,6 +79,7 @@ final class IosDanmakuView: UIView {
     comments = list.sorted { $0.time < $1.time }
     cursor = 0
     active.removeAll()
+    syncDisplayLinkPaused()
     setNeedsDisplay()
   }
 

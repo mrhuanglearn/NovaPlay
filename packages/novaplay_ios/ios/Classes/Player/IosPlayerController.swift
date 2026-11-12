@@ -8,6 +8,7 @@ protocol IosPlayerControllerUiDelegate: AnyObject {
   func controllerDidShowToast(_ text: String, long: Bool)
   func controllerDidUpdateSubtitleCue(_ text: String?)
   func controllerDidUpdateMetrics()
+  func controllerDidSkipRange(fromMs: Int64)
   func controllerRequestRestorePiP(completion: @escaping (Bool) -> Void)
 }
 
@@ -49,9 +50,13 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   var danmakuSearchListener: (([DanmakuSearchResultItem]) -> Void)?
   var danmakuEpisodesListener: (([EpisodeItem]) -> Void)?
   var danmakuCountListener: ((Int) -> Void)?
+  private(set) var danmakuAnimeTitle: String?
+  private(set) var danmakuEpisodeTitle: String?
   private(set) var tmdbMatches: [TmdbEpisodeItem]
 
   private var remoteCommandsRegistered = false
+  private var lastNowPlayingSignature: String = ""
+  private var lastNowPlayingPosMs: Int64 = -10_000
 
   init(
     request: OpenPlayerRequest,
@@ -82,7 +87,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     kernel.fitMode = playbackConfig.fitMode
     kernel.speed = Float(currentSpeed)
     kernel.autoPictureInPicture = playbackConfig.autoPictureInPicture
-    kernel.applySubtitlePreferences(lang: playbackConfig.subtitleLang)
+    kernel.applySubtitlePreferences(lang: playbackConfig.subtitleLang, fontFamily: playbackConfig.subtitleFontFamily)
     kernel.applyAudioPreference(lang: playbackConfig.audioLang)
     danmakuView.kernel = kernel
     danmakuView.configure(danmakuConfig)
@@ -147,6 +152,8 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     state = "buffering"
     if refreshDanmaku {
       extraSubtitles.removeAll()
+      danmakuAnimeTitle = nil
+      danmakuEpisodeTitle = nil
     }
     requestId += 1
     let epReq = EpisodeRequest(
@@ -220,6 +227,8 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   func onDanmaku(_ payload: DanmakuPayload) {
     DispatchQueue.main.async { [weak self] in
       guard let self = self, !self.isClosed else { return }
+      self.danmakuAnimeTitle = payload.animeTitle
+      self.danmakuEpisodeTitle = payload.episodeTitle
       guard let data = payload.commentsJson.data(using: .utf8),
             let arr = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else { return }
       let parsed: [IosDanmakuView.Comment] = arr.compactMap { item in
@@ -231,6 +240,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
       }
       self.danmakuView.setComments(parsed)
       self.danmakuCountListener?(self.danmakuView.commentCount)
+      self.uiDelegate?.controllerDidChangeState()
     }
   }
 
@@ -364,8 +374,8 @@ final class IosPlayerController: IosPlayerKernelDelegate {
       kernel.speed = Float(next.speed)
     }
     kernel.autoPictureInPicture = next.autoPictureInPicture
-    if old.subtitleLang != next.subtitleLang {
-      kernel.applySubtitlePreferences(lang: next.subtitleLang)
+    if old.subtitleLang != next.subtitleLang || old.subtitleFontFamily != next.subtitleFontFamily {
+      kernel.applySubtitlePreferences(lang: next.subtitleLang, fontFamily: next.subtitleFontFamily)
     }
     if old.audioLang != next.audioLang {
       kernel.applyAudioPreference(lang: next.audioLang)
@@ -459,23 +469,11 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   }
 
   func addExternalSubtitle(url: String, name: String) {
-    guard let payload = lastPayload, let mediaUrl = payload.url else { return }
+    let sub = SubtitleOption(url: url, name: name, language: nil, mimeType: nil)
     extraSubtitles.removeAll { $0.url == url }
-    extraSubtitles.append(SubtitleOption(url: url, name: name, language: nil, mimeType: nil))
-    let combined = (payload.subtitles ?? []) + extraSubtitles
-    kernel.load(
-      url: mediaUrl,
-      audioUrl: payload.audioUrl,
-      headers: payload.headers ?? [:],
-      startMs: kernel.positionMs,
-      subtitles: combined
-    )
-    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-      guard let self = self, !self.isClosed else { return }
-      if let idx = self.kernel.subtitleTracks().lastIndex(where: { $0.label.contains(name) }) {
-        self.kernel.selectSubtitle(idx)
-      }
-    }
+    extraSubtitles.append(sub)
+    kernel.addExternalSubtitleHot(sub, headers: lastPayload?.headers ?? [:])
+    uiDelegate?.controllerDidChangeState()
   }
 
   func danmakuPrompt(completion: @escaping (DanmakuPromptInfo?) -> Void) {
@@ -525,11 +523,20 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   }
 
   func retry() {
+    reload()
+  }
+
+  func reload() {
     errorMessage = nil
+    failed = false
     if kernel.positionMs > 0 {
       pendingStartMs = kernel.positionMs
     }
     requestEpisode(lineIndex: line, episodeIndex: episode, refreshDanmaku: false)
+  }
+
+  func undoSkip(toMs: Int64) {
+    seekTo(max(0, toMs))
   }
 
   private func showError(_ message: String) {
@@ -570,9 +577,10 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     for (idx, range) in skipRanges.enumerated() {
       if pos >= range.0 && pos < range.1 && lastSkippedRangeIndex != idx {
         lastSkippedRangeIndex = idx
+        let originPos = pos
         kernel.seekTo(range.1)
         if playbackConfig.skipNotice {
-          uiDelegate?.controllerDidShowNotice(IosPlayerUiText.t("已跳过片段", "Section skipped"))
+          uiDelegate?.controllerDidSkipRange(fromMs: originPos)
         }
         return
       } else if pos < range.0 || pos >= range.1 + 2000 {
@@ -691,18 +699,29 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
   }
 
-  private func updateNowPlayingInfo() {
+  private func updateNowPlayingInfo(force: Bool = false) {
     guard !isClosed else { return }
+    let pos = kernel.positionMs
+    let dur = kernel.durationMs
+    let rate = kernel.isPlaying ? currentSpeed : 0.0
+    let ep = episodeName ?? ""
+    let sig = "\(title)|\(ep)|\(dur)|\(String(format: "%.2f", rate))"
+    if !force && sig == lastNowPlayingSignature && abs(pos - lastNowPlayingPosMs) < 5000 {
+      return
+    }
+    lastNowPlayingSignature = sig
+    lastNowPlayingPosMs = pos
+
     var info: [String: Any] = [
       MPMediaItemPropertyTitle: title,
-      MPNowPlayingInfoPropertyElapsedPlaybackTime: Double(kernel.positionMs) / 1000.0,
-      MPNowPlayingInfoPropertyPlaybackRate: kernel.isPlaying ? currentSpeed : 0.0
+      MPNowPlayingInfoPropertyElapsedPlaybackTime: Double(pos) / 1000.0,
+      MPNowPlayingInfoPropertyPlaybackRate: rate
     ]
-    if let ep = episodeName, !ep.isEmpty {
+    if !ep.isEmpty {
       info[MPMediaItemPropertyAlbumTitle] = ep
     }
-    if kernel.durationMs > 0 {
-      info[MPMediaItemPropertyPlaybackDuration] = Double(kernel.durationMs) / 1000.0
+    if dur > 0 {
+      info[MPMediaItemPropertyPlaybackDuration] = Double(dur) / 1000.0
     }
     MPNowPlayingInfoCenter.default().nowPlayingInfo = info
   }

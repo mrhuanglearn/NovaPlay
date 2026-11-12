@@ -2010,12 +2010,16 @@ class AppLocalizationsEn extends AppLocalizations {
       'AVPlayer uses Apple VideoToolbox hardware decoding with native iOS Picture-in-Picture, AirPlay video routing, and low power draw (best for HLS / MP4).';
 
   @override
+  String get playerIosMpvNote =>
+      'MPV uses libmpv + FFmpeg + Metal/MoltenVK (gpu-next) with VideoToolbox hardware decoding, Dolby Vision / HDR tone mapping, MKV, and full ASS subtitles, without iOS system Picture-in-Picture.';
+
+  @override
   String get playerIosVlcNote =>
       'VLC uses FFmpeg / libvlc for MKV, FLV, AVI, embedded ASS subtitles, and HW/SW decode switching, without iOS system Picture-in-Picture.';
 
   @override
   String get playerHwDecodeIosAvSub =>
-      'AVPlayer always uses VideoToolbox hardware decoding; this toggle applies to the VLC kernel';
+      'AVPlayer always uses VideoToolbox hardware decoding; this toggle applies to the MPV and VLC kernels';
 
   @override
   String get playerAutoPipIosVlcSub =>

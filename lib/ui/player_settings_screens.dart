@@ -107,7 +107,8 @@ class _PlayerSettingsScreenState extends ConsumerState<PlayerSettingsScreen> {
       v == v.roundToDouble() ? v.toStringAsFixed(1) : '${double.parse(v.toStringAsFixed(2))}';
 
   static String _normalizeIosKernel(String raw) => switch (raw.trim().toLowerCase()) {
-        'vlc' || 'mpv' || 'mdk' => 'vlc',
+        'mpv' => 'mpv',
+        'vlc' || 'mdk' => 'vlc',
         _ => 'avplayer',
       };
 
@@ -117,12 +118,12 @@ class _PlayerSettingsScreenState extends ConsumerState<PlayerSettingsScreen> {
     final l = context.l10n;
     final isIos = Theme.of(context).platform == TargetPlatform.iOS;
     // OBSERVED (UZN 1.1.7 on Android, 2026-11-10): MPV (MPV) / MDK (MDK) / EXO (SYSTEM).
-    // On iOS 15+, expose genuine iOS kernels: AVPlayer (VideoToolbox + PiP + AirPlay) and VLC (MobileVLCKit / FFmpeg).
+    // On iOS 15+, expose 3 native kernels: AVPlayer (VideoToolbox + PiP + AirPlay), MPV (libmpv + Metal/MoltenVK), and VLC (MobileVLCKit / FFmpeg).
     final kernels = isIos
-        ? const {'avplayer': 'AVPlayer (SYSTEM)', 'vlc': 'VLC (FFmpeg)'}
+        ? const {'avplayer': 'AVPlayer (SYSTEM)', 'mpv': 'MPV (MPV)', 'vlc': 'VLC (FFmpeg)'}
         : const {'mpv': 'MPV (MPV)', 'mdk': 'MDK (MDK)', 'exo': 'EXO (SYSTEM)'};
     final kernelNames = isIos
-        ? const {'avplayer': 'AVPlayer', 'vlc': 'VLC'}
+        ? const {'avplayer': 'AVPlayer', 'mpv': 'MPV', 'vlc': 'VLC'}
         : const {'mpv': 'MPV', 'mdk': 'MDK', 'exo': 'EXO'};
     final effectiveKernel = p == null ? '' : (isIos ? _normalizeIosKernel(p.kernel) : p.kernel);
     final fits = {'fit': l.playerFitFit, 'zoom': l.playerFitZoom, 'fill': l.playerFitFill};
@@ -160,6 +161,7 @@ class _PlayerSettingsScreenState extends ConsumerState<PlayerSettingsScreen> {
               if (!isIos && p.kernel == 'mpv') SettingsNote(l.playerMpvNote),
               if (!isIos && p.kernel == 'mdk') SettingsNote(l.playerMdkNote),
               if (isIos && effectiveKernel == 'avplayer') SettingsNote(l.playerIosAvplayerNote),
+              if (isIos && effectiveKernel == 'mpv') SettingsNote(l.playerIosMpvNote),
               if (isIos && effectiveKernel == 'vlc') SettingsNote(l.playerIosVlcNote),
               SettingsSection(title: l.playerGroupPlayback, children: [
                 SettingsTile(
@@ -225,7 +227,7 @@ class _PlayerSettingsScreenState extends ConsumerState<PlayerSettingsScreen> {
                 SwitchRow(
                   icon: Icons.picture_in_picture_alt_outlined,
                   title: l.playerAutoPip,
-                  subtitle: (isIos && effectiveKernel == 'vlc') ? l.playerAutoPipIosVlcSub : l.playerAutoPipSub,
+                  subtitle: (isIos && effectiveKernel != 'avplayer') ? l.playerAutoPipIosVlcSub : l.playerAutoPipSub,
                   value: p.autoPictureInPicture,
                   onChanged: (v) => _change((p) => p.autoPictureInPicture = v),
                 ),

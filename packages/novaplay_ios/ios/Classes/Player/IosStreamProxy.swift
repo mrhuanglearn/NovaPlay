@@ -534,7 +534,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
   private let delegateQueue: OperationQueue = {
     let q = OperationQueue()
     q.name = "app.novaplay.streamproxy.urlsession"
-    q.maxConcurrentOperationCount = 8
+    q.maxConcurrentOperationCount = 16
     q.qualityOfService = .userInitiated
     return q
   }()
@@ -547,10 +547,18 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     cfg.urlCache = nil
     cfg.httpShouldSetCookies = false
     cfg.httpCookieAcceptPolicy = .never
-    cfg.httpMaximumConnectionsPerHost = 8
+    cfg.httpMaximumConnectionsPerHost = 16
     cfg.timeoutIntervalForRequest = 20
     cfg.timeoutIntervalForResource = 7200
     urlSession = URLSession(configuration: cfg, delegate: self, delegateQueue: delegateQueue)
+  }
+
+  /// True only for URLs served by this `IosStreamProxy` listener (`127.0.0.1:<boundPort>/proxy/...`),
+  /// NOT for CatPaw's own local Node proxy (`127.0.0.1:2333/...`).
+  func isOwnProxyURL(_ url: URL) -> Bool {
+    guard url.host == "127.0.0.1", url.path.hasPrefix("/proxy/") else { return false }
+    let p = Int(currentBoundPort)
+    return p > 0 && url.port == p
   }
 
   static func isLikelyVlcOnlyExtension(_ rawExt: String) -> Bool {

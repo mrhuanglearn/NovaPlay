@@ -46,6 +46,10 @@ enum IosPlayerUiText {
     return String(format: "%.2fx", r)
   }
 
+  static func speedOption(_ v: Double) -> String {
+    abs(v - 1.0) < 0.001 ? t("1.0x 常速", "1.0x Normal") : speed(v)
+  }
+
   static func speedMenuLabel(_ v: Double) -> String {
     if abs(v - 1.0) < 0.001 {
       return t("1.0x 常速", "1.0x Normal")
@@ -54,6 +58,42 @@ enum IosPlayerUiText {
       return "\(Int(v))x"
     }
     return speed(v)
+  }
+
+  static func num(_ v: Double) -> String {
+    if v == floor(v) {
+      return String(format: "%.1f", v)
+    }
+    let r = (v * 100.0).rounded() / 100.0
+    if Int((r * 10.0).rounded()) * 10 == Int((r * 100.0).rounded()) {
+      return String(format: "%.1f", r)
+    }
+    return String(format: "%.2f", r)
+  }
+
+  static func danmakuDelay(_ seconds: Double) -> String {
+    let v = (seconds * 10.0).rounded() / 10.0
+    let n = (v.truncatingRemainder(dividingBy: 1.0) == 0) ? "\(Int(v))" : String(format: "%.1f", v)
+    return (v >= 0 ? "+" : "") + n + t(" 秒", " s")
+  }
+
+  static func codecName(_ raw: String?) -> String? {
+    guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !raw.isEmpty else { return nil }
+    if raw.contains("hevc") || raw.contains("h265") || raw.contains("hvc1") || raw.contains("hev1") { return "HEVC" }
+    if raw.contains("avc") || raw.contains("h264") { return "H.264" }
+    if raw.contains("av01") || raw.contains("av1") { return "AV1" }
+    if raw.contains("vp9") { return "VP9" }
+    if raw.contains("vp8") { return "VP8" }
+    let stripped = raw.hasPrefix("video/") ? String(raw.dropFirst("video/".count)) : raw
+    return stripped.uppercased()
+  }
+
+  static func fps(_ v: Double?) -> String? {
+    guard let v = v, v > 0 else { return nil }
+    if v.truncatingRemainder(dividingBy: 1.0) == 0 {
+      return "\(Int(v)) FPS"
+    }
+    return String(format: "%.1f FPS", v)
   }
 
   static func longPressSlideSpeed(base: Double, upPt: CGFloat, ptPerStep: CGFloat, enabled: Bool?) -> Double {
@@ -161,12 +201,14 @@ enum IosPlayerUiText {
     return ids[(idx + 1) % ids.count]
   }
 
-  // iOS-supported playback kernels (`avplayer` & `vlc`), normalizing cross-platform configs (`exo`->`avplayer`, `mpv`/`mdk`->`vlc`).
-  static let iosKernels: [String] = ["avplayer", "vlc"]
+  // iOS-supported playback kernels (`avplayer`, `mpv`, `vlc`), normalizing cross-platform configs (`exo`->`avplayer`, `mdk`->`vlc`).
+  static let iosKernels: [String] = ["avplayer", "mpv", "vlc"]
 
   static func normalizeIosKernel(_ raw: String) -> String {
     switch raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-    case "vlc", "mpv", "mdk":
+    case "mpv":
+      return "mpv"
+    case "vlc", "mdk":
       return "vlc"
     default:
       return "avplayer"
@@ -174,11 +216,19 @@ enum IosPlayerUiText {
   }
 
   static func kernelShortName(_ raw: String) -> String {
-    normalizeIosKernel(raw) == "vlc" ? "VLC" : "AVPlayer"
+    switch normalizeIosKernel(raw) {
+    case "mpv": return "MPV"
+    case "vlc": return "VLC"
+    default: return "AVPlayer"
+    }
   }
 
   static func kernelOptionName(_ raw: String) -> String {
-    normalizeIosKernel(raw) == "vlc" ? "VLC (FFmpeg)" : "AVPlayer (SYSTEM)"
+    switch normalizeIosKernel(raw) {
+    case "mpv": return "MPV (MPV)"
+    case "vlc": return "VLC (FFmpeg)"
+    default: return "AVPlayer (SYSTEM)"
+    }
   }
 
   static let danmakuColorModes = ["random_Mix", "white", "original", "gradient", "random"]
@@ -249,13 +299,45 @@ enum IosPlayerUiText {
     return UIColor(red: r, green: g, blue: b, alpha: alpha)
   }
 
+  static var danmakuGradientPresets: [(Int, String)] {
+    [
+      (-1, t("随机风格", "Random Style")),
+      (0, t("粉→蓝", "Pink → Purple")),
+      (1, t("金→橙红", "Gold → Orange")),
+      (2, t("青→薄荷绿", "Cyan → Mint")),
+      (3, t("紫→粉", "Violet → Pink")),
+      (4, t("天蓝→青", "Sky → Emerald")),
+      (5, t("玫红→深紫", "Rose → Purple")),
+      (6, t("橙→柠檬黄", "Orange → Yellow")),
+      (7, t("薄荷→蓝绿", "Teal → Blue"))
+    ]
+  }
+
+  static func encodeGradientAndWeight(preset: Int, weight: Int) -> String {
+    let g = (0...7).contains(preset) ? "\(preset)" : "none"
+    let w = min(8, max(0, weight))
+    return w == 4 ? g : "\(g):w=\(w)"
+  }
+
+  static func danmakuGradientLabel(_ gradientStyle: String) -> String {
+    let p = parseGradientPreset(gradientStyle)
+    return danmakuGradientPresets.first(where: { $0.0 == p })?.1 ?? t("随机风格", "Random Style")
+  }
+
+  static func danmakuFontWeightLabel(_ weight: Int) -> String {
+    let w = min(8, max(0, weight))
+    let zh = ["最细", "特细", "细", "偏细", "适中", "半粗", "粗", "特粗", "最粗"]
+    let en = ["Thin", "Extra Light", "Light", "Normal-", "Medium", "Semi Bold", "Bold", "Extra Bold", "Black"]
+    return chinese ? zh[w] : en[w]
+  }
+
   static func accentColor(hex: String?) -> UIColor {
     guard let raw = hex?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
-      return uiColor(0x2F88FF)
+      return uiColor(0x007AFF)
     }
     let cleaned = raw.hasPrefix("#") ? String(raw.dropFirst()) : (raw.lowercased().hasPrefix("0x") ? String(raw.dropFirst(2)) : raw)
     guard let val = UInt64(cleaned, radix: 16) else {
-      return uiColor(0x2F88FF)
+      return uiColor(0x007AFF)
     }
     let rgb = Int(val & 0xFFFFFF)
     return uiColor(rgb)

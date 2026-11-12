@@ -95,12 +95,22 @@ function createCatpawHost({ bridge, workerEntryPath }) {
     status(`catpaw ${name}: config ${configPath ? `已加载(${keyCount} keys)` : '缺失(空 config 启动)'}`);
     const tempDir = path.join(path.dirname(scriptPath), 'Temp');
     fs.mkdirSync(tempDir, { recursive: true });
+    const extraDirs = [];
+    if (env && typeof env.profile_path === 'string' && env.profile_path.length > 0) {
+      const profileDir = path.dirname(env.profile_path);
+      try {
+        fs.mkdirSync(profileDir, { recursive: true });
+        extraDirs.push(profileDir);
+      } catch {
+        /* ignore invalid profile_path */
+      }
+    }
     const worker = spawnWorker({
       workerEntryPath,
       name,
       workerData: {
         name, scriptPath, startArg: config, dataDir, port: port || null, dartPort: dartServerPort,
-        env: env || {}, allowWriteDirs: [dataDir, tempDir], allowReadDirs: [path.dirname(scriptPath)],
+        env: env || {}, allowWriteDirs: [dataDir, tempDir, ...extraDirs], allowReadDirs: [path.dirname(scriptPath), ...extraDirs],
         redirectRoot: tempDir, enableNetLog: !!enableNetLog, enableLog: enableLog !== false,
       },
       onMsg: onWorkerMessage(name),

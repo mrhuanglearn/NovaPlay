@@ -3764,6 +3764,12 @@ abstract class AppLocalizations {
   /// **'AVPlayer uses Apple VideoToolbox hardware decoding with native iOS Picture-in-Picture, AirPlay video routing, and low power draw (best for HLS / MP4).'**
   String get playerIosAvplayerNote;
 
+  /// No description provided for @playerIosMpvNote.
+  ///
+  /// In en, this message translates to:
+  /// **'MPV uses libmpv + FFmpeg + Metal/MoltenVK (gpu-next) with VideoToolbox hardware decoding, Dolby Vision / HDR tone mapping, MKV, and full ASS subtitles, without iOS system Picture-in-Picture.'**
+  String get playerIosMpvNote;
+
   /// No description provided for @playerIosVlcNote.
   ///
   /// In en, this message translates to:
@@ -3773,7 +3779,7 @@ abstract class AppLocalizations {
   /// No description provided for @playerHwDecodeIosAvSub.
   ///
   /// In en, this message translates to:
-  /// **'AVPlayer always uses VideoToolbox hardware decoding; this toggle applies to the VLC kernel'**
+  /// **'AVPlayer always uses VideoToolbox hardware decoding; this toggle applies to the MPV and VLC kernels'**
   String get playerHwDecodeIosAvSub;
 
   /// No description provided for @playerAutoPipIosVlcSub.

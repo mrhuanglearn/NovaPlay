@@ -1939,11 +1939,16 @@ class AppLocalizationsZh extends AppLocalizations {
       'AVPlayer 使用 Apple VideoToolbox 系统硬件解码，原生支持 iOS 系统画中画（PiP）、AirPlay 隔空投屏与低功耗播放（适合 HLS / MP4）。';
 
   @override
+  String get playerIosMpvNote =>
+      'MPV 内核基于 libmpv + FFmpeg + Metal/MoltenVK（gpu-next），支持 VideoToolbox 硬解、杜比视界/HDR 色调映射、MKV/ASS 特效字幕与网盘高码率直连，但暂不支持 iOS 系统画中画。';
+
+  @override
   String get playerIosVlcNote =>
       'VLC 内核基于 FFmpeg / libvlc，支持 MKV、FLV、AVI、内封 ASS 字幕等更多格式与软硬解切换，但暂不支持 iOS 系统画中画。';
 
   @override
-  String get playerHwDecodeIosAvSub => 'AVPlayer 始终启用系统硬件解码；此开关仅对 VLC 内核生效';
+  String get playerHwDecodeIosAvSub =>
+      'AVPlayer 始终启用系统硬件解码；此开关对 MPV 与 VLC 内核生效';
 
   @override
   String get playerAutoPipIosVlcSub => 'iOS 系统画中画仅在 AVPlayer 内核下可用';

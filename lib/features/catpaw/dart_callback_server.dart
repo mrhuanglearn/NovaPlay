@@ -14,6 +14,13 @@ import 'dart:io';
 /// accepted by [resolveCall].
 typedef DartActionHandler = Future<Object?> Function(Map<String, dynamic> args);
 
+/// Returned by a [DartActionHandler] (such as `queryProfile`) whose HTTP caller reads the decoded JSON body directly
+/// instead of an `{"ok": true, "code": 0, "data": ...}` envelope.
+class RawJsonResponse {
+  const RawJsonResponse(this.body);
+  final Object? body;
+}
+
 class DartCallbackServer {
   DartCallbackServer({Map<String, DartActionHandler>? handlers}) : handlers = handlers ?? {};
 
@@ -37,7 +44,7 @@ class DartCallbackServer {
   void Function(String line) log = (_) {};
 
   Future<void> _handle(HttpRequest req) async {
-    Map<String, Object?> reply;
+    Object? reply;
     int status = 200;
     String action = '';
     try {
@@ -57,7 +64,12 @@ class DartCallbackServer {
         status = 501;
         reply = {'ok': false, 'code': -1, 'error': 'unsupported action: $action'};
       } else {
-        reply = {'ok': true, 'code': 0, 'data': await handler(call.args)};
+        final res = await handler(call.args);
+        if (res is RawJsonResponse) {
+          reply = res.body;
+        } else {
+          reply = {'ok': true, 'code': 0, 'data': res};
+        }
       }
     } catch (e) {
       status = 500;
