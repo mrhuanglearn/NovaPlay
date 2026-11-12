@@ -83,7 +83,7 @@ class CatpawClient {
     bool enableLog = false,
     bool enableNetLog = false,
     Map<String, String>? env,
-    Duration timeout = const Duration(seconds: 30),
+    Duration timeout = const Duration(seconds: 60),
   }) async {
     final done = Completer<int>();
     final sub = events.listen((e) {
@@ -105,6 +105,9 @@ class CatpawClient {
         if (env != null) 'env': env,
       });
       return await done.future.timeout(timeout);
+    } on TimeoutException {
+      unawaited(stop(name).catchError((Object _) {}));
+      rethrow;
     } finally {
       await sub.cancel();
     }

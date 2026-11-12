@@ -76,9 +76,59 @@ void _openVod(BuildContext context, VodItem item) {
   context.push(q.toString());
 }
 
-Widget _poster(VodItem item) => item.pic != null && item.pic!.isNotEmpty
-    ? Image.network(item.pic!, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const _PosterFallback())
-    : const _PosterFallback();
+const _defaultPosterUserAgent =
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1';
+
+final _catVodHeaderTag = RegExp(
+  r'@(Referer|User-Agent|Cookie|Origin|Authorization|Accept)=([^@]*)',
+  caseSensitive: false,
+);
+
+/// Parses CatVod poster URLs that may carry `@Referer=...` / `@User-Agent=...` suffixes and adds anti-hotlink
+/// headers required by hosts like `*.doubanio.com`.
+({String url, Map<String, String> headers}) parsePosterRequest(String raw) {
+  final headers = <String, String>{};
+  var clean = raw.trim();
+  for (final m in _catVodHeaderTag.allMatches(clean)) {
+    final k = m.group(1)!;
+    final v = m.group(2)!.trim();
+    if (v.isEmpty) continue;
+    final canonical = switch (k.toLowerCase()) {
+      'referer' => 'Referer',
+      'user-agent' => 'User-Agent',
+      'cookie' => 'Cookie',
+      'origin' => 'Origin',
+      'authorization' => 'Authorization',
+      'accept' => 'Accept',
+      _ => k,
+    };
+    headers[canonical] = v;
+  }
+  final firstTag = _catVodHeaderTag.firstMatch(clean);
+  if (firstTag != null) {
+    clean = clean.substring(0, firstTag.start).trim();
+  }
+  final uri = Uri.tryParse(clean);
+  final host = uri?.host.toLowerCase() ?? '';
+  if ((host.endsWith('doubanio.com') || host.endsWith('douban.com')) && !headers.containsKey('Referer')) {
+    headers['Referer'] = 'https://movie.douban.com/';
+  }
+  headers.putIfAbsent('User-Agent', () => _defaultPosterUserAgent);
+  return (url: clean, headers: headers);
+}
+
+Widget _poster(VodItem item) {
+  final raw = item.pic;
+  if (raw == null || raw.trim().isEmpty) return const _PosterFallback();
+  final req = parsePosterRequest(raw);
+  if (req.url.isEmpty) return const _PosterFallback();
+  return Image.network(
+    req.url,
+    headers: req.headers,
+    fit: BoxFit.cover,
+    errorBuilder: (_, __, ___) => const _PosterFallback(),
+  );
+}
 
 /// OBSERVED poster card: radius 12, the remark in a small dark chip at the bottom left, the title centred below.
 class VodCard extends StatelessWidget {

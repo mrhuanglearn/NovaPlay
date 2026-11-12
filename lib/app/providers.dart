@@ -175,6 +175,8 @@ class SpiderRuntime {
   final List<SpiderSite> sites;
 }
 
+String? _lastRunningCatpawSubKey;
+
 /// Installs the active subscription's script (if needed), starts it in the Node runtime and loads its sites.
 /// Cloud subscriptions skip the local runtime and talk to the given address directly.
 final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<SpiderRuntime?>((ref) async {
@@ -188,6 +190,14 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
   final sub = subs.firstWhere((s) => s.key == key, orElse: () => subs.first);
 
   if (sub.cloudUrl != null) {
+    final prevKey = _lastRunningCatpawSubKey;
+    if (prevKey != null && prevKey != sub.key) {
+      _lastRunningCatpawSubKey = null;
+      try {
+        final catpaw = ref.read(catpawClientProvider);
+        if (catpaw.attached) await catpaw.stop(prevKey);
+      } catch (_) {}
+    }
     final uri = Uri.parse(sub.cloudUrl!);
     final api =
         SpiderApi(uri.port, baseUrl: sub.cloudUrl, receiveTimeout: ref.read(appPreferencesProvider).catpawTimeout);
@@ -196,6 +206,12 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
 
   final catpaw = ref.watch(catpawClientProvider);
   await catpaw.attach(); // completes after "Node ready"
+  final prevKey = _lastRunningCatpawSubKey;
+  if (prevKey != null && prevKey != sub.key) {
+    try {
+      await catpaw.stop(prevKey);
+    } catch (_) {}
+  }
   // Scripts reach the app through this loopback server; the port must be announced before the script starts.
   await catpaw.setDartPort(await ref.watch(dartCallbackServerProvider).start());
   final installer = ref.watch(subscriptionInstallerProvider);
@@ -205,6 +221,7 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
     final remote = await installer.remoteMd5(sub); // null when offline: keep the installed copy
     if (remote != null && remote != installed.md5) installed = null;
   }
+  var freshlyInstalled = false;
   if (installed == null) {
     if (sub.local) throw StateError('the local script is missing; import the zip again on the edit page');
     installed =
@@ -212,7 +229,7 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
     await ref
         .read(subscriptionRepositoryProvider)
         .upsert(sub.copyWith(installedMd5: installed.md5, updatedAt: DateTime.now().millisecondsSinceEpoch));
-    ref.invalidate(subscriptionsProvider); // the subscriptions page shows the new 上次更新 / 内容指纹
+    freshlyInstalled = true;
   }
   final int port;
   try {
@@ -241,6 +258,7 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
     } catch (_) {
       profileFilePath = null;
     }
+    _lastRunningCatpawSubKey = sub.key;
     port = await catpaw.startAndWait(
       name: sub.key,
       scriptPath: installed.scriptPath,
@@ -248,10 +266,13 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
       force: true,
       env: profileFilePath == null ? null : {'profile_path': profileFilePath},
     );
-  } catch (_) {
-    // A broken download must not be reused: 重试 downloads it again while keeping Temp/_redirect instance data intact.
-    if (!sub.local) await installer.invalidateScript(sub);
+  } catch (e) {
+    // Only invalidate the downloaded bundle if Node failed to require/parse it; keep MD5-verified bundles on timeouts.
+    if (!sub.local && '$e'.contains('require bundle failed')) await installer.invalidateScript(sub);
     rethrow;
+  }
+  if (freshlyInstalled) {
+    ref.invalidate(subscriptionsProvider); // the subscriptions page shows the new 上次更新 / 内容指纹
   }
   final api = SpiderApi(port, receiveTimeout: ref.read(appPreferencesProvider).catpawTimeout);
   return SpiderRuntime(subscription: sub, api: api, sites: await api.sites());

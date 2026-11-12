@@ -8,12 +8,17 @@ import 'package:uzv_reimpl/core/json_store.dart';
 import 'package:uzv_reimpl/features/subscription/subscription.dart';
 import 'package:uzv_reimpl/l10n/l10n.dart';
 import 'package:uzv_reimpl/ui/subscriptions_screen.dart';
+import 'package:uzv_reimpl/ui/widgets.dart';
 
 // User report (2026-11-10): 设置 → 订阅管理 → 编辑, then back, left the page for 设置. The user wants back to leave the
 // edit mode first and stay on 订阅管理. (OBSERVED: the original 1.1.7 on the user's phone leaves the page, so this is a
 // deliberate difference.)
 
-const _alpha = Subscription(key: 'a', name: 'Alpha');
+const _alpha = Subscription(
+  key: 'a',
+  name: 'Alpha',
+  indexJsUrl: 'https://woleigedouer:woleigedouer@catpaw.douer.me/index.js.md5',
+);
 
 void main() {
   Future<void> pump(WidgetTester tester) async {
@@ -73,6 +78,28 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('编辑'), findsOneWidget);
     expect(find.text('设置页'), findsNothing);
+  });
+
+  testWidgets('subscription URL preserves user:pass@ credentials on screen', (tester) async {
+    await pump(tester);
+    expect(
+      find.text('https://woleigedouer:woleigedouer@catpaw.douer.me/index.js.md5'),
+      findsOneWidget,
+    );
+  });
+
+  test('parsePosterRequest preserves anti-hotlink headers for Douban and CatVod @Header tags', () {
+    final douban = parsePosterRequest('https://img9.doubanio.com/view/photo/s_ratio_poster/public/p2928374.jpg');
+    expect(douban.url, 'https://img9.doubanio.com/view/photo/s_ratio_poster/public/p2928374.jpg');
+    expect(douban.headers['Referer'], 'https://movie.douban.com/');
+    expect(douban.headers['User-Agent'], isNotEmpty);
+
+    final tagged = parsePosterRequest(
+      'https://example.com/poster.jpg@Referer=https://custom.ref/@User-Agent=CustomUA/1.0',
+    );
+    expect(tagged.url, 'https://example.com/poster.jpg');
+    expect(tagged.headers['Referer'], 'https://custom.ref/');
+    expect(tagged.headers['User-Agent'], 'CustomUA/1.0');
   });
 }
 

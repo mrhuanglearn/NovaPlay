@@ -32,6 +32,63 @@ private final class AvLayerView: UIView {
   var playerLayer: AVPlayerLayer { layer as! AVPlayerLayer }
 }
 
+/// Touch-inert drawable host for `MobileVLCKit`.
+/// `MobileVLCKit` (`VLCVideoUIView`) attaches its own internal `UITapGestureRecognizer` (for DVD menus)
+/// and enables `userInteractionEnabled` on its drawable view, which otherwise preempts and cancels
+/// `NativePlayerViewController`'s single-tap gesture recognizer (`singleTap.require(toFail: doubleTap)`).
+private final class VlcDrawableContainerView: UIView {
+  override init(frame: CGRect) {
+    super.init(frame: frame)
+    super.isUserInteractionEnabled = false
+  }
+
+  required init?(coder: NSCoder) {
+    fatalError("init(coder:) has not been implemented")
+  }
+
+  override var isUserInteractionEnabled: Bool {
+    get { false }
+    set {}
+  }
+
+  override func didAddSubview(_ subview: UIView) {
+    super.didAddSubview(subview)
+    disableInteractionsRecursively(on: subview)
+  }
+
+  override func layoutSubviews() {
+    super.layoutSubviews()
+    for sub in subviews {
+      disableInteractionsRecursively(on: sub)
+    }
+  }
+
+  override func addGestureRecognizer(_ gestureRecognizer: UIGestureRecognizer) {
+    // Ignore internal gesture recognizers attached by MobileVLCKit.
+  }
+
+  override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+    return nil
+  }
+
+  override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+    return false
+  }
+
+  private func disableInteractionsRecursively(on view: UIView) {
+    view.isUserInteractionEnabled = false
+    if let recognizers = view.gestureRecognizers, !recognizers.isEmpty {
+      for gr in recognizers {
+        gr.isEnabled = false
+        view.removeGestureRecognizer(gr)
+      }
+    }
+    for child in view.subviews {
+      disableInteractionsRecursively(on: child)
+    }
+  }
+}
+
 /// Unified video container hosting:
 /// - `avLayerView` (`AVPlayerLayer` for `AVPlayer` + system PiP)
 /// - `mpvMetalView` (`CAMetalLayer` for `libmpv` + `MoltenVK` + VideoToolbox)
@@ -40,7 +97,7 @@ private final class AvLayerView: UIView {
 final class PlayerVideoContainerView: UIView {
   fileprivate let avLayerView = AvLayerView(frame: .zero)
   fileprivate let mpvMetalView = MpvMetalView(frame: .zero)
-  fileprivate let vlcDrawableView = UIView(frame: .zero)
+  fileprivate let vlcDrawableView: UIView = VlcDrawableContainerView(frame: .zero)
 
   var playerLayer: AVPlayerLayer { avLayerView.playerLayer }
 
@@ -64,11 +121,15 @@ final class PlayerVideoContainerView: UIView {
     super.init(frame: frame)
     backgroundColor = .black
     clipsToBounds = true
+    isUserInteractionEnabled = false
     avLayerView.backgroundColor = .black
+    avLayerView.isUserInteractionEnabled = false
     mpvMetalView.backgroundColor = .black
     mpvMetalView.isHidden = true
+    mpvMetalView.isUserInteractionEnabled = false
     vlcDrawableView.backgroundColor = .black
     vlcDrawableView.isHidden = true
+    vlcDrawableView.isUserInteractionEnabled = false
     addSubview(avLayerView)
     addSubview(mpvMetalView)
     addSubview(vlcDrawableView)
@@ -76,6 +137,19 @@ final class PlayerVideoContainerView: UIView {
 
   required init?(coder: NSCoder) {
     fatalError("init(coder:) has not been implemented")
+  }
+
+  override var isUserInteractionEnabled: Bool {
+    get { false }
+    set {}
+  }
+
+  override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+    return nil
+  }
+
+  override func point(inside point: CGPoint, with event: UIEvent?) -> Bool {
+    return false
   }
 
   override func layoutSubviews() {
@@ -297,11 +371,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     case "mpv":
       return mpvEngine?.isPlaying ?? false
     default:
-      #if canImport(MobileVLCKit)
-      return vlcPlayer?.isPlaying ?? false
-      #else
-      return false
-      #endif
+      return state == "playing"
     }
   }
 
@@ -1083,7 +1153,9 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     }
 
     player.play()
-    player.rate = speed
+    if abs(speed - 1.0) > 0.001 {
+      player.rate = speed
+    }
 
     let timer = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
       self?.sampleVlcMetrics()
@@ -1094,18 +1166,21 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
 
   private func sampleVlcMetrics() {
     guard isUsingVlc, let player = vlcPlayer else { return }
-    let curTime: VLCTime? = player.time
-    if let rawMs = curTime?.intValue, rawMs >= 0 {
-      positionMs = Int64(rawMs)
-    }
-    let mediaLen: VLCTime? = player.media?.length
-    if let len = mediaLen?.intValue, len > 0 {
-      durationMs = Int64(len)
-    }
-    let sz = player.videoSize
-    if sz.width > 0 && sz.height > 0 && sz != videoSize {
-      videoSize = sz
-      videoView.naturalVideoSize = sz
+    let activeStream = (state == "playing" || state == "paused")
+    if activeStream {
+      let curTime: VLCTime? = player.time
+      if let rawMs = curTime?.intValue, rawMs >= 0 {
+        positionMs = Int64(rawMs)
+      }
+      let mediaLen: VLCTime? = player.media?.length
+      if let len = mediaLen?.intValue, len > 0 {
+        durationMs = Int64(len)
+      }
+      let sz = player.videoSize
+      if sz.width > 0 && sz.height > 0 && sz != videoSize {
+        videoSize = sz
+        videoView.naturalVideoSize = sz
+      }
     }
     let now = CACurrentMediaTime()
     if activeLoad?.proxyToken != nil && vlcLoadedViaProxy {
@@ -1117,7 +1192,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
       }
       lastProxyBytesTotal = proxyTotal
       lastBytesSampleTime = now
-    } else if let media = player.media {
+    } else if activeStream, let media = player.media {
       let totalRead = Int64(max(0, media.numberOfReadBytesOnInput))
       if lastBytesTotal >= 0 && lastBytesSampleTime > 0 && totalRead >= lastBytesTotal {
         let dt = max(0.2, now - lastBytesSampleTime)
@@ -1797,7 +1872,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     }
 
     #if canImport(MobileVLCKit)
-    if let player = vlcPlayer {
+    if (state == "playing" || state == "paused"), let player = vlcPlayer {
       let names = (player.videoSubTitlesNames as Any as? [String]) ?? []
       let indexes = ((player.videoSubTitlesIndexes as Any as? [NSNumber]) ?? []).map { Int($0.int32Value) }
       let current = Int(player.currentVideoSubTitleIndex)
@@ -1817,6 +1892,16 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         list.append(IosTrackOption(
           index: syntheticIdx,
           label: side.option.name + (embeddedValidCount > 0 ? " (外挂)" : ""),
+          language: side.option.language,
+          selected: selectedSubtitleIdx == syntheticIdx
+        ))
+      }
+    } else {
+      for (j, side) in sidecarSubtitles.enumerated() {
+        let syntheticIdx = 10_000 + j
+        list.append(IosTrackOption(
+          index: syntheticIdx,
+          label: side.option.name,
           language: side.option.language,
           selected: selectedSubtitleIdx == syntheticIdx
         ))
@@ -1882,7 +1967,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     }
 
     #if canImport(MobileVLCKit)
-    if let player = vlcPlayer {
+    if (state == "playing" || state == "paused"), let player = vlcPlayer {
       let names = (player.audioTrackNames as Any as? [String]) ?? []
       let indexes = ((player.audioTrackIndexes as Any as? [NSNumber]) ?? []).map { Int($0.int32Value) }
       let current = Int(player.currentAudioTrackIndex)

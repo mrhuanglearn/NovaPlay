@@ -337,11 +337,13 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
       loadStack.topAnchor.constraint(equalTo: loadingBox.topAnchor, constant: 14),
       loadStack.bottomAnchor.constraint(equalTo: loadingBox.bottomAnchor, constant: -14)
     ])
+    loadingBox.isUserInteractionEnabled = false
     loadingBox.isHidden = true
     view.addSubview(loadingBox)
 
     // Top Notice (`64pt` from top)
     topNoticeLabel.translatesAutoresizingMaskIntoConstraints = false
+    topNoticeLabel.isUserInteractionEnabled = false
     topNoticeLabel.font = UIFont.systemFont(ofSize: 13, weight: .regular)
     topNoticeLabel.textColor = .white
     topNoticeLabel.clipsToBounds = true
@@ -351,6 +353,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
 
     // Persistent Top Corner Net Speed (`8pt` from top)
     cornerSpeedLabel.translatesAutoresizingMaskIntoConstraints = false
+    cornerSpeedLabel.isUserInteractionEnabled = false
     cornerSpeedLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 12, weight: .regular)
     cornerSpeedLabel.textColor = IosPlayerUi.argb(0x8DFF_FFFF)
     cornerSpeedLabel.textAlignment = .center
@@ -363,6 +366,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
 
     // Top Gesture / Long-Press Speed Hint (`36pt` from top)
     hintWrap.translatesAutoresizingMaskIntoConstraints = false
+    hintWrap.isUserInteractionEnabled = false
     ui.applyRounded(hintWrap, fill: IosPlayerUi.argb(0xA600_0000), radius: 16)
     hintRow.translatesAutoresizingMaskIntoConstraints = false
     hintRow.axis = .horizontal
@@ -775,6 +779,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     let titleLbl = ui.text(controller.title, size: 16, medium: true)
     titleLbl.numberOfLines = 1
     titleLbl.lineBreakMode = .byTruncatingTail
+    titleLbl.setContentHuggingPriority(.defaultHigh, for: .horizontal)
     titleLbl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     titleView = titleLbl
 
@@ -783,19 +788,27 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     resolutionChip = resChip
     episodeChip = epChip
 
-    let chipRow = UIStackView(arrangedSubviews: [resChip, epChip, UIView()])
+    let chipRow = UIStackView(arrangedSubviews: [resChip, epChip])
     chipRow.axis = .horizontal
     chipRow.alignment = .center
     chipRow.spacing = 6
 
     let titleCol = UIStackView(arrangedSubviews: [titleLbl, chipRow])
     titleCol.axis = .vertical
-    titleCol.alignment = .fill
+    titleCol.alignment = .leading
     titleCol.spacing = 4
-    titleCol.setContentHuggingPriority(.defaultLow, for: .horizontal)
+    titleCol.setContentHuggingPriority(.defaultHigh, for: .horizontal)
     titleCol.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
     row.addArrangedSubview(titleCol)
     row.setCustomSpacing(10, after: titleCol)
+
+    // Flexible spacer that pushes all top-right action buttons and clock/battery to the right edge
+    let topSpacer = UIView()
+    topSpacer.translatesAutoresizingMaskIntoConstraints = false
+    topSpacer.isUserInteractionEnabled = false
+    topSpacer.setContentHuggingPriority(UILayoutPriority(1), for: .horizontal)
+    topSpacer.setContentCompressionResistancePriority(UILayoutPriority(1), for: .horizontal)
+    row.addArrangedSubview(topSpacer)
 
     let actionsStack = UIStackView()
     actionsStack.axis = .horizontal
@@ -855,15 +868,21 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
 
       // Clock + Battery stack (`16pt` left margin)
       let clk = ui.text("00:00", size: 12.5, mono: true)
+      clk.setContentHuggingPriority(.required, for: .horizontal)
+      clk.setContentCompressionResistancePriority(.required, for: .horizontal)
       clockLabel = clk
       let bat = BatteryView()
       batteryIcon = bat
       let batTxt = ui.text("100%", size: 10.5, mono: true)
+      batTxt.setContentHuggingPriority(.required, for: .horizontal)
+      batTxt.setContentCompressionResistancePriority(.required, for: .horizontal)
       batteryPercentLabel = batTxt
       let batRow = UIStackView(arrangedSubviews: [bat, batTxt])
       batRow.axis = .horizontal
       batRow.alignment = .center
       batRow.spacing = 5
+      batRow.setContentHuggingPriority(.required, for: .horizontal)
+      batRow.setContentCompressionResistancePriority(.required, for: .horizontal)
       NSLayoutConstraint.activate([
         bat.widthAnchor.constraint(equalToConstant: 19),
         bat.heightAnchor.constraint(equalToConstant: 10)
@@ -872,6 +891,8 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
       statusCol.axis = .vertical
       statusCol.alignment = .leading
       statusCol.spacing = 3
+      statusCol.setContentHuggingPriority(.required, for: .horizontal)
+      statusCol.setContentCompressionResistancePriority(.required, for: .horizontal)
       row.addArrangedSubview(actionsStack)
       row.setCustomSpacing(16, after: actionsStack)
       row.addArrangedSubview(statusCol)
@@ -1686,6 +1707,9 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
         return false
       }
     }
+    if let hit = touch.view, hit.isDescendant(of: controller.kernel.videoView) {
+      return true
+    }
     var cur: UIView? = touch.view
     while let v = cur, v !== view {
       if v is UIControl || v is AVRoutePickerView || v is UITextField || v is UITextView || v === skipBanner {
@@ -1694,6 +1718,28 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
       cur = v.superview
     }
     return true
+  }
+
+  func gestureRecognizer(
+    _ gestureRecognizer: UIGestureRecognizer,
+    shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+  ) -> Bool {
+    if let otherView = otherGestureRecognizer.view,
+       otherView.isDescendant(of: controller.kernel.videoView) {
+      return true
+    }
+    return false
+  }
+
+  func gestureRecognizer(
+    _ gestureRecognizer: UIGestureRecognizer,
+    shouldBeRequiredToFailBy otherGestureRecognizer: UIGestureRecognizer
+  ) -> Bool {
+    if let otherView = otherGestureRecognizer.view,
+       otherView.isDescendant(of: controller.kernel.videoView) {
+      return true
+    }
+    return false
   }
 
   @objc private func handleSingleTap(_ gr: UITapGestureRecognizer) {

@@ -48,12 +48,7 @@ String? effectiveActiveKey(List<Subscription> list, String? selected) {
   return list.any((s) => s.key == selected) ? selected : list.first.key;
 }
 
-String _displayUrl(Subscription s) {
-  final raw = s.cloudUrl ?? s.indexJsUrl;
-  if (raw == null) return '';
-  final u = Uri.tryParse(raw);
-  return u == null ? raw : redactUrl(u); // never put user:pass on screen
-}
+String _displayUrl(Subscription s) => s.cloudUrl ?? s.indexJsUrl ?? '';
 
 String _chipLabel(AppLocalizations l, Subscription s) =>
     s.cloudUrl != null ? l.subscriptionChipCloud : (s.local ? l.subscriptionChipLocal : l.subscriptionChipNetwork);
@@ -74,7 +69,11 @@ Future<void> _refreshOne(BuildContext context, WidgetRef ref, Subscription s) as
     } else {
       final subs = await ref.read(subscriptionsProvider.future);
       final active = effectiveActiveKey(subs, ref.read(activeSubscriptionKeyProvider).valueOrNull);
-      if (active == s.key) ref.invalidate(catpawRuntimeProvider);
+      if (active == s.key) {
+        ref.invalidate(catpawRuntimeProvider);
+        ref.invalidate(videoFeedProvider);
+        ref.read(catpawRuntimeProvider);
+      }
       showToast(l.subscriptionUpdatedOne);
     }
   } catch (e) {
@@ -114,7 +113,11 @@ class _SubscriptionsScreenState extends ConsumerState<SubscriptionsScreen> {
         if (await service.refresh(s, confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey)) !=
             null) {
           updated++;
-          if (s.key == active) ref.invalidate(catpawRuntimeProvider);
+          if (s.key == active) {
+            ref.invalidate(catpawRuntimeProvider);
+            ref.invalidate(videoFeedProvider);
+            ref.read(catpawRuntimeProvider);
+          }
         }
       } catch (e) {
         failure ??= e;
@@ -130,9 +133,13 @@ class _SubscriptionsScreenState extends ConsumerState<SubscriptionsScreen> {
     }
   }
 
-  void _activate(Subscription s) {
-    ref.read(activeSubscriptionKeyProvider.notifier).select(s.key);
-    showToast(context.l10n.subscriptionSwitchedTo(s.name));
+  Future<void> _activate(Subscription s) async {
+    await ref.read(activeSubscriptionKeyProvider.notifier).select(s.key);
+    ref.read(selectedTypeIdProvider.notifier).select(null);
+    ref.invalidate(catpawRuntimeProvider);
+    ref.invalidate(videoFeedProvider);
+    ref.read(catpawRuntimeProvider);
+    if (mounted) showToast(context.l10n.subscriptionSwitchedTo(s.name));
   }
 
   Future<void> _deleteSelected(List<Subscription> list) async {
@@ -666,13 +673,13 @@ class _AddSubscriptionScreenState extends ConsumerState<AddSubscriptionScreen> {
   Future<void> _save() async {
     final l = context.l10n;
     final service = ref.read(subscriptionServiceProvider);
-    final hadNone = (await ref.read(subscriptionsProvider.future)).isEmpty;
     setState(() => _busy = true);
     try {
+      final Subscription added;
       switch (_kind) {
         case _SubscriptionKind.network:
           if (_url.text.trim().isEmpty) return showToast(l.subscriptionUrlRequired);
-          await service.addNetwork(
+          added = await service.addNetwork(
             url: _url.text,
             name: _name.text,
             autoUpdate: _autoUpdate,
@@ -682,13 +689,17 @@ class _AddSubscriptionScreenState extends ConsumerState<AddSubscriptionScreen> {
         case _SubscriptionKind.local:
           final zip = _zip;
           if (zip == null) return showToast(l.subscriptionZipRequired);
-          await service.addLocal(zip: zip.bytes, name: _name.text, locked: _lock);
+          added = await service.addLocal(zip: zip.bytes, name: _name.text, locked: _lock);
         case _SubscriptionKind.cloud:
           if (_url.text.trim().isEmpty) return showToast(l.subscriptionUrlRequired);
-          await service.addCloud(url: _url.text, name: _name.text, locked: _lock);
+          added = await service.addCloud(url: _url.text, name: _name.text, locked: _lock);
       }
       ref.invalidate(subscriptionsProvider);
-      if (hadNone) ref.invalidate(catpawRuntimeProvider); // the first subscription becomes the active one
+      await ref.read(activeSubscriptionKeyProvider.notifier).select(added.key);
+      ref.read(selectedTypeIdProvider.notifier).select(null);
+      ref.invalidate(catpawRuntimeProvider);
+      ref.invalidate(videoFeedProvider);
+      ref.read(catpawRuntimeProvider);
       if (!mounted) return;
       showSuccessHud(context, l.added);
       context.pop();
@@ -896,6 +907,8 @@ class _EditSubscriptionScreenState extends ConsumerState<EditSubscriptionScreen>
       final subs = await ref.read(subscriptionsProvider.future);
       if (effectiveActiveKey(subs, ref.read(activeSubscriptionKeyProvider).valueOrNull) == s.key) {
         ref.invalidate(catpawRuntimeProvider);
+        ref.invalidate(videoFeedProvider);
+        ref.read(catpawRuntimeProvider);
       }
       showToast(l.subscriptionUpdatedOne);
     } catch (e) {

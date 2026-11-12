@@ -155,6 +155,30 @@ http.createServer = function createServer(...args) {
 globalThis.catServerFactory = (handler) => {
   const server = http.createServer(handler);
   let addr = null;
+  let retriedEphemeral = false;
+  const origEmit = server.emit.bind(server);
+  server.emit = function emitWithPortFallback(event, ...args) {
+    if (
+      event === 'error' &&
+      !addr &&
+      !port &&
+      !retriedEphemeral &&
+      args[0] &&
+      args[0].code === 'EADDRINUSE'
+    ) {
+      retriedEphemeral = true;
+      if (enableLog) {
+        post({ type: WorkerMsg.log, message: '[catpaw] default port in use, falling back to ephemeral port' });
+      }
+      try {
+        server.listen(0, '0.0.0.0');
+        return true;
+      } catch {
+        /* fall through to original error emission */
+      }
+    }
+    return origEmit(event, ...args);
+  };
   server.on('listening', () => {
     try {
       const a = server.address();

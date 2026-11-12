@@ -8,12 +8,41 @@
  */
 
 const fs = require('fs');
+const net = require('net');
 const path = require('path');
 const {
   Channel, Action, WorkerMsg, LoaderMsg, SharedPath, STOP_GRACE_MS, RELOAD_TIMEOUT_MS,
   parseCatpawStart, resultEvent, portEvent, listEvent, sanitizeName,
 } = require('./protocol');
 const { spawnWorker, removeDir } = require('./spawn');
+
+const DEFAULT_CATPAW_PORT = 2333;
+
+/**
+ * If caller did not specify a port, check whether default catpaw port (2333) is already bound
+ * (e.g. by another app or instance). If 2333 is free, return null so DEV_HTTP_PORT stays unset;
+ * if 2333 is busy, allocate and return an ephemeral free port for DEV_HTTP_PORT.
+ */
+function resolveAvailablePort(requestedPort) {
+  if (requestedPort) return Promise.resolve(requestedPort);
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.unref();
+    probe.once('error', () => {
+      const fallback = net.createServer();
+      fallback.unref();
+      fallback.once('error', () => resolve(null));
+      fallback.listen(0, '0.0.0.0', () => {
+        const addr = fallback.address();
+        const freePort = addr && typeof addr.port === 'number' ? addr.port : null;
+        fallback.close(() => resolve(freePort));
+      });
+    });
+    probe.listen(DEFAULT_CATPAW_PORT, '0.0.0.0', () => {
+      probe.close(() => resolve(null));
+    });
+  });
+}
 
 function loadConfig(configPath) {
   if (!configPath) return {};
@@ -73,8 +102,11 @@ function createCatpawHost({ bridge, workerEntryPath }) {
           break;
         case WorkerMsg.error:
           status(`catpaw ${name} error: ${msg.message}`);
-          dropInstance(name);
-          report();
+          if (instances[name] && !instances[name].running) {
+            emit(resultEvent({ action: Action.start, name, ok: false, error: msg.message || 'worker error' }));
+            dropInstance(name);
+            report();
+          }
           break;
         default:
       }
@@ -82,8 +114,13 @@ function createCatpawHost({ bridge, workerEntryPath }) {
   }
 
   function onWorkerError(name, err) {
-    status(`catpaw ${name} worker crashed: ${(err && err.message) || err}`);
+    const message = (err && err.message) || String(err);
+    status(`catpaw ${name} worker crashed: ${message}`);
+    const inst = instances[name];
     delete instances[name];
+    if (inst && !inst.running) {
+      emit(resultEvent({ action: Action.start, name, ok: false, error: message }));
+    }
     report();
   }
 
@@ -105,11 +142,12 @@ function createCatpawHost({ bridge, workerEntryPath }) {
         /* ignore invalid profile_path */
       }
     }
+    const resolvedPort = await resolveAvailablePort(port || null);
     const worker = spawnWorker({
       workerEntryPath,
       name,
       workerData: {
-        name, scriptPath, startArg: config, dataDir, port: port || null, dartPort: dartServerPort,
+        name, scriptPath, startArg: config, dataDir, port: resolvedPort, dartPort: dartServerPort,
         env: env || {}, allowWriteDirs: [dataDir, tempDir, ...extraDirs], allowReadDirs: [path.dirname(scriptPath), ...extraDirs],
         redirectRoot: tempDir, enableNetLog: !!enableNetLog, enableLog: enableLog !== false,
       },
@@ -125,11 +163,26 @@ function createCatpawHost({ bridge, workerEntryPath }) {
     if (!inst) { if (purge) removeDir(dataDirOf(name)); return; }
     const { worker } = inst;
     delete instances[name];
-    if (purge) worker.once('exit', () => { if (!instances[name]) removeDir(dataDirOf(name)); });
-    try { worker.postMessage({ type: LoaderMsg.stop }); } catch { /* worker gone */ }
-    const timer = setTimeout(() => { try { worker.terminate(); } catch { /* gone */ } }, STOP_GRACE_MS);
-    timer.unref();
-    worker.once('exit', () => clearTimeout(timer));
+    await new Promise((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      worker.once('exit', done);
+      try { worker.postMessage({ type: LoaderMsg.stop }); } catch { /* worker gone */ }
+      const timer = setTimeout(() => {
+        try {
+          Promise.resolve(worker.terminate()).catch(() => {}).finally(done);
+        } catch {
+          done();
+        }
+      }, STOP_GRACE_MS);
+      timer.unref();
+    });
+    if (purge && !instances[name]) removeDir(dataDirOf(name));
   }
 
   /** Ask a worker to run one of its reload routines and wait for the acknowledgement. */

@@ -432,8 +432,18 @@ class SubscriptionInstaller {
     }
   }
 
-  Future<List<int>> _bytes(Uri uri) async =>
-      (await _dio.getUri<List<int>>(uri, options: Options(responseType: ResponseType.bytes))).data!;
+  Future<List<int>> _bytes(Uri uri) async {
+    final headers = <String, String>{
+      if (uri.userInfo.isNotEmpty)
+        'Authorization': 'Basic ${base64Encode(utf8.encode(Uri.decodeFull(uri.userInfo)))}',
+    };
+    final cleanUri = uri.userInfo.isEmpty ? uri : uri.replace(userInfo: '');
+    return (await _dio.getUri<List<int>>(
+      cleanUri,
+      options: Options(responseType: ResponseType.bytes, headers: headers.isEmpty ? null : headers),
+    ))
+        .data!;
+  }
 
   /// The first 32-hex word of [uri]. When the checksum is optional, a missing file or one without an md5 gives null.
   Future<String?> _fetchMd5(Uri uri, {required bool required}) async {

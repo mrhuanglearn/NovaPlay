@@ -122,6 +122,8 @@ class HomeScreen extends ConsumerWidget {
       body: SafeArea(
         bottom: false,
         child: runtime.when(
+          skipLoadingOnRefresh: false,
+          skipLoadingOnReload: false,
           loading: () => const Center(child: CircularProgressIndicator()),
           error: (e, _) => EmptyState(
             icon: Icons.cloud_off_rounded,
@@ -335,8 +337,8 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
     return cats.isEmpty ? null : cats.first.id;
   }
 
-  void _ensureLoaded(SpiderSite site, String? typeId) {
-    final key = '${site.key}|$typeId';
+  void _ensureLoaded(String? subKey, SpiderSite site, String? typeId) {
+    final key = '${subKey ?? ''}|${site.key}|$typeId';
     if (key == _loadedFor) return;
     _loadedFor = key;
     _site = site;
@@ -439,9 +441,12 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
     ref.watch(selectedTypeIdProvider);
     final prefs = ref.watch(homePrefsProvider).valueOrNull ?? const HomePrefs();
     final site = ref.watch(currentSiteProvider);
+    final subKey = ref.watch(catpawRuntimeProvider).valueOrNull?.subscription.key;
     final feed = ref.watch(videoFeedProvider);
     final bottom = tabBottomInset(context);
     return feed.when(
+      skipLoadingOnRefresh: false,
+      skipLoadingOnReload: false,
       loading: () => const Center(child: CircularProgressIndicator()),
       error: (e, _) => ErrorState(error: e, bottomInset: bottom, onRetry: () => ref.invalidate(videoFeedProvider)),
       data: (home) {
@@ -449,7 +454,7 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
         final blocked = prefs.blockedFor(site.key);
         final cats = home.categories.where((x) => !blocked.contains(x.id)).toList();
         final typeId = _effectiveType(home, blocked);
-        _ensureLoaded(site, typeId);
+        _ensureLoaded(subKey, site, typeId);
         final selected = cats.where((x) => x.id == typeId).firstOrNull;
         final filters = selected != null && selected.filters.isNotEmpty && !prefs.hideFilters
             ? CategoryFilterBar(
