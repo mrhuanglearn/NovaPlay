@@ -1314,7 +1314,8 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
         self.controllerDidShowToast(IosPlayerUiText.t("加载字幕失败：链接无效", "Invalid subtitle URL"), long: false)
         return
       }
-      let name = URL(string: raw)?.lastPathComponent.flatMap { $0.isEmpty ? nil : $0 } ?? "subtitle"
+      let lastComp = URL(string: raw)?.lastPathComponent ?? ""
+      let name = lastComp.isEmpty ? "subtitle" : lastComp
       self.controller.addExternalSubtitle(url: raw, name: name)
       self.controllerDidShowToast(IosPlayerUiText.t("已加载字幕：\(name)", "Subtitles loaded: \(name)"), long: false)
     })

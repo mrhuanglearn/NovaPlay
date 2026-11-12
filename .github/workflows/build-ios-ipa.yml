@@ -33,8 +33,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Locate Flutter app directory
+      - name: Locate Flutter app directory & resolve build flags
         id: dirs
+        env:
+          INPUT_MPV: ${{ inputs.include_mpv }}
+          INPUT_VLC: ${{ inputs.include_vlc }}
         run: |
           if [[ -f "pubspec.yaml" ]]; then
             echo "app_dir=." >> "$GITHUB_OUTPUT"
@@ -44,6 +47,17 @@ jobs:
             echo "Could not locate Flutter pubspec.yaml" >&2
             exit 1
           fi
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${INPUT_MPV}" == "false" ]]; then
+            echo "with_mpv=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "with_mpv=1" >> "$GITHUB_OUTPUT"
+          fi
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" && "${INPUT_VLC}" == "false" ]]; then
+            echo "with_vlc=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "with_vlc=1" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Resolved build flags: event=${GITHUB_EVENT_NAME}, with_mpv=$(tail -n 2 "$GITHUB_OUTPUT" | head -n 1 | cut -d= -f2), with_vlc=$(tail -n 1 "$GITHUB_OUTPUT" | cut -d= -f2)"
 
       - name: Setup Flutter (stable)
         uses: subosito/flutter-action@v2
@@ -61,19 +75,21 @@ jobs:
           key: nodemobile-ios-v18.20.4
 
       - name: Cache NovaMpv.xcframework
-        if: inputs.include_mpv != false
+        if: steps.dirs.outputs.with_mpv == '1'
         uses: actions/cache@v4
         with:
-          path: ${{ steps.dirs.outputs.app_dir }}/packages/novaplay_ios/ios/Frameworks/NovaMpv.xcframework
-          key: novampv-ios-arm64-v1-${{ hashFiles('**/fetch_mpvkit.sh') }}
+          path: |
+            ${{ steps.dirs.outputs.app_dir }}/packages/novaplay_ios/ios/Frameworks/*.xcframework
+            !${{ steps.dirs.outputs.app_dir }}/packages/novaplay_ios/ios/Frameworks/NodeMobile.xcframework
+          key: novampv-ios-arm64-v2-${{ hashFiles('**/fetch_mpvkit.sh') }}
 
       - name: Cache CocoaPods downloads
         uses: actions/cache@v4
         with:
           path: ~/Library/Caches/CocoaPods
-          key: cocoapods-cache-${{ runner.os }}-mpv-${{ inputs.include_mpv != false }}-vlc-${{ inputs.include_vlc != false }}-${{ hashFiles('**/Podfile', '**/novaplay_ios.podspec', '**/pubspec.lock') }}
+          key: cocoapods-cache-${{ runner.os }}-mpv-${{ steps.dirs.outputs.with_mpv }}-vlc-${{ steps.dirs.outputs.with_vlc }}-${{ hashFiles('**/Podfile', '**/novaplay_ios.podspec', '**/pubspec.lock') }}
           restore-keys: |
-            cocoapods-cache-${{ runner.os }}-mpv-${{ inputs.include_mpv != false }}-vlc-${{ inputs.include_vlc != false }}-
+            cocoapods-cache-${{ runner.os }}-mpv-${{ steps.dirs.outputs.with_mpv }}-vlc-${{ steps.dirs.outputs.with_vlc }}-
             cocoapods-cache-${{ runner.os }}-
 
       - name: Run Flutter unit & widget tests
@@ -87,8 +103,8 @@ jobs:
         working-directory: ${{ steps.dirs.outputs.app_dir }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NOVAPLAY_WITH_MPV: ${{ inputs.include_mpv == false && '0' || '1' }}
-          NOVAPLAY_WITH_VLC: ${{ inputs.include_vlc == false && '0' || '1' }}
+          NOVAPLAY_WITH_MPV: ${{ steps.dirs.outputs.with_mpv }}
+          NOVAPLAY_WITH_VLC: ${{ steps.dirs.outputs.with_vlc }}
         run: bash ios/scripts/package_ipa.sh
 
       - name: Upload IPA Artifact

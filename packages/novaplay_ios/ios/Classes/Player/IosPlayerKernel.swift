@@ -1026,7 +1026,12 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     player.delegate = self
     player.drawable = videoView.vlcDrawableView
 
-    let media = VLCMedia(url: mediaURL)
+    let maybeMedia: VLCMedia? = VLCMedia(url: mediaURL)
+    guard let media = maybeMedia else {
+      let msg = "VLC " + IosPlayerUiText.t("加载失败", "load failed")
+      delegate?.kernelDidFail(message: msg, code: -2)
+      return
+    }
     media.addOption(":network-caching=2000")
     if hwDecode {
       media.addOption(":videotoolbox")
@@ -1089,11 +1094,12 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
 
   private func sampleVlcMetrics() {
     guard isUsingVlc, let player = vlcPlayer else { return }
-    let tMs = Int64(player.time.intValue)
-    if tMs >= 0 {
-      positionMs = tMs
+    let curTime: VLCTime? = player.time
+    if let rawMs = curTime?.intValue, rawMs >= 0 {
+      positionMs = Int64(rawMs)
     }
-    if let len = player.media?.length.intValue, len > 0 {
+    let mediaLen: VLCTime? = player.media?.length
+    if let len = mediaLen?.intValue, len > 0 {
       durationMs = Int64(len)
     }
     let sz = player.videoSize
@@ -1622,7 +1628,10 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     default:
       #if canImport(MobileVLCKit)
       if let player = vlcPlayer {
-        player.time = VLCTime(number: NSNumber(value: clamped))
+        let seekTime: VLCTime? = VLCTime(number: NSNumber(value: clamped))
+        if let st = seekTime {
+          player.time = st
+        }
       }
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
         guard let self = self, self.isUsingVlc else { return }
@@ -1789,8 +1798,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
 
     #if canImport(MobileVLCKit)
     if let player = vlcPlayer {
-      let names = (player.videoSubTitlesNames as? [String]) ?? []
-      let indexes = (player.videoSubTitlesIndexes as? [NSNumber])?.map { Int($0.int32Value) } ?? []
+      let names = (player.videoSubTitlesNames as Any as? [String]) ?? []
+      let indexes = ((player.videoSubTitlesIndexes as Any as? [NSNumber]) ?? []).map { Int($0.int32Value) }
       let current = Int(player.currentVideoSubTitleIndex)
       var embeddedValidCount = 0
       for (pos, vlcIdx) in indexes.enumerated() where vlcIdx >= 0 {
@@ -1874,8 +1883,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
 
     #if canImport(MobileVLCKit)
     if let player = vlcPlayer {
-      let names = (player.audioTrackNames as? [String]) ?? []
-      let indexes = (player.audioTrackIndexes as? [NSNumber])?.map { Int($0.int32Value) } ?? []
+      let names = (player.audioTrackNames as Any as? [String]) ?? []
+      let indexes = ((player.audioTrackIndexes as Any as? [NSNumber]) ?? []).map { Int($0.int32Value) }
       let current = Int(player.currentAudioTrackIndex)
       var result: [IosTrackOption] = []
       for (pos, vlcIdx) in indexes.enumerated() where vlcIdx >= 0 {
@@ -2129,7 +2138,10 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
         }
         if !self.vlcAppliedInitialSeek && self.vlcPendingStartMs > 0 {
           self.vlcAppliedInitialSeek = true
-          player.time = VLCTime(number: NSNumber(value: self.vlcPendingStartMs))
+          let initialTime: VLCTime? = VLCTime(number: NSNumber(value: self.vlcPendingStartMs))
+          if let st = initialTime {
+            player.time = st
+          }
         }
         player.rate = self.speed
         self.updateState("playing")
@@ -2196,9 +2208,10 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
   func mediaPlayerTimeChanged(_ aNotification: Notification) {
     DispatchQueue.main.async { [weak self] in
       guard let self = self, self.isUsingVlc, let player = self.vlcPlayer else { return }
-      let ms = Int64(player.time.intValue)
-      if ms >= 0 { self.positionMs = ms }
-      if let len = player.media?.length.intValue, len > 0 {
+      let curTime: VLCTime? = player.time
+      if let ms = curTime?.intValue, ms >= 0 { self.positionMs = Int64(ms) }
+      let mediaLen: VLCTime? = player.media?.length
+      if let len = mediaLen?.intValue, len > 0 {
         self.durationMs = Int64(len)
       }
       if self.state == "buffering" && player.isPlaying && !self.isSeeking {

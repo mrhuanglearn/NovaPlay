@@ -142,21 +142,6 @@ def load_package(url, exact_tag=None, lower=None, upper=None, branch=None):
     manifest = json.loads(raw_json)
     packages[ident] = {"dir": dest, "manifest": manifest}
 
-    def find_first_url(node):
-        if isinstance(node, str) and (node.startswith("https://") or node.startswith("http://") or node.startswith("git@")):
-            return node
-        if isinstance(node, dict):
-            for v in node.values():
-                found = find_first_url(v)
-                if found:
-                    return found
-        elif isinstance(node, list):
-            for item in node:
-                found = find_first_url(item)
-                if found:
-                    return found
-        return None
-
     def unwrap_first_str(val):
         while isinstance(val, list) and val:
             val = val[0]
@@ -190,7 +175,24 @@ def load_package(url, exact_tag=None, lower=None, upper=None, branch=None):
     return ident
 
 
-root_ident = load_package(mpvkit_repo, exact_tag=mpvkit_tag or None)
+def find_first_url(node):
+    if isinstance(node, str) and (node.startswith("https://") or node.startswith("http://") or node.startswith("git@")):
+        return node
+    if isinstance(node, dict):
+        for v in node.values():
+            found = find_first_url(v)
+            if found:
+                return found
+    elif isinstance(node, list):
+        for item in node:
+            found = find_first_url(item)
+            if found:
+                return found
+    return None
+
+
+resolved_root_tag = mpvkit_tag or pick_remote_tag(mpvkit_repo)
+root_ident = load_package(mpvkit_repo, exact_tag=resolved_root_tag or None)
 
 binary_urls = []
 seen_binary_urls = set()
@@ -202,6 +204,10 @@ visited_targets = set()
 def condition_allows_ios(cond):
     while isinstance(cond, list) and len(cond) == 1:
         cond = cond[0]
+    while isinstance(cond, dict) and "condition" in cond:
+        cond = cond["condition"]
+        while isinstance(cond, list) and len(cond) == 1:
+            cond = cond[0]
     if not cond or not isinstance(cond, dict):
         return True
     plats = cond.get("platforms") or cond.get("platformNames") or []
@@ -264,7 +270,7 @@ def walk_target(pkg_id, target_name):
     collect_settings(target_obj)
 
     if target_obj.get("type") == "binary":
-        url = target_obj.get("url")
+        url = target_obj.get("url") or find_first_url(target_obj)
         if url and url not in seen_binary_urls:
             seen_binary_urls.add(url)
             binary_urls.append((target_name, url))
@@ -304,19 +310,34 @@ def walk_target(pkg_id, target_name):
                             walk_product(cand_id, prod_name)
 
 
-walk_product(root_ident, root_product)
-
-if not binary_urls:
-    # Fallback: collect all non-GPL binary targets across loaded manifests
+def collect_fallback_binaries():
     for ident, pkg in packages.items():
         for t in pkg["manifest"].get("targets", []):
-            if t.get("type") == "binary" and t.get("url"):
+            if t.get("type") == "binary":
+                t_url = t.get("url") or find_first_url(t)
+                if not t_url:
+                    continue
                 tname = t.get("name", "")
                 if not use_gpl and "gpl" in tname.lower():
                     continue
-                if t["url"] not in seen_binary_urls:
-                    seen_binary_urls.add(t["url"])
-                    binary_urls.append((tname, t["url"]))
+                if t_url not in seen_binary_urls:
+                    seen_binary_urls.add(t_url)
+                    binary_urls.append((tname, t_url))
+
+
+walk_product(root_ident, root_product)
+if not binary_urls:
+    collect_fallback_binaries()
+
+if not binary_urls and resolved_root_tag and not mpvkit_tag:
+    shutil.rmtree(repos_dir, ignore_errors=True)
+    repos_dir.mkdir(parents=True, exist_ok=True)
+    packages.clear()
+    visited_targets.clear()
+    root_ident = load_package(mpvkit_repo, exact_tag=None)
+    walk_product(root_ident, root_product)
+    if not binary_urls:
+        collect_fallback_binaries()
 
 if not binary_urls:
     raise RuntimeError("No binaryTarget XCFramework URLs discovered in MPVKit manifest")
@@ -387,8 +408,17 @@ for tname, xcfws in extracted_items:
             continue
 
         file_desc = run(["file", "-b", str(bin_path)]).lower()
-        if "ar archive" in file_desc or bin_path.suffix == ".a":
-            if tname.lower() in ("libmpv", "mpv") or xcfw.stem.lower() in ("libmpv", "mpv"):
+        if "ar archive" in file_desc or "mach-o 64-bit object" in file_desc or bin_path.suffix == ".a":
+            # Ensure multi-arch static archives are thinned to arm64 so nm & -force_load operate cleanly
+            try:
+                archs_raw = run(["xcrun", "lipo", "-archs", str(bin_path)]).strip().split()
+                if len(archs_raw) > 1 and "arm64" in archs_raw:
+                    thinned = work_dir / f"thin_{len(static_archives)}_{tname}_{bin_path.name}.a"
+                    run(["xcrun", "lipo", str(bin_path), "-thin", "arm64", "-output", str(thinned)])
+                    bin_path = thinned
+            except Exception:
+                pass
+            if "libmpv" in tname.lower() or "libmpv" in xcfw.stem.lower() or tname.lower() == "mpv":
                 libmpv_static = bin_path
             else:
                 static_archives.append(bin_path)
@@ -424,7 +454,7 @@ print(
 
 # Build exported symbol list: ONLY `_mpv_*` (and `_vk*` if MoltenVK is static so libplacebo dlsym finds Vulkan)
 exp_syms = set()
-nm_mpv = run(["xcrun", "nm", "-gU", str(libmpv_static)])
+nm_mpv = run(["xcrun", "nm", "-arch", "arm64", "-gU", str(libmpv_static)])
 for line in nm_mpv.splitlines():
     toks = line.strip().split()
     if toks and toks[-1].startswith("_mpv_"):
@@ -435,7 +465,7 @@ moltenvk_archives = set()
 for arch_path in static_archives:
     if "moltenvk" in str(arch_path).lower():
         moltenvk_archives.add(arch_path)
-        nm_vk = run(["xcrun", "nm", "-gU", str(arch_path)])
+        nm_vk = run(["xcrun", "nm", "-arch", "arm64", "-gU", str(arch_path)])
         for line in nm_vk.splitlines():
             toks = line.strip().split()
             if toks and (toks[-1].startswith("_vk") or toks[-1].startswith("_vk_icd")):
@@ -475,11 +505,15 @@ base_frameworks = [
 ]
 optional_sdk_frameworks = [
     "Accelerate",
+    "CFNetwork",
     "CoreImage",
+    "CoreServices",
     "GameController",
     "IOKit",
     "MediaPlayer",
     "MetalPerformanceShaders",
+    "MobileCoreServices",
+    "OpenGLES",
 ]
 for fw in sorted(set(linked_frameworks) | set(optional_sdk_frameworks)):
     if fw not in base_frameworks:
@@ -488,7 +522,7 @@ for fw in sorted(set(linked_frameworks) | set(optional_sdk_frameworks)):
             base_frameworks.append(fw)
 
 base_libs = ["objc", "iconv", "z", "bz2", "xml2", "resolv", "c++"]
-optional_sdk_libs = ["compression", "sqlite3"]
+optional_sdk_libs = ["compression", "expat", "lzma", "sqlite3"]
 for lib in sorted(set(linked_libraries) | set(optional_sdk_libs)):
     if lib not in base_libs:
         tbd_path = pathlib.Path(iphoneos_sdk) / "usr" / "lib" / f"lib{lib}.tbd"
@@ -540,7 +574,7 @@ for lib in base_libs:
 
 link_cmd += ["-o", str(dev_bin)]
 run(link_cmd)
-run(["xcrun", "strip", "-x", str(dev_bin)])
+run(["xcrun", "strip", "-x", str(dev_bin)], check=False)
 
 dev_plist = {
     "CFBundleDevelopmentRegion": "en",

@@ -59,10 +59,11 @@ post_install do |installer|
   unless bitcode_strip.empty?
     patterns = [
       File.join(__dir__, 'Pods', 'MobileVLCKit', '**', 'MobileVLCKit.framework', 'MobileVLCKit'),
-      File.join(__dir__, '..', 'packages', 'novaplay_ios', 'ios', 'Frameworks', '**', 'NodeMobile.framework', 'NodeMobile')
+      File.join(__dir__, '..', 'packages', 'novaplay_ios', 'ios', 'Frameworks', '**', '*.framework', '*')
     ]
     patterns.flat_map { |p| Dir.glob(p) }.uniq.each do |bin|
       next unless File.file?(bin)
+      next unless File.basename(File.dirname(bin)) == "#{File.basename(bin)}.framework"
       file_info = `file "#{bin}" 2>/dev/null`
       next unless file_info.include?('dynamically linked shared library')
       puts "Stripping bitcode from #{bin}"
