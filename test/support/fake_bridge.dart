@@ -5,6 +5,7 @@ import 'package:uzv_reimpl/core/node_bridge.dart';
 /// In-memory [NodeBridge]: records what Dart sent and lets a test play the part of the Node runtime.
 class FakeBridge implements NodeBridge {
   final sent = <(String, String)>[];
+  final diagnostics = <String>[];
   final _controllers = <String, StreamController<String>>{};
   bool started = false;
 
@@ -39,4 +40,9 @@ class FakeBridge implements NodeBridge {
 
   @override
   Stream<String> listen(String channel) => _c(channel).stream;
+
+  @override
+  void logDiagnostic(String message) {
+    diagnostics.add(message);
+  }
 }

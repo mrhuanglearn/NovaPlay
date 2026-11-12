@@ -422,6 +422,16 @@ class SubscriptionInstaller {
     if (await dir.exists()) await dir.delete(recursive: true);
   }
 
+  /// Removes only [sub]'s script bundle files while preserving `Temp/` runtime data (cookies, DBs, caches).
+  Future<void> invalidateScript(Subscription sub) async {
+    final dir = await _dir(sub);
+    if (!await dir.exists()) return;
+    for (final name in const [_markerName, 'index.js', 'config.js']) {
+      final f = File(p.join(dir.path, name));
+      if (await f.exists()) await f.delete();
+    }
+  }
+
   Future<List<int>> _bytes(Uri uri) async =>
       (await _dio.getUri<List<int>>(uri, options: Options(responseType: ResponseType.bytes))).data!;
 

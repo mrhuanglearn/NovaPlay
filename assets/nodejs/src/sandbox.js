@@ -27,14 +27,37 @@ const FSP_WRITE = ['writeFile', 'mkdir', 'rmdir', 'unlink', 'rename', 'appendFil
 // Captured before any patching so the policy never recurses into itself.
 const realpath = fs.realpathSync.native || fs.realpathSync;
 const mkdirSyncOriginal = fs.mkdirSync;
+const lstatSyncOriginal = fs.lstatSync;
 
-/** Resolve a directory to an absolute, symlink-free path when possible. */
-function normDir(p) {
-  const abs = path.resolve(p);
-  try { return realpath(abs); } catch { return abs; }
+const IOS_DATA_CONTAINER_RE =
+  /^(?:\/private)?\/var\/mobile\/Containers\/Data\/Application\/[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}(?=\/|$)/;
+
+function pathExistsOriginal(p) {
+  try { lstatSyncOriginal(p); return true; } catch { return false; }
 }
 
-/** Like normDir, but for paths that may not exist yet: resolve the deepest existing ancestor. */
+function redirectSubpath(target) {
+  return IOS_DATA_CONTAINER_RE.test(target)
+    ? target.replace(IOS_DATA_CONTAINER_RE, '/_ios_container')
+    : target;
+}
+
+function isOpenWriteFlags(flags) {
+  if (typeof flags === 'string') return /[wa+]/.test(flags);
+  if (typeof flags === 'number') {
+    const c = fs.constants || {};
+    const mask = (c.O_WRONLY || 0) | (c.O_RDWR || 0) | (c.O_CREAT || 0) | (c.O_TRUNC || 0) | (c.O_APPEND || 0);
+    return (flags & mask) !== 0;
+  }
+  return false;
+}
+
+/** Resolve a directory (including non-existent leaves under symlinked ancestors like iOS `/var`) canonically. */
+function normDir(p) {
+  return normPath(p);
+}
+
+/** Resolve paths that may not exist yet via the deepest existing ancestor. */
 function normPath(p) {
   const abs = path.resolve(String(p));
   try { return realpath(abs); } catch { /* fall through */ }
@@ -64,18 +87,36 @@ function createPolicy(cfg = {}) {
   const redirectBase = cfg.redirectRoot
     ? path.join(cfg.redirectRoot, '_redirect')
     : cfg.dataDir ? path.join(cfg.dataDir, '_redirect') : null;
+  if (redirectBase) {
+    try { mkdirSyncOriginal(redirectBase, { recursive: true }); } catch { /* best effort */ }
+  }
   const redirectRoot = redirectBase ? normDir(redirectBase) : null;
   const seen = new Set();
 
   function resolve(input, isWrite) {
     if (typeof input !== 'string' && !(input instanceof URL) && !Buffer.isBuffer(input)) return input;
     const target = normPath(input instanceof URL ? input.pathname : Buffer.isBuffer(input) ? input.toString() : input);
-    const allowed = isWrite ? writeDirs : [...writeDirs, ...readDirs];
-    if (allowed.some((d) => isInside(d, target))) return input;
+    if (writeDirs.some((d) => isInside(d, target))) return input;
     if (!redirectRoot) return input;
     // Never redirect something that already lives under the redirect area.
     if (isInside(redirectRoot, target)) return target;
-    const dest = path.join(redirectRoot, target);
+
+    const subpath = redirectSubpath(target);
+    const dest = path.join(redirectRoot, subpath);
+    const legacyDest = subpath !== target ? path.join(redirectRoot, target) : null;
+
+    if (!isWrite && readDirs.some((d) => isInside(d, target))) {
+      // Read-after-write overlay: if a spider wrote/updated a file inside allowReadDirs (e.g. __dirname/db.json),
+      // subsequent reads across restarts must see the persisted file in _redirect rather than missing it in readDirs.
+      if (pathExistsOriginal(dest)) return dest;
+      if (legacyDest && pathExistsOriginal(legacyDest)) return legacyDest;
+      return input;
+    }
+
+    if (!isWrite && legacyDest && !pathExistsOriginal(dest) && pathExistsOriginal(legacyDest)) {
+      return legacyDest;
+    }
+
     if (!seen.has(dest)) {
       seen.add(dest);
       if (cfg.onRedirect) cfg.onRedirect(isWrite ? 'write' : 'read', target, dest);
@@ -94,10 +135,11 @@ function patchMethods(target, names, isWrite, policy) {
     if (typeof target[name] !== 'function') continue;
     const original = target[name];
     target[name] = function patched(first, ...rest) {
+      const effectiveWrite = isWrite || ((name === 'open' || name === 'openSync') && isOpenWriteFlags(rest[0]));
       // rename/copy style calls carry a second path; protect it as a write target as well.
-      const mapped = policy.resolve(first, isWrite);
+      const mapped = policy.resolve(first, effectiveWrite);
       if ((name === 'rename' || name === 'renameSync' || name === 'copyFile' || name === 'copyFileSync' ||
-        name === 'cp' || name === 'cpSync' || name === 'link' || name === 'linkSync') && typeof rest[0] === 'string') {
+        name === 'cp' || name === 'cpSync' || name === 'link' || name === 'linkSync') && rest.length > 0) {
         rest[0] = policy.resolve(rest[0], true);
       }
       return original.call(this, mapped, ...rest);

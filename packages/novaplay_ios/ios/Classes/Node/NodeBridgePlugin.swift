@@ -1,7 +1,37 @@
 import Darwin
 import Flutter
 import Foundation
+import os
 import Security
+
+private let nodeUsbLog = Logger(subsystem: "app.novaplay.player", category: "node")
+private let dartUsbLog = Logger(subsystem: "app.novaplay.player", category: "dart")
+
+private enum NodeUsbLogRedactor {
+  private static let credRegex = try? NSRegularExpression(pattern: #"://[^/@\s]+@"#, options: [])
+
+  static func sanitize(_ raw: String, maxLen: Int = 400) -> String {
+    let singleLine = raw
+      .replacingOccurrences(of: "\r", with: " ")
+      .replacingOccurrences(of: "\n", with: " ")
+    let ns = singleLine as NSString
+    let redacted: String
+    if let rx = credRegex {
+      redacted = rx.stringByReplacingMatches(
+        in: singleLine,
+        options: [],
+        range: NSRange(location: 0, length: ns.length),
+        withTemplate: "://***@"
+      )
+    } else {
+      redacted = singleLine
+    }
+    if redacted.count <= maxLen {
+      return redacted
+    }
+    return String(redacted.prefix(maxLen)) + "…"
+  }
+}
 
 /// iOS counterpart of Android's `NodeBridgePlugin.kt`:
 /// - `MethodChannel("uzv/node")`: `start()` and `send(channel, message)`
@@ -58,6 +88,14 @@ final class NodeBridgePlugin: NSObject, FlutterStreamHandler {
           }
         }
       }
+    case "log":
+      if let args = call.arguments as? [String: Any],
+         let rawMsg = args["message"] as? String,
+         !rawMsg.isEmpty {
+        let safe = NodeUsbLogRedactor.sanitize(rawMsg)
+        dartUsbLog.notice("[NovaPlay][Dart] \(safe, privacy: .public)")
+      }
+      result(nil)
     default:
       result(FlutterMethodNotImplemented)
     }
@@ -120,6 +158,8 @@ private final class NodeHostIos {
   }
 
   private func emitStatus(_ line: String) {
+    let safe = NodeUsbLogRedactor.sanitize(line)
+    nodeUsbLog.notice("[NovaPlay][Node] \(safe, privacy: .public)")
     emit(channel: "status", message: line)
   }
 
@@ -332,10 +372,37 @@ private final class NodeHostIos {
 
         guard let channel = obj["c"] as? String,
               let message = obj["m"] as? String else { continue }
-        if channel == "status" && message.hasPrefix("Node ready") {
-          lock.lock()
-          readyLine = message
-          lock.unlock()
+        if channel == "status" {
+          if message.hasPrefix("Node ready") {
+            lock.lock()
+            readyLine = message
+            lock.unlock()
+          }
+          if !message.hasPrefix("[log]") && (
+            message.hasPrefix("Node ") ||
+            message.hasPrefix("catpaw") ||
+            message.hasPrefix("error:") ||
+            message.hasPrefix("rejection:") ||
+            message.contains("[redirect]")
+          ) {
+            let safe = NodeUsbLogRedactor.sanitize(message)
+            nodeUsbLog.notice("[NovaPlay][Node] \(safe, privacy: .public)")
+          }
+        } else if channel == "catpaw",
+                  let msgData = message.data(using: .utf8),
+                  let ev = (try? JSONSerialization.jsonObject(with: msgData)) as? [String: Any],
+                  let evType = ev["type"] as? String {
+          if evType == "port", let p = ev["port"] as? Int {
+            nodeUsbLog.notice("[NovaPlay][Node] catpaw worker port=\(p, privacy: .public)")
+          } else if evType == "result" {
+            let act = (ev["action"] as? String) ?? "-"
+            let ok = (ev["ok"] as? Bool) ?? false
+            let errRaw = (ev["error"] as? String) ?? "-"
+            let errSafe = NodeUsbLogRedactor.sanitize(errRaw, maxLen: 200)
+            nodeUsbLog.notice(
+              "[NovaPlay][Node] catpaw result action=\(act, privacy: .public) ok=\(ok, privacy: .public) err=\(errSafe, privacy: .public)"
+            )
+          }
         }
         emit(channel: channel, message: message)
       }

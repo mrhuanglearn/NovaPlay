@@ -55,13 +55,13 @@ class DartCallbackServer {
       final handler = handlers[action];
       if (handler == null) {
         status = 501;
-        reply = {'ok': false, 'error': 'unsupported action: $action'};
+        reply = {'ok': false, 'code': -1, 'error': 'unsupported action: $action'};
       } else {
-        reply = {'ok': true, 'data': await handler(call.args)};
+        reply = {'ok': true, 'code': 0, 'data': await handler(call.args)};
       }
     } catch (e) {
       status = 500;
-      reply = {'ok': false, 'error': '$e'};
+      reply = {'ok': false, 'code': -1, 'error': '$e'};
       log('[DartServer] $action failed: $e');
     }
     req.response
@@ -88,36 +88,52 @@ class DartCallbackServer {
     return (action: segment, args: {...map, ...uri.queryParameters});
   }
   String? named;
+  String? namedKey;
   for (final k in const ['action', 'type', 'method', 'name']) {
     final v = map[k];
     if (v is String && v.isNotEmpty && !v.contains('/')) {
       named = v;
+      namedKey = k;
       break;
     }
   }
   final action = uri.queryParameters['action'] ?? named ?? segment ?? '';
   Map<String, dynamic> args = map;
+  var unwrapped = false;
   if (named != null) {
     // `opt` is OBSERVED (2026-11-10, 「设」配置 → openInternalWebview); the others are guesses kept for other scripts.
     for (final k in const ['opt', 'data', 'args', 'params', 'payload']) {
+      if (!map.containsKey(k)) continue;
       final v = map[k];
       if (v is Map) {
         args = v.cast<String, dynamic>();
+        unwrapped = true;
+        break;
+      } else if (v != null) {
+        args = {'value': v};
+        unwrapped = true;
         break;
       }
     }
   }
-  return (action: action, args: {...args, ...uri.queryParameters}..remove('action'));
+  final merged = {...args, ...uri.queryParameters}..remove('action');
+  if (!unwrapped && namedKey != null) merged.remove(namedKey);
+  return (action: action, args: merged);
 }
 
+const _safeShapeKeys = {'action', 'type', 'method', 'kind'};
+
 /// Names and value types of a decoded JSON value, with string lengths instead of the strings: `{url: str(41)}`.
-String describeShape(Object? v, [int depth = 0]) {
+String describeShape(Object? v, [int depth = 0, String? key]) {
   if (v is Map) {
     if (depth > 2) return '{…}';
-    return '{${v.entries.map((e) => '${e.key}: ${describeShape(e.value, depth + 1)}').join(', ')}}';
+    return '{${v.entries.map((e) => '${e.key}: ${describeShape(e.value, depth + 1, '${e.key}')}').join(', ')}}';
   }
   if (v is List) return 'list(${v.length})';
-  // identifiers (action names, kinds) are shown; anything else only by its length
-  if (v is String) return RegExp(r'^[A-Za-z][A-Za-z0-9_.-]{0,39}$').hasMatch(v) ? v : 'str(${v.length})';
+  // Only known action/kind discriminator keys show identifier names; all other strings (cookies, passwords, URLs) log length only.
+  if (v is String) {
+    final showIdent = (key == null || _safeShapeKeys.contains(key)) && RegExp(r'^[A-Za-z][A-Za-z0-9_.-]{0,39}$').hasMatch(v);
+    return showIdent ? v : 'str(${v.length})';
+  }
   return '$v';
 }

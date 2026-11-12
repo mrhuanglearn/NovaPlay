@@ -60,6 +60,7 @@ final favoriteRepositoryProvider = Provider((ref) => FavoriteRepository());
 final playerConfigRepositoryProvider = Provider((ref) => PlayerConfigRepository());
 final snifferServiceProvider = Provider((ref) => SnifferService());
 final settingsStoreProvider = Provider((ref) => JsonStore('settings.json'));
+final subscriptionProfilesStoreProvider = Provider((ref) => JsonStore('subscription_profiles.json'));
 final webDavConfigStoreProvider = Provider((ref) => JsonStore('webdav_config.json'));
 final backupServiceProvider = Provider((ref) => BackupService());
 
@@ -220,8 +221,8 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
       force: true,
     );
   } catch (_) {
-    // A broken download must not be reused: 重试 downloads it again. A local zip cannot be fetched again, so it stays.
-    if (!sub.local) await installer.discard(sub);
+    // A broken download must not be reused: 重试 downloads it again while keeping Temp/_redirect instance data intact.
+    if (!sub.local) await installer.invalidateScript(sub);
     rethrow;
   }
   final api = SpiderApi(port, receiveTimeout: ref.read(appPreferencesProvider).catpawTimeout);
@@ -353,7 +354,7 @@ bool webviewReplacesTop(Uri top, bool Function(DetailQuery q) detailLoading) =>
 
 final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCallbackServer>((ref) {
   final history = ref.watch(historyRepositoryProvider);
-  final profiles = JsonStore('subscription_profiles.json');
+  final profiles = ref.watch(subscriptionProfilesStoreProvider);
   String? str(Map<String, dynamic> a, List<String> keys) {
     for (final k in keys) {
       final v = a[k];
@@ -361,6 +362,16 @@ final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCal
       if (v is num) return '$v';
     }
     return null;
+  }
+
+  Future<String> activeProfileSubKey() async {
+    final subs = await ref.read(subscriptionsProvider.future);
+    final selected = await ref.read(activeSubscriptionKeyProvider.future);
+    if (selected != null && selected.isNotEmpty) {
+      if (subs.isEmpty || subs.any((s) => s.key == selected)) return selected;
+    }
+    if (subs.isNotEmpty) return subs.first.key;
+    return 'default';
   }
 
   // Every payload field name below is INFERRED (only the action names were observed), hence the alias lists.
@@ -380,14 +391,55 @@ final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCal
     },
     DartActions.queryHistory: (args) async => [for (final e in await history.all()) e.toJson()],
     DartActions.queryProfile: (args) async {
+      final subKey = await activeProfileSubKey();
       final all = await profiles.read<Map<String, dynamic>>(<String, dynamic>{});
-      return all['${args['name']}'];
+      final slot = args['name'];
+      if (slot is String && slot.isNotEmpty && args.length == 1) {
+        final scoped = all['$subKey:$slot'];
+        if (scoped != null) return scoped;
+        if (all.containsKey(slot)) return all[slot];
+      }
+      if (all.containsKey(subKey)) return all[subKey];
+      if (subKey != 'default' && all.containsKey('default')) return all['default'];
+      return null;
     },
     DartActions.saveProfile: (args) async {
-      final all = await profiles.read<Map<String, dynamic>>(<String, dynamic>{});
-      all['${args['name']}'] = args['profile'];
-      await profiles.write(all);
-      return true;
+      try {
+        final subKey = await activeProfileSubKey();
+        final all = Map<String, dynamic>.of(await profiles.read<Map<String, dynamic>>(<String, dynamic>{}));
+        if (all.containsKey('null') && all['null'] == null) {
+          all.remove('null');
+        }
+        final slot = args['name'];
+        if (slot is String && slot.isNotEmpty && args.containsKey('profile') && args.length == 2) {
+          all['$subKey:$slot'] = args['profile'];
+        } else if (args.length == 1 && args.containsKey('value')) {
+          all[subKey] = args['value'];
+        } else if (args.length == 1 && args.containsKey('profile')) {
+          final inner = args['profile'];
+          final prev = all[subKey];
+          if (inner is Map && inner.isNotEmpty && prev is Map) {
+            all[subKey] = {...prev.cast<String, dynamic>(), ...inner.cast<String, dynamic>()};
+          } else {
+            all[subKey] = inner;
+          }
+        } else {
+          final incoming = Map<String, dynamic>.of(args);
+          final prev = all[subKey];
+          if (incoming.isNotEmpty && prev is Map) {
+            all[subKey] = {...prev.cast<String, dynamic>(), ...incoming};
+          } else {
+            all[subKey] = incoming;
+          }
+        }
+        await profiles.write(all);
+        return true;
+      } catch (e) {
+        final msg = '持久化订阅 profile 失败: $e';
+        debugPrint(msg);
+        ref.read(nodeBridgeProvider).logDiagnostic(msg);
+        rethrow;
+      }
     },
     DartActions.openVodDetail: (args) async {
       final id = str(args, ['id', 'vodId', 'vod_id']);
@@ -462,7 +514,10 @@ final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCal
     },
   });
   // Logged to the device log (shape only, see DartCallbackServer.log) so the request format scripts use can be checked.
-  server.log = (line) => debugPrint(line);
+  server.log = (line) {
+    debugPrint(line);
+    ref.read(nodeBridgeProvider).logDiagnostic(line);
+  };
   ref.onDispose(server.stop);
   return server;
 });

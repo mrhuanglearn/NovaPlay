@@ -1,6 +1,9 @@
 import Darwin
 import Foundation
+import os
 import Security
+
+private let proxyUsbLog = Logger(subsystem: "app.novaplay.player", category: "proxy")
 
 enum IosStreamContainer: String {
   case hls = "hls"
@@ -594,6 +597,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     serverFd = fd
     boundPort = port
     lock.unlock()
+    proxyUsbLog.notice("[NovaPlay][Proxy] listening on 127.0.0.1:\(port, privacy: .public)")
 
     Thread.detachNewThread { [weak self] in
       self?.acceptLoop(srvFd: fd)
@@ -710,6 +714,17 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
       }
       finished = true
       stateLock.unlock()
+      let host = result.finalURL?.host ?? session.rootURL.host ?? "-"
+      let ext = (result.finalURL?.pathExtension.isEmpty == false
+        ? result.finalURL?.pathExtension
+        : session.rootURL.pathExtension) ?? ""
+      let codeStr = result.statusCode.map(String.init) ?? "nil"
+      let mimeStr = result.contentType ?? "-"
+      let containerStr = result.container.rawValue
+      let errStr = result.errorDescription ?? "-"
+      proxyUsbLog.notice(
+        "[NovaPlay][Proxy] probe host=\(host, privacy: .public) ext=\(ext, privacy: .public) status=\(codeStr, privacy: .public) mime=\(mimeStr, privacy: .public) container=\(containerStr, privacy: .public) err=\(errStr, privacy: .public)"
+      )
       DispatchQueue.main.async {
         completion(result)
       }

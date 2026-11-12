@@ -1,11 +1,14 @@
 import AVFoundation
 import AVKit
 import CoreImage
+import os
 import Photos
 import UIKit
 #if canImport(MobileVLCKit)
 import MobileVLCKit
 #endif
+
+private let playerUsbLog = Logger(subsystem: "app.novaplay.player", category: "player")
 
 struct IosTrackOption {
   let index: Int
@@ -465,6 +468,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     let (parsedURL, effectiveHeaders) = IosUrlSanitizer.normalizeUrlAndHeaders(rawUrl: url, headers: headers)
     guard let mediaURL = parsedURL else {
       let msg = IosPlayerUiText.t("无效的播放地址", "Invalid playback URL")
+      playerUsbLog.error("[NovaPlay][Player] invalid playback URL")
       lastDiagnosticReport = "\(msg)\nrawUrl=\(url.prefix(240))"
       delegate?.kernelDidFail(message: msg, code: -1)
       return
@@ -475,6 +479,13 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
     loadSidecarSubtitles(subtitles, headers: effectiveHeaders)
 
     let scheme = (mediaURL.scheme ?? "").lowercased()
+    let targetHost = mediaURL.isFileURL ? "local-file" : (mediaURL.host ?? "-")
+    let targetExt = mediaURL.pathExtension.lowercased()
+    let headerKeys = effectiveHeaders.keys.sorted().joined(separator: ",")
+    let activeBackend = activeKernelId
+    playerUsbLog.notice(
+      "[NovaPlay][Player] load backend=\(activeBackend, privacy: .public) scheme=\(scheme, privacy: .public) host=\(targetHost, privacy: .public) ext=\(targetExt, privacy: .public) startMs=\(startMs, privacy: .public) headerKeys=[\(headerKeys, privacy: .public)]"
+    )
     if mediaURL.isFileURL {
       activeLoad = ActiveLoadContext(
         generation: gen,
@@ -921,6 +932,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
             if !self.didAutoFallbackToVlc,
                let ctx = self.activeLoad,
                ctx.generation == self.loadGeneration {
+              playerUsbLog.notice("[NovaPlay][Player] AVPlayer video track unplayable -> fallback to VLC")
               self.didAutoFallbackToVlc = true
               self.lastAvFailedRawUrl = ctx.rawUrl
               self.lastAvFailureSummary = "AVAssetTrack.isPlayable=false"
@@ -948,6 +960,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
             }
           }
           self.inspectAvTrackMetadata(on: it)
+          let codec = self.videoCodecName ?? "unknown"
+          playerUsbLog.notice("[NovaPlay][Player] AVPlayer readyToPlay codec=\(codec, privacy: .public)")
           self.applyAvPreferredTracks(on: it)
           if startMs > 0 {
             let target = CMTime(value: startMs, timescale: 1000)
@@ -968,6 +982,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate {
           }
         case .failed:
           let (shortMsg, fullDiag, code) = self.describeAvFailure(item: it)
+          let safeDiag = fullDiag.replacingOccurrences(of: "\n", with: " | ")
+          playerUsbLog.error("[NovaPlay][Player] AVPlayer failed: \(safeDiag, privacy: .public)")
           #if canImport(MobileVLCKit)
           if !self.didAutoFallbackToVlc,
              let ctx = self.activeLoad,
@@ -1641,6 +1657,11 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
           self.updateState("buffering")
         }
       case .playing:
+        if self.state != "playing" {
+          let viaProxy = self.vlcLoadedViaProxy
+          let hw = self.hwDecode
+          playerUsbLog.notice("[NovaPlay][Player] VLC playing viaProxy=\(viaProxy, privacy: .public) hw=\(hw, privacy: .public)")
+        }
         if !self.vlcAppliedInitialSeek && self.vlcPendingStartMs > 0 {
           self.vlcAppliedInitialSeek = true
           player.time = VLCTime(number: NSNumber(value: self.vlcPendingStartMs))
@@ -1659,6 +1680,7 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
            self.vlcLoadedViaProxy,
            let ctx = self.activeLoad,
            ctx.generation == self.loadGeneration {
+          playerUsbLog.notice("[NovaPlay][Player] VLC proxy open failed -> retrying direct upstream")
           self.vlcRetriedDirect = true
           let resumeAt = max(ctx.startMs, self.positionMs)
           self.loadWithVlcPlayer(
@@ -1685,6 +1707,7 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
             msg += " (\(proxyDiag))"
           }
         }
+        playerUsbLog.error("[NovaPlay][Player] VLC failed: \(msg, privacy: .public)")
         var reportLines: [String] = [msg]
         if let avFail = self.lastAvFailureSummary {
           reportLines.append("AVPlayer: \(avFail)")

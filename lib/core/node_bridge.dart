@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 
 import 'package:flutter/services.dart';
 
@@ -17,6 +18,9 @@ abstract class NodeBridge {
 
   /// Messages Node sent on [channel].
   Stream<String> listen(String channel);
+
+  /// Emits a pre-redacted diagnostic line to native OS logging (used on iOS Release builds over USB syslog).
+  void logDiagnostic(String message) {}
 }
 
 class MethodChannelNodeBridge implements NodeBridge {
@@ -39,5 +43,11 @@ class MethodChannelNodeBridge implements NodeBridge {
   Stream<String> listen(String channel) {
     _shared ??= _events.receiveBroadcastStream().cast<Map<Object?, Object?>>().asBroadcastStream();
     return _shared!.where((e) => e['channel'] == channel).map((e) => e['message'] as String);
+  }
+
+  @override
+  void logDiagnostic(String message) {
+    if (!Platform.isIOS) return;
+    unawaited(_method.invokeMethod<void>('log', {'message': message}).catchError((Object _) {}));
   }
 }

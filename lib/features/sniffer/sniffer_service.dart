@@ -35,9 +35,17 @@ class SnifferService {
 
   Future<String> _loadScript() async => _script ??= await rootBundle.loadString('assets/scripts/sniffer_inject.js');
 
-  /// Settings for the interactive sniffer page / headless run.
+  /// Settings for the interactive sniffer page / `/website` config page / headless run.
+  ///
+  /// `sharedCookiesEnabled`, `domStorageEnabled`, `databaseEnabled`, and `thirdPartyCookiesEnabled` ensure cookies
+  /// and login state set inside `/website` or cloud-drive QR pages on iOS `WKWebView` sync immediately to persistent
+  /// `HTTPCookieStorage.shared` rather than remaining only in `WebKit.Networking`'s volatile RAM cache on force-quit.
   InAppWebViewSettings get webViewSettings => InAppWebViewSettings(
         javaScriptEnabled: true,
+        domStorageEnabled: true,
+        databaseEnabled: true,
+        sharedCookiesEnabled: true,
+        thirdPartyCookiesEnabled: true,
         mediaPlaybackRequiresUserGesture: false,
         useShouldInterceptRequest: true, // Android: lets us see every sub-resource request
         useOnLoadResource: true,
