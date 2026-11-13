@@ -16,6 +16,12 @@ import 'widgets.dart';
 String _stripCatpawTags(String raw) =>
     raw.replaceAll(RegExp(r'\[a=cr:\{[^}]*\}/\]'), '').replaceAll('[/a]', '').trim();
 
+abstract final class DetailScreenRetry {
+  /// Minimum time the spinner stays after 「重新加载」, so a request that fails at once (no network) still shows the
+  /// page is working instead of looking like the tap did nothing.
+  static const minSpinner = Duration(milliseconds: 600);
+}
+
 class DetailScreen extends ConsumerStatefulWidget {
   const DetailScreen({super.key, required this.vodId, this.siteKey});
   final String vodId;
@@ -50,6 +56,29 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
 
   /// The user picked a line before the history was read: keep theirs.
   bool _lineTouched = false;
+
+  /// 「重新加载」 is running: the page shows the spinner instead of the previous error.
+  bool _retrying = false;
+
+  /// Riverpod keeps showing the previous error while an invalidated provider refetches (`skipLoadingOnRefresh`), and an
+  /// offline request fails within milliseconds, so before 2026-11-13 「重新加载」 looked dead. Now it shows the spinner
+  /// for at least [DetailScreenRetry.minSpinner], and also reloads the subscription runtime when that is what failed.
+  Future<void> _retry() async {
+    if (_retrying) return;
+    setState(() => _retrying = true);
+    final started = DateTime.now();
+    final query = (siteKey: widget.siteKey, vodId: widget.vodId);
+    if (ref.read(catpawRuntimeProvider).hasError) ref.invalidate(catpawRuntimeProvider);
+    ref.invalidate(videoDetailProvider(query));
+    try {
+      await ref.read(videoDetailProvider(query).future);
+    } catch (_) {
+      // The error is shown by the page itself.
+    }
+    final rest = DetailScreenRetry.minSpinner - DateTime.now().difference(started);
+    if (rest > Duration.zero) await Future<void>.delayed(rest);
+    if (mounted) setState(() => _retrying = false);
+  }
 
   Future<void> _play(VodDetail detail, int episode) async {
     final rt = ref.read(catpawRuntimeProvider).valueOrNull;
@@ -441,11 +470,12 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
           ),
         ],
       ),
-      body: detail.when(
+      body: _retrying && !detail.hasValue
+          ? const Center(child: CircularProgressIndicator())
+          : detail.when(
+        skipLoadingOnRefresh: false,
         loading: () => const Center(child: CircularProgressIndicator()),
-        error: (e, _) => ErrorState(
-            error: e,
-            onRetry: () => ref.invalidate(videoDetailProvider((siteKey: widget.siteKey, vodId: widget.vodId)))),
+        error: (e, _) => ErrorState(error: e, onRetry: _retry),
         data: (d) {
           if (d == null) return EmptyState(icon: Icons.search_off, title: l.notFound);
           final overview =
