@@ -84,7 +84,7 @@ class NodeBridgePlugin private constructor(private val context: Context) :
 /** The process-wide Node runtime and its loopback connection. Events go to the engine that attached last. */
 internal object NodeHost {
     private var listener: NodeBridgePlugin? = null
-    private var session: LoopbackBridgeSession? = null
+    internal var session: LoopbackBridgeSession? = null
     private var started = false
     private var firstFailure: String? = null
 
@@ -181,7 +181,11 @@ internal object NodeHost {
     fun send(line: String, done: (Pair<String, String>?) -> Unit) {
         sender.execute {
             val current = synchronized(this) { session }
-            val failure = current?.writeLine(line) ?: ("not_connected" to "Node runtime is not connected")
+            val failure = if (current == null) {
+                "not_connected" to "Node runtime is not connected"
+            } else {
+                current.writeLine(line)
+            }
             done(failure)
         }
     }

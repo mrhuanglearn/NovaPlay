@@ -62,9 +62,19 @@ class NodeBridgeServerTest {
             while (received.isEmpty() && System.currentTimeMillis() < deadline) Thread.sleep(15)
             assertEquals(listOf("status" to "Node ready, version v20"), received.toList())
 
-            // Server -> Node write works
-            assertNull(server.writeLine("{\"c\":\"catpaw\",\"m\":\"ping\"}\n"))
+            // Server -> Node write through NodeHost.send delivers null failure on success
+            synchronized(NodeHost) { NodeHost.session = server }
+            val sendRes = java.util.concurrent.CompletableFuture<Pair<String, String>?>()
+            NodeHost.send("{\"c\":\"catpaw\",\"m\":\"ping\"}\n") { sendRes.complete(it) }
+            assertNull(sendRes.get(2, TimeUnit.SECONDS))
             assertEquals("{\"c\":\"catpaw\",\"m\":\"ping\"}", r1.readLine())
+
+            // When session is absent, NodeHost.send reports not_connected
+            synchronized(NodeHost) { NodeHost.session = null }
+            val noSessionRes = java.util.concurrent.CompletableFuture<Pair<String, String>?>()
+            NodeHost.send("{\"c\":\"catpaw\",\"m\":\"ping\"}\n") { noSessionRes.complete(it) }
+            assertEquals("not_connected", noSessionRes.get(2, TimeUnit.SECONDS)?.first)
+            synchronized(NodeHost) { NodeHost.session = server }
 
             // 3. First socket drops during idle -> Node reconnects to the SAME ServerSocket
             first.close()
@@ -79,10 +89,13 @@ class NodeBridgeServerTest {
 
                 readyCount.await(2, TimeUnit.SECONDS)
                 assertEquals(2, received.count { it.first == "status" && it.second.startsWith("Node ready") })
-                assertNull(server.writeLine("{\"c\":\"catpaw\",\"m\":\"reload\"}\n"))
+                val reloadRes = java.util.concurrent.CompletableFuture<Pair<String, String>?>()
+                NodeHost.send("{\"c\":\"catpaw\",\"m\":\"reload\"}\n") { reloadRes.complete(it) }
+                assertNull(reloadRes.get(2, TimeUnit.SECONDS))
                 assertEquals("{\"c\":\"catpaw\",\"m\":\"reload\"}", r2.readLine())
             }
         } finally {
+            synchronized(NodeHost) { NodeHost.session = null }
             srv.close()
             acceptThread.join(1000)
         }
