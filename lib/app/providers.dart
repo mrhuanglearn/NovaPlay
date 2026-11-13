@@ -14,6 +14,7 @@ import '../core/json_store.dart';
 import '../core/node_bridge.dart';
 import '../features/catpaw/catpaw_client.dart';
 import '../features/catpaw/catpaw_protocol.dart';
+import '../features/catpaw/catpaw_recovery.dart';
 import '../features/catpaw/dart_callback_server.dart';
 import '../features/catpaw/manager_client.dart';
 import '../features/backup/backup_service.dart';
@@ -178,6 +179,74 @@ class SpiderRuntime {
 
 String? _lastRunningCatpawSubKey;
 
+Future<String?> _prepareSubscriptionProfilePath(Ref ref, Subscription sub) async {
+  try {
+    final profileStore = ref.read(subscriptionProfilesStoreProvider);
+    final allProfiles = Map<String, dynamic>.of(await profileStore.read<Map<String, dynamic>>(<String, dynamic>{}));
+    final rawEntry = allProfiles[sub.key] ?? allProfiles['default'];
+    final sanitized = sanitizeSubscriptionProfile(rawEntry);
+    if (rawEntry != null && jsonEncode(sanitized) != jsonEncode(rawEntry)) {
+      allProfiles[sub.key] = sanitized;
+      await profileStore.write(allProfiles);
+    }
+    final baseDir = await profileStore.resolveBaseDir();
+    final safeSubName = sub.key.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
+    final profileDir = Directory(p.join(baseDir.path, 'subscription_profiles'));
+    await profileDir.create(recursive: true);
+    final pf = File(p.join(profileDir.path, '$safeSubName.json'));
+    if (!await pf.exists() || sanitized != null) {
+      final seed = sanitized is Map ? sanitized : (sanitized ?? <String, dynamic>{});
+      final tmp = File('${pf.path}.tmp');
+      await tmp.writeAsString(jsonEncode(seed), flush: true);
+      await tmp.rename(pf.path);
+    }
+    return pf.path;
+  } catch (_) {
+    return null;
+  }
+}
+
+/// Supervises the active local CatPaw instance across idle/background resume and connection drops.
+final catpawSupervisorProvider = Provider<CatpawSupervisor>((ref) {
+  return CatpawSupervisor(
+    catpaw: ref.watch(catpawClientProvider),
+    callbackServer: ref.watch(dartCallbackServerProvider),
+    activeSubscription: () async {
+      final subs = await ref.read(subscriptionsProvider.future);
+      if (subs.isEmpty) return null;
+      final key = await ref.read(activeSubscriptionKeyProvider.future);
+      return subs.firstWhere((s) => s.key == key, orElse: () => subs.first);
+    },
+    currentApi: () => ref.read(catpawRuntimeProvider).valueOrNull?.api,
+    isRuntimeStarting: () => ref.read(catpawRuntimeProvider).isLoading,
+    restartInstance: (sub) async {
+      final installed = ref.read(catpawRuntimeProvider).valueOrNull == null
+          ? null
+          : await ref.read(subscriptionInstallerProvider).installedScript(sub);
+      if (installed == null) {
+        ref.invalidate(catpawRuntimeProvider);
+        return (await ref.read(catpawRuntimeProvider.future))?.api.port;
+      }
+      final catpaw = ref.read(catpawClientProvider);
+      await catpaw.attach();
+      await catpaw.setDartPort(await ref.read(dartCallbackServerProvider).ensureRunning());
+      final profileFilePath = await _prepareSubscriptionProfilePath(ref, sub);
+      _lastRunningCatpawSubKey = sub.key;
+      return catpaw.startAndWait(
+        name: sub.key,
+        scriptPath: installed.scriptPath,
+        configPath: installed.configPath,
+        force: true,
+        env: profileFilePath == null ? null : {'profile_path': profileFilePath},
+      );
+    },
+    log: (msg) {
+      debugPrint(msg);
+      ref.read(nodeBridgeProvider).logDiagnostic(msg);
+    },
+  );
+});
+
 /// Installs the active subscription's script (if needed), starts it in the Node runtime and loads its sites.
 /// Cloud subscriptions skip the local runtime and talk to the given address directly.
 final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<SpiderRuntime?>((ref) async {
@@ -214,7 +283,7 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
     } catch (_) {}
   }
   // Scripts reach the app through this loopback server; the port must be announced before the script starts.
-  await catpaw.setDartPort(await ref.watch(dartCallbackServerProvider).start());
+  await catpaw.setDartPort(await ref.watch(dartCallbackServerProvider).ensureRunning());
   final installer = ref.watch(subscriptionInstallerProvider);
   var installed = await installer.installedScript(sub); // reuse: no network needed on later launches
   if (installed != null && sub.autoUpdate) {
@@ -234,31 +303,7 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
   }
   final int port;
   try {
-    String? profileFilePath;
-    try {
-      final profileStore = ref.read(subscriptionProfilesStoreProvider);
-      final allProfiles = Map<String, dynamic>.of(await profileStore.read<Map<String, dynamic>>(<String, dynamic>{}));
-      final rawEntry = allProfiles[sub.key] ?? allProfiles['default'];
-      final sanitized = sanitizeSubscriptionProfile(rawEntry);
-      if (rawEntry != null && jsonEncode(sanitized) != jsonEncode(rawEntry)) {
-        allProfiles[sub.key] = sanitized;
-        await profileStore.write(allProfiles);
-      }
-      final baseDir = await profileStore.resolveBaseDir();
-      final safeSubName = sub.key.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
-      final profileDir = Directory(p.join(baseDir.path, 'subscription_profiles'));
-      await profileDir.create(recursive: true);
-      final pf = File(p.join(profileDir.path, '$safeSubName.json'));
-      if (!await pf.exists() || sanitized != null) {
-        final seed = sanitized is Map ? sanitized : (sanitized ?? <String, dynamic>{});
-        final tmp = File('${pf.path}.tmp');
-        await tmp.writeAsString(jsonEncode(seed), flush: true);
-        await tmp.rename(pf.path);
-      }
-      profileFilePath = pf.path;
-    } catch (_) {
-      profileFilePath = null;
-    }
+    final profileFilePath = await _prepareSubscriptionProfilePath(ref, sub);
     _lastRunningCatpawSubKey = sub.key;
     port = await catpaw.startAndWait(
       name: sub.key,
@@ -275,7 +320,11 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
   if (freshlyInstalled) {
     ref.invalidate(subscriptionsProvider); // the subscriptions page shows the new 上次更新 / 内容指纹
   }
-  final api = SpiderApi(port, receiveTimeout: ref.read(appPreferencesProvider).catpawTimeout);
+  final api = SpiderApi(
+    port,
+    receiveTimeout: ref.read(appPreferencesProvider).catpawTimeout,
+    onConnectionErrorRecover: () => ref.read(catpawSupervisorProvider).recoverNow(),
+  );
   return SpiderRuntime(subscription: sub, api: api, sites: await api.sites());
 });
 

@@ -30,7 +30,7 @@ async function main(env = process.env, argv = process.argv.slice(2), { exit = ()
   if (!port || !token || !dataDir) {
     throw new Error('--bridge-port, --bridge-token and --data-dir (or UZV_BRIDGE_PORT, UZV_BRIDGE_TOKEN, UZV_DATA_DIR) are required');
   }
-  const { bridge, close } = await connectTcpBridge({ port, token, dataDir });
+  const { bridge, close } = await connectTcpBridge({ port, token, dataDir, reconnect: true });
   const host = startHost({ bridge });
   bridge.onClose(async () => { await host.dispose(); close(); exit(0); });
   return host;

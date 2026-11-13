@@ -1,4 +1,5 @@
 import 'package:flutter/foundation.dart' show TargetPlatform, defaultTargetPlatform;
+import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../../core/haptics.dart';
 import '../../core/json_store.dart';
@@ -107,8 +108,25 @@ class PlayerLauncher {
     this.describeError,
     NativePlayerHostApi? host,
     PlayerSessionRouter? router,
+    this.installRouter = true,
+    Future<void> Function()? enableWakelock,
+    Future<void> Function()? disableWakelock,
   })  : host = host ?? NativePlayerHostApi(),
-        router = router ?? PlayerSessionRouter.shared;
+        router = router ?? PlayerSessionRouter.shared,
+        _enableWakelock = enableWakelock ?? _defaultEnableWakelock,
+        _disableWakelock = disableWakelock ?? _defaultDisableWakelock;
+
+  static Future<void> _defaultEnableWakelock() async {
+    try {
+      await WakelockPlus.enable();
+    } catch (_) {}
+  }
+
+  static Future<void> _defaultDisableWakelock() async {
+    try {
+      await WakelockPlus.disable();
+    } catch (_) {}
+  }
 
   final PlayerConfigRepository configs;
   final SnifferService sniffer;
@@ -123,6 +141,9 @@ class PlayerLauncher {
   final String Function(Object error)? describeError;
   final NativePlayerHostApi host;
   final PlayerSessionRouter router;
+  final bool installRouter;
+  final Future<void> Function() _enableWakelock;
+  final Future<void> Function() _disableWakelock;
 
   Future<PageClosedEvent> playSource(
     PlaybackSource source, {
@@ -142,10 +163,10 @@ class PlayerLauncher {
       onPreferences: (r) => configs.saveReport(r),
       describeError: describeError ?? (e) => '$e',
     );
-    router
-      ..install()
-      ..register(session);
+    if (installRouter) router.install();
+    router.register(session);
     onSession?.call(session);
+    await _enableWakelock();
     try {
       await session.open(
         playback: playback,
@@ -161,6 +182,9 @@ class PlayerLauncher {
     } finally {
       router.unregister(session);
       onSession?.call(router.latest); // another player may still be open (e.g. one in picture-in-picture)
+      if (router.latest == null) {
+        await _disableWakelock();
+      }
     }
   }
 

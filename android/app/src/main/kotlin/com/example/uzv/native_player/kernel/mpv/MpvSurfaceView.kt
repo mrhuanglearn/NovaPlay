@@ -47,6 +47,8 @@ class MpvSurfaceView(
     }
 
     init {
+        keepScreenOn = true
+        holder.setKeepScreenOn(true)
         setEGLContextClientVersion(3) // mpv's OpenGL back end needs ES 3.0 for most of its shaders
         setEGLConfigChooser(8, 8, 8, 0, 0, 0)
         preserveEGLContextOnPause = true

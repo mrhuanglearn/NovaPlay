@@ -416,6 +416,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     super.init()
     configureAudioSession()
     avPlayer.automaticallyWaitsToMinimizeStalling = true
+    avPlayer.preventsDisplaySleepDuringVideoPlayback = true
     videoView.bind(avPlayer: avPlayer)
     setupPictureInPictureIfSupported()
     setupAppLifecycleObservers()
@@ -1094,6 +1095,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     videoOutput = output
 
     observeAvItem(item, startMs: startMs)
+    avPlayer.preventsDisplaySleepDuringVideoPlayback = true
     avPlayer.replaceCurrentItem(with: item)
 
     secondaryAudioPlayer?.pause()

@@ -5,6 +5,7 @@ import 'package:flutter_localizations/flutter_localizations.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'app/app_preferences.dart';
+import 'app/providers.dart';
 import 'app/router.dart';
 import 'app/theme.dart';
 import 'app/ui_hooks.dart';
@@ -60,11 +61,35 @@ Future<void> _startupWebDavSync() async {
   }
 }
 
-class UzvApp extends ConsumerWidget {
+class UzvApp extends ConsumerStatefulWidget {
   const UzvApp({super.key});
 
   @override
-  Widget build(BuildContext context, WidgetRef ref) {
+  ConsumerState<UzvApp> createState() => _UzvAppState();
+}
+
+class _UzvAppState extends ConsumerState<UzvApp> with WidgetsBindingObserver {
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      unawaited(ref.read(catpawSupervisorProvider).onAppResumed());
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final prefs = ref.watch(appPreferencesProvider);
     final fontFamily = ref.watch(fontSettingsProvider).fontFamily;
     return MaterialApp.router(

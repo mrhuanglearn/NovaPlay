@@ -62,6 +62,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   private var controlsVisible: Bool = true
   private var screenLocked: Bool = false
   private var dismissedForPiP: Bool = false
+  var isDismissedForPiP: Bool { dismissedForPiP }
   private var seekWaitUntil: TimeInterval = 0
 
   private var hideControlsWorkItem: DispatchWorkItem?
@@ -220,6 +221,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     dismissedForPiP = false
     attachVideoViewToPlayerIfNeeded()
     controller.kernel.setAutomaticPipInlineAllowed(true)
+    NativePlayerHost.shared.syncIdleTimer(forceReassert: true)
     applyOrientationStep()
     rebuildControlsIfNeeded(force: builtForLandscape == nil)
     showControls()
@@ -252,6 +254,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
       skipCountdownTimer?.invalidate()
       controller.close(completed: false, dismissVC: false)
     }
+    NativePlayerHost.shared.syncIdleTimer()
   }
 
   override func viewDidLayoutSubviews() {
@@ -2136,6 +2139,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     dismissedForPiP = true
     controller.kernel.setAutomaticPipInlineAllowed(false)
     NativePlayerHost.shared.parkVideoViewForInAppPiP(controller.kernel.videoView)
+    NativePlayerHost.shared.syncIdleTimer()
     restorePortraitBeforeExit()
     if presentingViewController != nil {
       let isActive = UIApplication.shared.applicationState == .active
@@ -2153,6 +2157,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     dismissedForPiP = false
     attachVideoViewToPlayerIfNeeded()
     controller.kernel.setAutomaticPipInlineAllowed(true)
+    NativePlayerHost.shared.syncIdleTimer(forceReassert: true)
     if presentingViewController != nil {
       completion(true)
       return

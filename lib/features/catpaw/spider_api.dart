@@ -49,16 +49,36 @@ class SpiderApi {
   /// [baseUrl] defaults to the local runtime; pass the subscription's address for a cloud catpaw service
   /// (`http://ip:9321` or `http://ip:9321/TOKEN`).
   /// [receiveTimeout] is 功能设置 → catpaw 服务超时 (OBSERVED default 15 s).
-  SpiderApi(this.port, {Dio? dio, String? baseUrl, Duration receiveTimeout = const Duration(seconds: 15)})
-      : _dio = dio ??
+  SpiderApi(
+    int port, {
+    Dio? dio,
+    String? baseUrl,
+    Duration receiveTimeout = const Duration(seconds: 15),
+    this.onConnectionErrorRecover,
+  })  : _port = port,
+        _isLocal = baseUrl == null,
+        _dio = dio ??
             Dio(BaseOptions(
               baseUrl: (baseUrl ?? 'http://127.0.0.1:$port').replaceAll(RegExp(r'/+$'), ''),
               connectTimeout: const Duration(seconds: 10),
               receiveTimeout: receiveTimeout,
             ));
 
-  final int port;
+  int _port;
+  final bool _isLocal;
   final Dio _dio;
+
+  /// Optional single-flight recovery callback for local CatPaw instances when the loopback socket/worker died while idle.
+  final Future<int?> Function()? onConnectionErrorRecover;
+
+  int get port => _port;
+
+  /// Updates the local loopback port (e.g. after `reload` or worker restart stepped to a new free port).
+  void updateLocalPort(int nextPort) {
+    if (!_isLocal || nextPort <= 0) return;
+    _port = nextPort;
+    _dio.options.baseUrl = 'http://127.0.0.1:$nextPort';
+  }
 
   /// Address of the spider server (`http://127.0.0.1:<port>` or the cloud service's address), without a trailing `/`.
   String get baseUrl => _dio.options.baseUrl;
@@ -68,8 +88,47 @@ class SpiderApi {
   /// Applies a new 服务超时 to the next requests without rebuilding the client.
   set receiveTimeout(Duration? value) => _dio.options.receiveTimeout = value;
 
+  /// Lightweight health probe (`GET /config`) used when resuming from idle/background.
+  Future<bool> probe({Duration timeout = const Duration(milliseconds: 2500)}) async {
+    try {
+      final res = await _dio.get<Object?>(
+        '/config',
+        options: Options(sendTimeout: timeout, receiveTimeout: timeout),
+      );
+      final code = res.statusCode ?? 0;
+      return code >= 200 && code < 500;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  /// Probes local `/config` and runs [onConnectionErrorRecover] if dead before non-Dio callers (e.g. WebView) open [baseUrl].
+  Future<void> ensureHealthy() async {
+    final recover = onConnectionErrorRecover;
+    if (recover == null || await probe()) return;
+    final nextPort = await recover();
+    if (nextPort != null) updateLocalPort(nextPort);
+  }
+
+  Future<Response<T>> _withRecovery<T>(Future<Response<T>> Function() request) async {
+    try {
+      return await request();
+    } on DioException catch (e) {
+      final recover = onConnectionErrorRecover;
+      if (recover != null &&
+          (e.type == DioExceptionType.connectionError || e.type == DioExceptionType.connectionTimeout)) {
+        final nextPort = await recover();
+        if (nextPort != null) {
+          updateLocalPort(nextPort);
+          return await request();
+        }
+      }
+      rethrow;
+    }
+  }
+
   Future<List<SpiderSite>> sites() async {
-    final res = await _dio.get<Map<String, dynamic>>('/config');
+    final res = await _withRecovery(() => _dio.get<Map<String, dynamic>>('/config'));
     final video = (res.data?['video'] as Map?)?.cast<String, dynamic>();
     return ((video?['sites'] as List?) ?? const [])
         .whereType<Map>()
@@ -78,7 +137,7 @@ class SpiderApi {
   }
 
   Future<Map<String, dynamic>> _post(SpiderSite site, String op, [Map<String, Object?> body = const {}]) async {
-    final res = await _dio.post<Map<String, dynamic>>('${site.api}/$op', data: body);
+    final res = await _withRecovery(() => _dio.post<Map<String, dynamic>>('${site.api}/$op', data: body));
     return res.data ?? const {};
   }
 

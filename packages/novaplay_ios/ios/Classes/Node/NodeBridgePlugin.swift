@@ -125,7 +125,9 @@ private final class NodeHostIos {
 
   private let lock = NSLock()
   private weak var listener: NodeBridgePlugin?
+  private var serverFd: Int32 = -1
   private var clientFd: Int32 = -1
+  private var nodeRunning = false
   private var started = false
   private var readyLine: String?
   private var firstFailure: String?
@@ -190,11 +192,25 @@ private final class NodeHostIos {
     }
 
     let (srvFd, port) = try openLoopbackServer()
-    let dataDir = try prepareDataDirectory()
+    let dataDir: String
+    do {
+      dataDir = try prepareDataDirectory()
+    } catch {
+      Darwin.close(srvFd)
+      lock.lock()
+      started = false
+      lock.unlock()
+      throw error
+    }
     let mainJsPath = projectDir.appendingPathComponent("src/main.js").path
 
+    lock.lock()
+    serverFd = srvFd
+    nodeRunning = true
+    lock.unlock()
+
     Thread.detachNewThread { [weak self] in
-      self?.acceptLoop(srvFd: srvFd)
+      self?.acceptLoop(initialSrvFd: srvFd, port: port)
     }
 
     Thread.detachNewThread { [weak self] in
@@ -238,18 +254,31 @@ private final class NodeHostIos {
       if rc < 0 {
         let detail = String(cString: errBuf)
         self.lock.lock()
+        self.nodeRunning = false
         self.started = false
+        let srvToClose = self.serverFd
+        self.serverFd = -1
+        let cliToClose = self.clientFd
+        self.clientFd = -1
         let reason = detail.isEmpty ? (self.firstFailure ?? "start code \(rc)") : detail
         if self.firstFailure == nil { self.firstFailure = reason }
         self.lock.unlock()
-        Darwin.close(srvFd)
+        if srvToClose >= 0 { Darwin.close(srvToClose) }
+        if cliToClose >= 0 { Darwin.close(cliToClose) }
         self.emitStatus("Node runtime failed: \(reason)")
         return
       }
 
       self.lock.lock()
+      self.nodeRunning = false
       self.readyLine = nil
+      let srvToClose = self.serverFd
+      self.serverFd = -1
+      let cliToClose = self.clientFd
+      self.clientFd = -1
       self.lock.unlock()
+      if srvToClose >= 0 { Darwin.close(srvToClose) }
+      if cliToClose >= 0 { Darwin.close(cliToClose) }
       self.emitStatus("Node runtime exited with code \(rc)")
     }
   }
@@ -270,8 +299,16 @@ private final class NodeHostIos {
         var written = 0
         while written < rawBuf.count {
           let n = Darwin.write(fd, base.advanced(by: written), rawBuf.count - written)
-          if n <= 0 {
-            return ("send_failed", String(cString: strerror(errno)))
+          if n < 0 {
+            let err = errno
+            if err == EINTR || err == EAGAIN {
+              Thread.sleep(forTimeInterval: 0.005)
+              continue
+            }
+            return ("send_failed", String(cString: strerror(err)))
+          }
+          if n == 0 {
+            return ("send_failed", "EOF")
           }
           written += n
         }
@@ -281,18 +318,19 @@ private final class NodeHostIos {
     }
   }
 
-  private func openLoopbackServer() throws -> (Int32, UInt16) {
+  private func openLoopbackServer(preferredPort: UInt16 = 0) throws -> (Int32, UInt16) {
     let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
     guard fd >= 0 else {
       throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "socket() failed"])
     }
     var yes: Int32 = 1
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, socklen_t(MemoryLayout<Int32>.size))
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
 
     var addr = sockaddr_in()
     addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = 0
+    addr.sin_port = preferredPort.bigEndian
     addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
 
     let bindRc = withUnsafePointer(to: &addr) { ptr in
@@ -305,7 +343,7 @@ private final class NodeHostIos {
       Darwin.close(fd)
       throw NSError(domain: NSPOSIXErrorDomain, code: code, userInfo: [NSLocalizedDescriptionKey: "bind(127.0.0.1) failed"])
     }
-    if Darwin.listen(fd, 1) != 0 {
+    if Darwin.listen(fd, 16) != 0 {
       let code = Int(errno)
       Darwin.close(fd)
       throw NSError(domain: NSPOSIXErrorDomain, code: code, userInfo: [NSLocalizedDescriptionKey: "listen() failed"])
@@ -326,18 +364,59 @@ private final class NodeHostIos {
     return (fd, UInt16(bigEndian: bound.sin_port))
   }
 
-  private func acceptLoop(srvFd: Int32) {
-    let connFd = Darwin.accept(srvFd, nil, nil)
-    Darwin.close(srvFd)
-    guard connFd >= 0 else { return }
+  private func isNodeRunning() -> Bool {
+    lock.lock()
+    let active = nodeRunning
+    lock.unlock()
+    return active
+  }
 
+  private func acceptLoop(initialSrvFd: Int32, port: UInt16) {
+    var srvFd = initialSrvFd
+    while isNodeRunning() {
+      let connFd = Darwin.accept(srvFd, nil, nil)
+      if connFd < 0 {
+        let err = errno
+        if !isNodeRunning() { break }
+        if err == EINTR || err == EAGAIN || err == ECONNABORTED {
+          continue
+        }
+        // iOS may invalidate a loopback listening socket across prolonged suspend; rebind the same port for Node reconnect.
+        lock.lock()
+        if serverFd == srvFd { serverFd = -1 }
+        lock.unlock()
+        Darwin.close(srvFd)
+        srvFd = -1
+        while isNodeRunning() {
+          if let (reboundFd, _) = try? openLoopbackServer(preferredPort: port) {
+            lock.lock()
+            if nodeRunning {
+              serverFd = reboundFd
+              srvFd = reboundFd
+              lock.unlock()
+              nodeUsbLog.notice("[NovaPlay][Node] rebound loopback bridge on 127.0.0.1:\(port, privacy: .public)")
+              break
+            }
+            lock.unlock()
+            Darwin.close(reboundFd)
+            return
+          }
+          Thread.sleep(forTimeInterval: 0.2)
+        }
+        if srvFd < 0 { break }
+        continue
+      }
+      serveConnection(connFd: connFd)
+    }
+  }
+
+  private func serveConnection(connFd: Int32) {
     var noSigPipe: Int32 = 1
     setsockopt(connFd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
 
     defer {
       lock.lock()
       if clientFd == connFd { clientFd = -1 }
-      readyLine = nil
       lock.unlock()
       Darwin.close(connFd)
     }
@@ -348,7 +427,14 @@ private final class NodeHostIos {
 
     while true {
       let n = Darwin.read(connFd, &chunk, chunk.count)
-      if n <= 0 { break }
+      if n < 0 {
+        let err = errno
+        if err == EINTR || err == EAGAIN {
+          continue
+        }
+        break
+      }
+      if n == 0 { break }
       buffer.append(contentsOf: chunk[0..<n])
 
       while let nlIndex = buffer.firstIndex(of: 0x0A) {

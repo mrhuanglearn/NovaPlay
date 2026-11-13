@@ -43,13 +43,13 @@ class SiteSwitchSheet extends ConsumerStatefulWidget {
 class _SiteSwitchSheetState extends ConsumerState<SiteSwitchSheet> {
   bool _settings = false;
 
-  void _openWebsite() {
+  Future<void> _openWebsite() async {
     final rt = ref.read(catpawRuntimeProvider).valueOrNull;
     if (rt == null) return;
-    final url = '${rt.api.baseUrl}/website';
-    Navigator.pop(context);
     final page = widget.pageContext;
-    if (page.mounted) page.push(Uri(path: '/website', queryParameters: {'url': url}).toString());
+    Navigator.pop(context);
+    await rt.api.ensureHealthy();
+    if (page.mounted) page.push(Uri(path: '/website', queryParameters: {'url': '${rt.api.baseUrl}/website'}).toString());
   }
 
   @override

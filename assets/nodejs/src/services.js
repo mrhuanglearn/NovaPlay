@@ -72,6 +72,7 @@ function createServiceManager({ bridge, workerEntryPath }) {
     const dataDir = serviceDataDir(name);
     const tempDir = path.join(path.dirname(def.path), 'Temp');
     fs.mkdirSync(tempDir, { recursive: true });
+    let workerRef = null;
     const worker = spawnWorker({
       workerEntryPath,
       name,
@@ -81,9 +82,20 @@ function createServiceManager({ bridge, workerEntryPath }) {
         allowReadDirs: [path.dirname(def.path)], redirectRoot: tempDir, enableNetLog: !!enableNetLog, enableLog,
       },
       onMsg: onMessage(name),
-      onError: (e) => { status(`svc ${name} worker crashed: ${(e && e.message) || e}`); delete running[name]; report(); },
+      onError: (e) => {
+        status(`svc ${name} worker crashed: ${(e && e.message) || e}`);
+        if (running[name] && (!workerRef || running[name].worker === workerRef)) { delete running[name]; report(); }
+      },
+      onExit: (code) => {
+        if (running[name] && (!workerRef || running[name].worker === workerRef)) {
+          status(`svc ${name} worker exited (code=${code})`);
+          delete running[name];
+          report();
+        }
+      },
       onStatus: status,
     });
+    workerRef = worker;
     running[name] = { worker, port: listenPort, dataDir, env: env || {} };
     return running[name];
   }

@@ -10,10 +10,11 @@ final class NativePlayerHost: NativePlayerHostApi {
   private var activeViewController: NativePlayerViewController?
   private weak var pendingForegroundDismissVC: UIViewController?
   private var pipWindowHostView: UIView?
-  private var fgObserver: NSObjectProtocol?
+  private var lifecycleObservers: [NSObjectProtocol] = []
 
   private init() {
-    fgObserver = NotificationCenter.default.addObserver(
+    let nc = NotificationCenter.default
+    let fgObs = nc.addObserver(
       forName: UIApplication.willEnterForegroundNotification,
       object: nil,
       queue: .main
@@ -25,7 +26,23 @@ final class NativePlayerHost: NativePlayerHostApi {
           staleVC.dismiss(animated: false)
         }
       }
+      self.syncIdleTimer(forceReassert: true)
     }
+    let activeObs = nc.addObserver(
+      forName: UIApplication.didBecomeActiveNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.syncIdleTimer(forceReassert: true)
+    }
+    let bgObs = nc.addObserver(
+      forName: UIApplication.didEnterBackgroundNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.syncIdleTimer()
+    }
+    lifecycleObservers = [fgObs, activeObs, bgObs]
   }
 
   func register(with registrar: FlutterPluginRegistrar) {
@@ -71,6 +88,42 @@ final class NativePlayerHost: NativePlayerHostApi {
       removeParkedVideoViewHost()
       activeController = nil
       activeViewController = nil
+    }
+    syncIdleTimer()
+  }
+
+  /// Keeps iOS screen awake across all three kernels (`AVPlayer`, `MPV` `CAMetalLayer`, `MobileVLCKit`)
+  /// whenever the fullscreen player is presented or in-app PiP is actively playing/buffering, and reliably
+  /// restores `isIdleTimerDisabled = false` on session close or backgrounding.
+  func syncIdleTimer(forceReassert: Bool = false) {
+    let apply = { [weak self] in
+      guard let self = self else { return }
+      let appActive = UIApplication.shared.applicationState == .active
+      let shouldKeepAwake: Bool
+      if !appActive {
+        shouldKeepAwake = false
+      } else if let ctrl = self.activeController, !ctrl.isClosed {
+        let vcVisible = self.activeViewController.map { !$0.isDismissedForPiP && !$0.isBeingDismissed } ?? false
+        let activelyPlayingOrBuffering = ctrl.kernel.isPlaying || ctrl.state == "playing" || ctrl.state == "buffering"
+        shouldKeepAwake = vcVisible || activelyPlayingOrBuffering
+      } else {
+        shouldKeepAwake = false
+      }
+      if shouldKeepAwake {
+        if forceReassert && UIApplication.shared.isIdleTimerDisabled {
+          UIApplication.shared.isIdleTimerDisabled = false
+        }
+        if !UIApplication.shared.isIdleTimerDisabled {
+          UIApplication.shared.isIdleTimerDisabled = true
+        }
+      } else if UIApplication.shared.isIdleTimerDisabled {
+        UIApplication.shared.isIdleTimerDisabled = false
+      }
+    }
+    if Thread.isMainThread {
+      apply()
+    } else {
+      DispatchQueue.main.async(execute: apply)
     }
   }
 
@@ -131,9 +184,11 @@ final class NativePlayerHost: NativePlayerHostApi {
         controller.close(completed: false, dismissVC: false)
         return
       }
-      presenter.present(playerVC, animated: true) {
+      presenter.present(playerVC, animated: true) { [weak self] in
         controller.start()
+        self?.syncIdleTimer(forceReassert: true)
       }
+      self.syncIdleTimer()
     }
   }
 

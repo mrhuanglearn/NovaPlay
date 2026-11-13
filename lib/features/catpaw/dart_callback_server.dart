@@ -35,8 +35,36 @@ class DartCallbackServer {
     if (existing != null) return existing.port;
     final server = await HttpServer.bind(InternetAddress.loopbackIPv4, preferredPort ?? 0);
     _server = server;
-    unawaited(server.forEach(_handle));
+    server.listen(
+      _handle,
+      onDone: () {
+        if (identical(_server, server)) _server = null;
+      },
+      cancelOnError: false,
+    );
     return server.port;
+  }
+
+  /// Verifies the loopback listener is still reachable (e.g. after app idle/suspend) and rebinds if closed.
+  Future<int> ensureRunning({int? preferredPort}) async {
+    final existing = _server;
+    if (existing != null) {
+      try {
+        final sock = await Socket.connect(
+          InternetAddress.loopbackIPv4,
+          existing.port,
+          timeout: const Duration(milliseconds: 500),
+        );
+        sock.destroy();
+        return existing.port;
+      } catch (_) {
+        try {
+          await existing.close(force: true);
+        } catch (_) {}
+        if (identical(_server, existing)) _server = null;
+      }
+    }
+    return start(preferredPort: preferredPort);
   }
 
   /// Every request is described here (path, parameter names, value lengths - never the values, which may be cookies)

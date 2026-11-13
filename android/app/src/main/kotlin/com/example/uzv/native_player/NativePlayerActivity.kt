@@ -64,18 +64,29 @@ import com.example.uzv.native_player.ui.SwitchView
  */
 class NativePlayerActivity : AppCompatActivity() {
     private var controller: PlayerController? = null
+    private var rootView: FrameLayout? = null
     private var inPip = false
     private var wasInPip = false
+
+    private fun ensureKeepScreenOn() {
+        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        window.decorView.keepScreenOn = true
+        rootView?.keepScreenOn = true
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val request = NativePlayerHost.takePending()
         if (request == null) { finish(); return }
 
-        window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        ensureKeepScreenOn()
         applyOrientation(request.playbackConfig)
 
-        val root = FrameLayout(this).apply { setBackgroundColor(0xFF000000.toInt()) }
+        val root = FrameLayout(this).apply {
+            setBackgroundColor(0xFF000000.toInt())
+            keepScreenOn = true
+        }
+        rootView = root
         val kernel = createKernel(request.playbackConfig)
         val danmaku = DanmakuView(this).also { it.attach(kernel) }
         root.addView(kernel.view, FrameLayout.LayoutParams(-1, -1))
@@ -1334,7 +1345,10 @@ class NativePlayerActivity : AppCompatActivity() {
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
         super.onWindowFocusChanged(hasFocus)
-        if (hasFocus && !inPip) hideSystemBars()
+        if (hasFocus) {
+            ensureKeepScreenOn()
+            if (!inPip) hideSystemBars()
+        }
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
@@ -1375,6 +1389,7 @@ class NativePlayerActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        ensureKeepScreenOn()
         if (Build.VERSION.SDK_INT < 26 || !isInPictureInPictureMode) {
             inPip = false
             wasInPip = false
@@ -1393,6 +1408,8 @@ class NativePlayerActivity : AppCompatActivity() {
             controller?.close()
             PlaybackNotificationService.stop(this)
             finish()
+        } else {
+            ensureKeepScreenOn()
         }
     }
 
@@ -1430,6 +1447,7 @@ class NativePlayerActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        rootView = null
         controller?.close()
         if (NativePlayerHost.controller === controller) NativePlayerHost.controller = null
         PlaybackNotificationService.stop(this)

@@ -33,7 +33,17 @@ function startHost(opts = {}) {
   const catpaw = createCatpawHost({ bridge, workerEntryPath });
   services.attach();
   catpaw.attach();
-  status('Node ready, version ' + proc.version);
+  const announceReady = () => {
+    status('Node ready, version ' + proc.version);
+  };
+  announceReady();
+  if (typeof bridge.onReconnect === 'function') {
+    bridge.onReconnect(() => {
+      announceReady();
+      catpaw.report();
+      services.report();
+    });
+  }
 
   return {
     catpaw,

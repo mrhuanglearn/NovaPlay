@@ -25,7 +25,7 @@ const {
   startMode = 'config',
   dataDir,
   port,
-  dartPort,
+  dartPort: initialDartPort,
   env,
   allowWriteDirs = [],
   allowReadDirs = [],
@@ -33,6 +33,7 @@ const {
   enableNetLog = false,
   enableLog = true,
 } = workerData || {};
+let currentDartPort = initialDartPort || 0;
 
 function post(message) {
   try { parentPort.postMessage({ name, ...message }); } catch { /* parent already gone */ }
@@ -159,6 +160,7 @@ globalThis.catServerFactory = (handler) => {
   const server = http.createServer(handler);
   let addr = null;
   let retries = 0;
+  let allowFallback = true;
   let lastPort = port || 2333;
   let lastHost = '0.0.0.0';
   const originalListen = server.listen;
@@ -172,9 +174,9 @@ globalThis.catServerFactory = (handler) => {
   };
   const origEmit = server.emit.bind(server);
   server.emit = function emitWithPortFallback(event, ...args) {
-    // The host picked the first free port from 2333 up; if another app took it in the meantime, go on upward
-    // (2334, 2335, …) instead of a random port, so CatPawPlay's address stays near 2333.
-    if (event === 'error' && !addr && retries < LISTEN_RETRY_LIMIT && args[0] && args[0].code === 'EADDRINUSE') {
+    // The host picked the first free port from 2333 up; if another app took it in the meantime (or during reload after
+    // idle socket reclaim), go on upward (2334, 2335, …) instead of failing or picking a random port.
+    if (event === 'error' && allowFallback && retries < LISTEN_RETRY_LIMIT && args[0] && args[0].code === 'EADDRINUSE') {
       retries++;
       const next = lastPort + 1;
       process.env.DEV_HTTP_PORT = String(next);
@@ -191,6 +193,8 @@ globalThis.catServerFactory = (handler) => {
     return origEmit(event, ...args);
   };
   server.on('listening', () => {
+    allowFallback = false;
+    retries = 0;
     try {
       const a = server.address();
       if (a && typeof a.port === 'number') {
@@ -201,19 +205,25 @@ globalThis.catServerFactory = (handler) => {
     } catch { /* ignore */ }
   });
   server.on('error', (e) => post({ type: WorkerMsg.error, message: 'listen error: ' + ((e && e.message) || e) }));
-  globalThis._catServers.push({ server, handle: handler, getAddr: () => addr });
+  globalThis._catServers.push({
+    server,
+    handle: handler,
+    getAddr: () => addr,
+    prepareRelisten: (withFallback) => { allowFallback = !!withFallback; retries = 0; },
+  });
   return server;
 };
-globalThis.catDartServerPort = () => dartPort || 0;
+globalThis.catDartServerPort = () => currentDartPort;
 if (!globalThis.DB_NAME) globalThis.DB_NAME = 'default';
 
 // --- reload helpers --------------------------------------------------------------------------
-/** Close one registered server and bind it again on the same address. Resolves with an error string or null. */
-function relisten(entry) {
+/** Close one registered server (if still listening) and bind it again. Resolves with an error string or null. */
+function relisten(entry, { allowPortFallback = false } = {}) {
   return new Promise((resolve) => {
     const addr = entry.getAddr();
     if (!addr) { resolve('no-listened-addr'); return; }
     const server = entry.server;
+    if (typeof entry.prepareRelisten === 'function') entry.prepareRelisten(allowPortFallback);
     const bindAgain = () => {
       const onListening = () => { server.off('error', onError); resolve(null); };
       const onError = (e) => { server.off('listening', onListening); resolve((e && e.message) || String(e)); };
@@ -225,17 +235,21 @@ function relisten(entry) {
         resolve((e && e.message) || String(e));
       }
     };
+    if (!server.listening) {
+      bindAgain();
+      return;
+    }
     try {
       if (typeof server.closeAllConnections === 'function') server.closeAllConnections();
-      server.close(bindAgain);
+      server.close(() => bindAgain());
     } catch { bindAgain(); }
   });
 }
 
-async function reloadAll(entries, doneType, emptyError) {
+async function reloadAll(entries, doneType, emptyError, opts = {}) {
   if (entries.length === 0) { post({ type: doneType, ok: false, error: emptyError }); return; }
   let firstError = null;
-  const errors = await Promise.all(entries.map(relisten));
+  const errors = await Promise.all(entries.map((entry) => relisten(entry, opts)));
   for (const e of errors) if (e && !firstError) firstError = e;
   post({ type: doneType, ok: !firstError, error: firstError });
 }
@@ -259,9 +273,11 @@ parentPort.on('message', (msg) => {
       .catch(() => {})
       .finally(() => process.exit(0));
   } else if (msg.type === LoaderMsg.reload) {
-    reloadAll(globalThis._catServers, WorkerMsg.reloaded, 'no-server');
+    reloadAll(globalThis._catServers, WorkerMsg.reloaded, 'no-server', { allowPortFallback: true });
   } else if (msg.type === LoaderMsg.reloadDanmu) {
-    reloadAll(globalThis._catDanmuServers, WorkerMsg.reloadedDanmu, 'no-danmu-server');
+    reloadAll(globalThis._catDanmuServers, WorkerMsg.reloadedDanmu, 'no-danmu-server', { allowPortFallback: false });
+  } else if (msg.type === LoaderMsg.setDartPort) {
+    currentDartPort = Number(msg.port) || 0;
   }
 });
 

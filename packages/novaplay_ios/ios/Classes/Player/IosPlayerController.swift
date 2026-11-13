@@ -621,6 +621,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
       errorMessage = nil
     }
     danmakuView.paused = (nextState != "playing")
+    NativePlayerHost.shared.syncIdleTimer()
     uiDelegate?.controllerDidChangeState()
     flutterApi.onStateChanged(event: StateEvent(sessionId: request.sessionId, state: nextState)) { _ in }
     updateNowPlayingInfo()

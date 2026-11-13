@@ -85,9 +85,16 @@ interface PlayerKernel {
 
 class ExoKernel(private val context: Context) : PlayerKernel {
     private val bandwidth = DefaultBandwidthMeter.Builder(context).build()
-    private val player = ExoPlayer.Builder(context).setBandwidthMeter(bandwidth).build()
+    private val player = ExoPlayer.Builder(context)
+        .setBandwidthMeter(bandwidth)
+        .setWakeMode(C.WAKE_MODE_NETWORK)
+        .build()
     private var currentUrl = ""
-    private val playerView = PlayerView(context).also { it.player = player; it.useController = false }
+    private val playerView = PlayerView(context).also {
+        it.player = player
+        it.useController = false
+        it.keepScreenOn = true
+    }
     override val view: View get() = playerView
     override var listener: PlayerKernel.Listener? = null
 

@@ -993,7 +993,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
       let connFd = Darwin.accept(srvFd, nil, nil)
       if connFd < 0 {
         let err = errno
-        if err == EINTR || err == EAGAIN {
+        if err == EINTR || err == EAGAIN || err == ECONNABORTED {
           continue
         }
         break
@@ -1002,6 +1002,13 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
         self?.handleClientConnection(fd: connFd)
       }
     }
+    lock.lock()
+    if serverFd == srvFd {
+      serverFd = -1
+      boundPort = 0
+    }
+    lock.unlock()
+    Darwin.close(srvFd)
   }
 
   private func handleClientConnection(fd: Int32) {

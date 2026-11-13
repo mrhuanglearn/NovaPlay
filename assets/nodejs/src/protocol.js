@@ -69,6 +69,7 @@ const LoaderMsg = Object.freeze({
   stop: 'stop',
   reload: 'reload',
   reloadDanmu: 'reloadDanmu',
+  setDartPort: 'setDartPort',
 });
 
 /** Directory (below the app data dir) that holds per-instance catpaw data. */

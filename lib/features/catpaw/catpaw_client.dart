@@ -44,8 +44,10 @@ class CatpawClient {
       if (event is CatpawPort) _ports[event.name] = event.port;
       if (event is CatpawList) {
         _ports
-          ..removeWhere((k, _) => !event.services.any((s) => s.name == k))
-          ..addEntries(event.services.where((s) => s.port != null).map((s) => MapEntry(s.name, s.port!)));
+          ..removeWhere((k, _) => !event.services.any((s) => s.name == k && s.running && s.port != null))
+          ..addEntries(
+            event.services.where((s) => s.running && s.port != null).map((s) => MapEntry(s.name, s.port!)),
+          );
       }
       _events.add(event);
     });

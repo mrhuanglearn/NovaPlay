@@ -42,6 +42,8 @@ class MdkKernel(context: Context, hwDecode: Boolean) : PlayerKernel {
     private var lastEventError: String? = null
 
     private val surface = SurfaceView(context).apply {
+        keepScreenOn = true
+        holder.setKeepScreenOn(true)
         holder.addCallback(object : SurfaceHolder.Callback {
             override fun surfaceCreated(h: SurfaceHolder) = Unit
             override fun surfaceChanged(h: SurfaceHolder, format: Int, width: Int, height: Int) {

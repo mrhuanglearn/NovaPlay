@@ -84,7 +84,7 @@ class NodeBridgePlugin private constructor(private val context: Context) :
 /** The process-wide Node runtime and its loopback connection. Events go to the engine that attached last. */
 internal object NodeHost {
     private var listener: NodeBridgePlugin? = null
-    private var writer: OutputStreamWriter? = null
+    private var session: LoopbackBridgeSession? = null
     private var started = false
     private var firstFailure: String? = null
 
@@ -122,8 +122,19 @@ internal object NodeHost {
         started = true
         readyLine = null
         val project = NodeAssets.install(context) // copies assets/nodejs -> filesDir/nodejs-project
-        val srv = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))
-        thread(name = "uzv-node-bridge") { acceptLoop(srv) }
+        val srv = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
+        val bridgeSession = LoopbackBridgeSession(
+            token = token,
+            onEvent = { channel, message ->
+                if (channel == "status" && message.startsWith("Node ready")) {
+                    synchronized(this@NodeHost) { readyLine = message }
+                }
+                emit(channel, message)
+            },
+            onStatusError = { emitStatus(it) },
+        )
+        session = bridgeSession
+        thread(name = "uzv-node-bridge", isDaemon = true) { bridgeSession.acceptLoop(srv) }
         thread(name = "uzv-node-main") {
             val dataDir = File(context.filesDir, "node-data").apply { mkdirs() }.absolutePath
             // UnsatisfiedLinkError (libnode.so / libc++_shared.so missing from the APK) is an Error, not an Exception: left uncaught
@@ -145,7 +156,10 @@ internal object NodeHost {
             } catch (t: Throwable) {
                 // Let a later "Retry" start over (it fails again at once if the library is really missing) instead of waiting for a runtime
                 // that will never answer. Only a runtime that never ran may be started again.
-                synchronized(this) { started = false }
+                synchronized(this) {
+                    started = false
+                    session = null
+                }
                 runCatching { srv.close() }
                 // A failed class initialisation (the System.loadLibrary calls in NodeRuntime) makes every later attempt throw a bare
                 // NoClassDefFoundError; keep saying why the first one failed.
@@ -155,54 +169,96 @@ internal object NodeHost {
                 return@thread
             }
             // Node ran and ended; it cannot be started again in this process, so `started` stays true.
-            synchronized(this) { readyLine = null }
+            runCatching { srv.close() }
+            synchronized(this) {
+                readyLine = null
+                session = null
+            }
             emitStatus("Node runtime exited with code $code")
         }
     }
 
     fun send(line: String, done: (Pair<String, String>?) -> Unit) {
         sender.execute {
-            val failure: Pair<String, String>? = try {
-                synchronized(this) {
-                    val w = writer
-                    if (w == null) {
-                        "not_connected" to "Node runtime is not connected"
-                    } else {
-                        w.write(line)
-                        w.flush()
-                        null
-                    }
-                }
-            } catch (e: Exception) {
-                "send_failed" to (e.message ?: e.javaClass.simpleName)
-            }
+            val current = synchronized(this) { session }
+            val failure = current?.writeLine(line) ?: ("not_connected" to "Node runtime is not connected")
             done(failure)
         }
     }
+}
 
-    private fun acceptLoop(srv: ServerSocket) {
-        // This thread must never let an exception escape: on Android that ends the whole app. Closing the server socket
-        // (a failed Node start) makes accept() throw, and a garbled line from the other side makes the JSON parser throw.
-        var socket: Socket? = null
-        try {
-            socket = srv.accept()
-            val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
-            val hello = JSONObject(reader.readLine() ?: return)
-            if (hello.optString("hello") != token) { socket.close(); return } // reject foreign local processes
-            synchronized(this) { writer = OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8) }
-            while (true) {
-                val line = reader.readLine() ?: break
-                val frame = JSONObject(line)
-                val channel = frame.getString("c")
-                val message = frame.getString("m")
-                if (channel == "status" && message.startsWith("Node ready")) synchronized(this) { readyLine = message }
-                emit(channel, message)
+/**
+ * Multi-accept loopback bridge server:
+ * - Rejects unauthenticated local probes without shutting down the listener.
+ * - Tolerates malformed JSON lines without tearing down the active Node connection.
+ * - Keeps [ServerSocket] open across idle socket drops so `bridge_tcp.js` (`reconnect: true`) can re-attach seamlessly.
+ */
+internal class LoopbackBridgeSession(
+    private val token: String,
+    private val onEvent: (String, String) -> Unit,
+    private val onStatusError: (String) -> Unit = {},
+    private val parseJson: (String) -> Map<String, String>? = ::parseAndroidJson,
+) {
+    private var writer: OutputStreamWriter? = null
+
+    fun writeLine(line: String): Pair<String, String>? {
+        return try {
+            synchronized(this) {
+                val w = writer ?: return "not_connected" to "Node runtime is not connected"
+                w.write(line)
+                w.flush()
+                null
             }
         } catch (e: Exception) {
-            if (!srv.isClosed) emitStatus("Node bridge failed: ${e.message ?: e.javaClass.simpleName}")
-        } finally {
-            synchronized(this) { writer = null; readyLine = null }
-            runCatching { socket?.close() }
+            synchronized(this) { writer = null }
+            "send_failed" to (e.message ?: e.javaClass.simpleName)
         }
     }
+
+    fun acceptLoop(srv: ServerSocket) {
+        // This thread must never let an exception escape: on Android that ends the whole app.
+        while (!srv.isClosed) {
+            val socket: Socket = try {
+                srv.accept()
+            } catch (e: Exception) {
+                if (!srv.isClosed) {
+                    onStatusError("Node bridge failed: ${e.message ?: e.javaClass.simpleName}")
+                }
+                break
+            }
+            var out: OutputStreamWriter? = null
+            try {
+                runCatching { socket.tcpNoDelay = true }
+                val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
+                val helloLine = reader.readLine() ?: continue
+                val hello = parseJson(helloLine) ?: continue
+                if (hello["hello"] != token) continue // reject foreign local processes, keep listening for Node
+
+                out = OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8)
+                synchronized(this) { writer = out }
+                while (true) {
+                    val line = reader.readLine() ?: break
+                    if (line.isBlank()) continue
+                    val frame = parseJson(line) ?: continue
+                    val channel = frame["c"] ?: continue
+                    val message = frame["m"] ?: continue
+                    onEvent(channel, message)
+                }
+            } catch (_: Exception) {
+                // Transient socket reset during idle/doze: loop back to srv.accept() so Node can reconnect.
+            } finally {
+                synchronized(this) {
+                    if (writer === out) writer = null
+                }
+                runCatching { socket.close() }
+            }
+        }
+    }
+}
+
+private fun parseAndroidJson(raw: String): Map<String, String>? = try {
+    val o = JSONObject(raw)
+    buildMap { o.keys().forEach { k -> if (o.opt(k) is String) put(k, o.getString(k)) } }
+} catch (_: Exception) {
+    null
 }

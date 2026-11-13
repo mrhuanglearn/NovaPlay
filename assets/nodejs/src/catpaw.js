@@ -161,13 +161,18 @@ function createCatpawHost({ bridge, workerEntryPath }) {
     if (inst) inst.worker.terminate().catch(() => {});
   }
 
-  function onWorkerMessage(name) {
+  function onWorkerMessage(name, workerRef) {
     return (msg) => {
+      if (workerRef && instances[name] && instances[name].worker !== workerRef) return;
       switch (msg && msg.type) {
-        case WorkerMsg.port:
-          if (instances[name]) { instances[name].port = msg.port; instances[name].running = true; }
+        case WorkerMsg.port: {
+          const inst = instances[name];
+          const portChanged = !!(inst && inst.running && inst.port !== msg.port);
+          if (inst) { inst.port = msg.port; inst.running = true; }
           emit(portEvent(name, msg.port));
+          if (portChanged) report();
           break;
+        }
         case WorkerMsg.result:
           emit(resultEvent({ action: msg.action, name, ok: !!msg.ok, error: msg.error || null }));
           if (msg.action === Action.start && !msg.ok) { dropInstance(name); report(); }
@@ -192,13 +197,25 @@ function createCatpawHost({ bridge, workerEntryPath }) {
     };
   }
 
-  function onWorkerError(name, err) {
+  function onWorkerError(name, workerRef, err) {
     const message = (err && err.message) || String(err);
     status(`catpaw ${name} worker crashed: ${message}`);
     const inst = instances[name];
+    if (!inst || (workerRef && inst.worker !== workerRef)) return;
     delete instances[name];
-    if (inst && !inst.running) {
+    if (!inst.running) {
       emit(resultEvent({ action: Action.start, name, ok: false, error: message }));
+    }
+    report();
+  }
+
+  function onWorkerExit(name, workerRef, code) {
+    const inst = instances[name];
+    if (!inst || (workerRef && inst.worker !== workerRef)) return;
+    delete instances[name];
+    status(`catpaw ${name} worker exited (code=${code})`);
+    if (!inst.running) {
+      emit(resultEvent({ action: Action.start, name, ok: false, error: `worker exited with code ${code}` }));
     }
     report();
   }
@@ -228,6 +245,7 @@ function createCatpawHost({ bridge, workerEntryPath }) {
     }
     const resolvedPort = await resolveAvailablePort(port || null, reserved);
     status(`catpaw ${name}: 监听端口 ${resolvedPort}${port && resolvedPort !== port ? `(请求 ${port} 已被占用)` : ''}`);
+    let workerRef = null;
     const worker = spawnWorker({
       workerEntryPath,
       name,
@@ -236,10 +254,12 @@ function createCatpawHost({ bridge, workerEntryPath }) {
         env: env || {}, allowWriteDirs: [dataDir, tempDir, ...extraDirs], allowReadDirs: [path.dirname(scriptPath), ...extraDirs],
         redirectRoot: tempDir, enableNetLog: !!enableNetLog, enableLog: enableLog !== false,
       },
-      onMsg: onWorkerMessage(name),
-      onError: (e) => onWorkerError(name, e),
+      onMsg: (m) => onWorkerMessage(name, workerRef)(m),
+      onError: (e) => onWorkerError(name, workerRef, e),
+      onExit: (code) => onWorkerExit(name, workerRef, code),
       onStatus: status,
     });
+    workerRef = worker;
     instances[name] = { worker, port: null, requestedPort: resolvedPort, dataDir, running: false };
   }
 
@@ -277,10 +297,19 @@ function createCatpawHost({ bridge, workerEntryPath }) {
     const { worker } = inst;
     return new Promise((resolve) => {
       let settled = false;
-      const finish = (value) => { if (settled) return; settled = true; clearTimeout(timer); worker.off('message', onMessage); resolve(value); };
+      const finish = (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        worker.off('message', onMessage);
+        worker.off('exit', onExit);
+        resolve(value);
+      };
       const onMessage = (m) => { if (m && m.type === replyType) finish({ ok: m.ok !== false, error: m.error || null }); };
+      const onExit = (code) => finish({ ok: false, error: `worker-exited(${code})` });
       const timer = setTimeout(() => finish({ ok: false, error: 'loader-timeout' }), RELOAD_TIMEOUT_MS);
       worker.on('message', onMessage);
+      worker.once('exit', onExit);
       try { worker.postMessage({ type: request }); } catch (e) {
         finish({ ok: false, error: 'postMessage-failed: ' + ((e && e.message) || e) });
       }
@@ -293,7 +322,13 @@ function createCatpawHost({ bridge, workerEntryPath }) {
     const { action } = cmd;
     let name = cmd.name;
     try {
-      if (action === Action.setDartPort) { dartServerPort = Number(cmd.port) || 0; return; }
+      if (action === Action.setDartPort) {
+        dartServerPort = Number(cmd.port) || 0;
+        for (const inst of Object.values(instances)) {
+          try { inst.worker.postMessage({ type: LoaderMsg.setDartPort, port: dartServerPort }); } catch { /* gone */ }
+        }
+        return;
+      }
       if (action === Action.reload || action === Action.reloadDanmu) {
         const isDanmu = action === Action.reloadDanmu;
         const result = await askWorker(cmd.name, isDanmu ? LoaderMsg.reloadDanmu : LoaderMsg.reload,
