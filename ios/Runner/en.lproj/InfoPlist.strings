@@ -1,4 +1,4 @@
 "CFBundleDisplayName" = "NovaPlay";
-"NSLocalNetworkUsageDescription" = "NovaPlay uses the local network to reach your Emby, Jellyfin, WebDAV, or LAN danmaku/subscription servers.";
+"NSLocalNetworkUsageDescription" = "NovaPlay uses the local network to reach CatPawPlay LAN pages, Emby, Jellyfin, WebDAV, or LAN danmaku servers.";
 "NSPhotoLibraryAddUsageDescription" = "NovaPlay saves video screenshots to your Photo Library.";
 "NSPhotoLibraryUsageDescription" = "NovaPlay saves video screenshots to your Photo Library.";

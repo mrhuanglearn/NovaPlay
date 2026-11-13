@@ -13,6 +13,7 @@ import 'app_shell.dart';
 import 'category_filters.dart';
 import 'load_error.dart';
 import 'lock_dialogs.dart';
+import 'site_switch_sheet.dart';
 import 'widgets.dart';
 
 // Layout OBSERVED on the original with a mock subscription (2026-11-09, docs/ui-ref/original/orig_home*.png): a pill
@@ -184,73 +185,13 @@ class _LockedHome extends ConsumerWidget {
 class _SitePill extends ConsumerWidget {
   const _SitePill();
 
-  void _openSheet(BuildContext context, WidgetRef ref, List<SpiderSite> sites, SpiderSite current) {
-    final l = context.l10n;
+  void _openSheet(BuildContext context) {
     showModalBottomSheet<void>(
       context: context,
       showDragHandle: true,
       useRootNavigator: true,
-      builder: (c) {
-        final colors = AppColors.of(c);
-        return SafeArea(
-          child: ConstrainedBox(
-            constraints: BoxConstraints(maxHeight: MediaQuery.sizeOf(c).height * 0.7),
-            child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-              Padding(
-                padding: const EdgeInsets.fromLTRB(20, 0, 20, 12),
-                child: Text(l.homeSwitchSite,
-                    style: TextStyle(fontSize: 18, fontWeight: FontWeight.w700, color: colors.label)),
-              ),
-              Flexible(
-                child: ListView(shrinkWrap: true, padding: const EdgeInsets.fromLTRB(16, 0, 16, 16), children: [
-                  for (final s in sites)
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 8),
-                      child: Material(
-                        color: s.key == current.key
-                            ? AppColors.of(context).accent.withValues(alpha: 0.16)
-                            : colors.cardHigh.withValues(alpha: 0.5),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(10),
-                          side: BorderSide(
-                              color: s.key == current.key
-                                  ? AppColors.of(context).accent.withValues(alpha: 0.6)
-                                  : Colors.transparent),
-                        ),
-                        child: InkWell(
-                          borderRadius: BorderRadius.circular(10),
-                          onTap: () {
-                            ref.read(selectedHomeSiteProvider.notifier).select(s.key);
-                            Navigator.pop(c);
-                          },
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
-                            child: Row(children: [
-                              Expanded(
-                                child: Text(s.name,
-                                    style: TextStyle(
-                                      fontSize: 15.5,
-                                      fontWeight: s.key == current.key ? FontWeight.w600 : FontWeight.normal,
-                                      color: s.key == current.key ? AppColors.of(context).accent : colors.label,
-                                    )),
-                              ),
-                              if (s.key == current.key)
-                                Container(
-                                    width: 7,
-                                    height: 7,
-                                    decoration:
-                                        BoxDecoration(color: AppColors.of(context).accent, shape: BoxShape.circle)),
-                            ]),
-                          ),
-                        ),
-                      ),
-                    ),
-                ]),
-              ),
-            ]),
-          ),
-        );
-      },
+      isScrollControlled: true,
+      builder: (c) => SiteSwitchSheet(pageContext: context),
     );
   }
 
@@ -267,7 +208,7 @@ class _SitePill extends ConsumerWidget {
         shape: const StadiumBorder(),
         child: InkWell(
           customBorder: const StadiumBorder(),
-          onTap: () => _openSheet(context, ref, sites, current),
+          onTap: () => _openSheet(context),
           child: Padding(
             padding: const EdgeInsets.fromLTRB(8, 7, 12, 7),
             child: Row(mainAxisSize: MainAxisSize.min, children: [

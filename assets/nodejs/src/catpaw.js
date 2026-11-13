@@ -17,29 +17,108 @@ const {
 const { spawnWorker, removeDir } = require('./spawn');
 
 const DEFAULT_CATPAW_PORT = 2333;
+/** How many ports above the start port are tried before giving up and letting the OS pick one. */
+const PORT_SCAN_LIMIT = 200;
+const PROBE_TIMEOUT_MS = 300;
 
 /**
- * If caller did not specify a port, check whether default catpaw port (2333) is already bound
- * (e.g. by another app or instance). If 2333 is free, return null so DEV_HTTP_PORT stays unset;
- * if 2333 is busy, allocate and return an ephemeral free port for DEV_HTTP_PORT.
+ * Collects currently listening TCP ports within [minPort, maxPort] from /proc/net/tcp{,6}.
+ * Fails open (returns empty Set) on non-Linux hosts or restricted environments (e.g. Android SELinux / iOS).
  */
-function resolveAvailablePort(requestedPort) {
-  if (requestedPort) return Promise.resolve(requestedPort);
+function readProcListeningPorts(minPort, maxPort) {
+  const occupied = new Set();
+  for (const procPath of ['/proc/net/tcp', '/proc/net/tcp6']) {
+    let content;
+    try {
+      content = fs.readFileSync(procPath, 'utf8');
+    } catch {
+      continue;
+    }
+    const lines = content.split('\n');
+    for (let i = 1; i < lines.length; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      const parts = line.split(/\s+/);
+      if (parts.length < 4 || parts[3] !== '0A') continue; // 0A = TCP_LISTEN
+      const colonIdx = parts[1].lastIndexOf(':');
+      if (colonIdx < 0) continue;
+      const p = parseInt(parts[1].slice(colonIdx + 1), 16);
+      if (Number.isFinite(p) && p >= minPort && p <= maxPort) occupied.add(p);
+    }
+  }
+  return occupied;
+}
+
+/** Whether something already answers on 127.0.0.1:port (another app, or an old instance). */
+function somethingListens(port, host = '127.0.0.1') {
+  return new Promise((resolve) => {
+    const sock = net.connect({ port, host });
+    const done = (busy) => { sock.removeAllListeners(); sock.destroy(); resolve(busy); };
+    sock.setTimeout(PROBE_TIMEOUT_MS, () => done(false));
+    sock.once('connect', () => done(true));
+    sock.once('error', () => done(false));
+  });
+}
+
+/** Whether this process can bind port on host right now (released again at once). */
+function canBind(port, host) {
   return new Promise((resolve) => {
     const probe = net.createServer();
     probe.unref();
-    probe.once('error', () => {
-      const fallback = net.createServer();
-      fallback.unref();
-      fallback.once('error', () => resolve(null));
-      fallback.listen(0, '0.0.0.0', () => {
-        const addr = fallback.address();
-        const freePort = addr && typeof addr.port === 'number' ? addr.port : null;
-        fallback.close(() => resolve(freePort));
-      });
+    probe.once('error', () => resolve(false));
+    probe.listen({ port, host, exclusive: true }, () => probe.close(() => resolve(true)));
+  });
+}
+
+/** Whether IPv6 wildcard bind succeeds (treats disabled IPv6 on host as non-blocking). */
+function canBindIpv6(port) {
+  return new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.unref();
+    probe.once('error', (err) => {
+      if (err && (err.code === 'EAFNOSUPPORT' || err.code === 'EADDRNOTAVAIL')) resolve(true);
+      else resolve(false);
     });
-    probe.listen(DEFAULT_CATPAW_PORT, '0.0.0.0', () => {
-      probe.close(() => resolve(null));
+    probe.listen({ port, host: '::', ipv6Only: true, exclusive: true }, () => probe.close(() => resolve(true)));
+  });
+}
+
+/**
+ * A port is free when nobody answers on it and it can be bound on every interface. The connect probe matters on
+ * iOS/BSD: there a wildcard bind with SO_REUSEADDR (libuv sets it) succeeds although another app holds
+ * 127.0.0.1:port, and the script's requests would then reach that app.
+ */
+async function isPortFree(port) {
+  if (await somethingListens(port, '127.0.0.1')) return false;
+  if (!(await canBind(port, '0.0.0.0'))) return false;
+  return canBindIpv6(port);
+}
+
+/**
+ * The port a catpaw instance listens on (CatPawPlay 监听地址).
+ *
+ * Before 2026-11-13: 2333 when free, otherwise a random port picked by the OS. Now the ports from [startPort]
+ * (2333 unless the caller asks for one) upward are checked one by one and the first free one is used, so the
+ * address stays close to 2333 (2334, 2335, …) when another app or instance holds it. Ports used by this host's own
+ * running instances or listed as listening in /proc/net/tcp{,6} are skipped. Only when [PORT_SCAN_LIMIT] ports in a
+ * row are taken does the OS pick one.
+ */
+async function resolveAvailablePort(requestedPort, reserved = new Set()) {
+  const startPort = Number(requestedPort) > 0 ? Number(requestedPort) : DEFAULT_CATPAW_PORT;
+  const endPort = Math.min(65535, startPort + PORT_SCAN_LIMIT - 1);
+  const occupied = readProcListeningPorts(startPort, endPort);
+  for (let p = startPort; p <= endPort; p++) {
+    if (reserved.has(p) || occupied.has(p)) continue;
+    if (await isPortFree(p)) return p;
+  }
+  return new Promise((resolve) => {
+    const fallback = net.createServer();
+    fallback.unref();
+    fallback.once('error', () => resolve(null));
+    fallback.listen(0, '0.0.0.0', () => {
+      const addr = fallback.address();
+      const freePort = addr && typeof addr.port === 'number' ? addr.port : null;
+      fallback.close(() => resolve(freePort));
     });
   });
 }
@@ -142,7 +221,13 @@ function createCatpawHost({ bridge, workerEntryPath }) {
         /* ignore invalid profile_path */
       }
     }
-    const resolvedPort = await resolveAvailablePort(port || null);
+    const reserved = new Set();
+    for (const inst of Object.values(instances)) {
+      if (inst.port) reserved.add(inst.port);
+      if (inst.requestedPort) reserved.add(inst.requestedPort);
+    }
+    const resolvedPort = await resolveAvailablePort(port || null, reserved);
+    status(`catpaw ${name}: 监听端口 ${resolvedPort}${port && resolvedPort !== port ? `(请求 ${port} 已被占用)` : ''}`);
     const worker = spawnWorker({
       workerEntryPath,
       name,
@@ -155,7 +240,7 @@ function createCatpawHost({ bridge, workerEntryPath }) {
       onError: (e) => onWorkerError(name, e),
       onStatus: status,
     });
-    instances[name] = { worker, port: null, dataDir, running: false };
+    instances[name] = { worker, port: null, requestedPort: resolvedPort, dataDir, running: false };
   }
 
   async function stop(name, { purge = false } = {}) {
@@ -258,4 +343,4 @@ function createCatpawHost({ bridge, workerEntryPath }) {
   return { attach, handle, report, instances, idle, terminateAll };
 }
 
-module.exports = { createCatpawHost, loadConfig };
+module.exports = { createCatpawHost, loadConfig, resolveAvailablePort, readProcListeningPorts, DEFAULT_CATPAW_PORT };

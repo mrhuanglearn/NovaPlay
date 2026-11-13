@@ -170,10 +170,12 @@ class PlayerLauncher {
     required SpiderApi api,
     required VodDetail detail,
     required HistoryRepository history,
+    bool recordHistory = true,
     int line = 0,
     int episode = 0,
     void Function()? onOpened,
   }) =>
-      playSource(VodPlaybackSource(site: site, api: api, detail: detail, history: history),
+      playSource(
+          VodPlaybackSource(site: site, api: api, detail: detail, history: history, recordHistory: recordHistory),
           line: line, episode: episode, onOpened: onOpened);
 }

@@ -958,6 +958,21 @@ class AppLocalizationsEn extends AppLocalizations {
   String get homeSwitchSite => 'Switch site';
 
   @override
+  String get homeSiteSettings => 'Site settings';
+
+  @override
+  String get homeSiteEnable => 'Enable';
+
+  @override
+  String get homeSiteHistory => 'History';
+
+  @override
+  String get homeSiteWebsite => 'Web page';
+
+  @override
+  String get homeSiteUnlock => 'Unlock sites';
+
+  @override
   String get homeBlockCategories => 'Block categories';
 
   @override

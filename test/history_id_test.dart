@@ -94,4 +94,17 @@ void main() {
 
     expect((await history.all()).map((e) => e.item.name).toSet(), {'小春，屁股摇起来！', '愿你自由，我的女儿'});
   });
+
+  // 切换站点 → 站点设置 → 历史记录 off (2026-11-13): the site's videos stay out of 观看历史.
+  test('a site with 历史记录 switched off saves no progress', () async {
+    final detail = (await _apiAnswering(
+            {'vod_id': '1', 'vod_name': '小春，屁股摇起来！', 'vod_play_from': 'q', 'vod_play_url': '1\$a'}, [])
+        .detail(_site, '1'))!;
+    final source =
+        VodPlaybackSource(site: _site, api: SpiderApi(0), detail: detail, history: history, recordHistory: false);
+
+    await source.saveProgress(0, 0, 40, 100);
+
+    expect(await history.all(), isEmpty);
+  });
 }

@@ -1820,6 +1820,36 @@ abstract class AppLocalizations {
   /// **'Switch site'**
   String get homeSwitchSite;
 
+  /// No description provided for @homeSiteSettings.
+  ///
+  /// In en, this message translates to:
+  /// **'Site settings'**
+  String get homeSiteSettings;
+
+  /// No description provided for @homeSiteEnable.
+  ///
+  /// In en, this message translates to:
+  /// **'Enable'**
+  String get homeSiteEnable;
+
+  /// No description provided for @homeSiteHistory.
+  ///
+  /// In en, this message translates to:
+  /// **'History'**
+  String get homeSiteHistory;
+
+  /// No description provided for @homeSiteWebsite.
+  ///
+  /// In en, this message translates to:
+  /// **'Web page'**
+  String get homeSiteWebsite;
+
+  /// No description provided for @homeSiteUnlock.
+  ///
+  /// In en, this message translates to:
+  /// **'Unlock sites'**
+  String get homeSiteUnlock;
+
   /// No description provided for @homeBlockCategories.
   ///
   /// In en, this message translates to:

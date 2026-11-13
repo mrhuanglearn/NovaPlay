@@ -4,7 +4,13 @@ import '../../models/vod.dart';
 
 /// One video source exposed by a running catpaw instance.
 class SpiderSite {
-  const SpiderSite({required this.key, required this.name, required this.api, this.type = 3, this.searchable = true});
+  const SpiderSite(
+      {required this.key,
+      required this.name,
+      required this.api,
+      this.type = 3,
+      this.searchable = true,
+      this.indexs = false});
 
   factory SpiderSite.fromJson(Map<String, dynamic> j) => SpiderSite(
         key: '${j['key']}',
@@ -12,6 +18,7 @@ class SpiderSite {
         api: '${j['api']}',
         type: int.tryParse('${j['type']}') ?? 3,
         searchable: '${j['searchable'] ?? 1}' != '0',
+        indexs: '${j['indexs'] ?? 0}' == '1',
       );
 
   final String key;
@@ -19,6 +26,10 @@ class SpiderSite {
   final String api;
   final int type;
   final bool searchable;
+
+  /// `indexs: 1`: an index site (OBSERVED: 「荐」豆瓣 of a catpaw subscription). Its posters are recommendations with no
+  /// detail of their own; the original opens 搜索 with the title when one is tapped.
+  final bool indexs;
 }
 
 class HomeData {
@@ -48,6 +59,9 @@ class SpiderApi {
 
   final int port;
   final Dio _dio;
+
+  /// Address of the spider server (`http://127.0.0.1:<port>` or the cloud service's address), without a trailing `/`.
+  String get baseUrl => _dio.options.baseUrl;
 
   Duration? get receiveTimeout => _dio.options.receiveTimeout;
 

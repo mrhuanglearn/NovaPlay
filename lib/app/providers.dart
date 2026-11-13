@@ -37,6 +37,7 @@ import '../ui/load_error.dart';
 import 'app_preferences.dart';
 import 'live_providers.dart';
 import 'router.dart';
+import 'site_prefs.dart';
 import 'ui_hooks.dart';
 
 // Provider names intentionally follow the ones recovered from the original string pool
@@ -326,11 +327,17 @@ class SelectedTypeId extends Notifier<String?> {
 final selectedTypeIdProvider = NotifierProvider<SelectedTypeId, String?>(SelectedTypeId.new);
 
 final currentSiteProvider = Provider<SpiderSite?>((ref) {
-  final sites = ref.watch(homeSitesProvider);
-  if (sites.isEmpty) return null;
+  final all = ref.watch(homeSitesProvider);
+  if (all.isEmpty) return null;
   final selected = ref.watch(selectedHomeSiteProvider);
   // Wait for the saved choice instead of loading the first site for nothing (it is read right after the runtime).
   if (!selected.hasValue && !selected.hasError) return null;
+  // Likewise wait for 站点设置, so a disabled or locked site is not loaded first. A site that is switched off or locked
+  // while shown gives way to the first one still listed in 切换站点 (all sites when none is left).
+  final prefs = ref.watch(sitePrefsProvider);
+  if (!prefs.hasValue && !prefs.hasError) return null;
+  final visible = ref.watch(visibleHomeSitesProvider);
+  final sites = visible.isEmpty ? all : visible;
   final key = selected.valueOrNull;
   return sites.firstWhere((s) => s.key == key, orElse: () => sites.first);
 });
@@ -694,8 +701,9 @@ final searchPrefsProvider = AsyncNotifierProvider<SearchPrefsNotifier, SearchPre
 ///
 /// OBSERVED (UZN 1.1.7, 站点搜索管理 on the phone): every type 3 site is listed and switched on, 「盘」我的 included
 /// although its config says `searchable: 0`; 「推」推送 (type 4) and the Apple Music web page (type 7) are not listed.
+/// OBSERVED (2026-11-13): sites switched off (启用) or locked in 切换站点 → 站点设置 are not listed either.
 final searchableSitesProvider =
-    Provider<List<SpiderSite>>((ref) => [for (final s in ref.watch(homeSitesProvider)) if (s.type == 3) s]);
+    Provider<List<SpiderSite>>((ref) => [for (final s in ref.watch(visibleHomeSitesProvider)) if (s.type == 3) s]);
 
 final tmdbSettingsStoreProvider = Provider((ref) => JsonStore('tmdb_settings.json'));
 

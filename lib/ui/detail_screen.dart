@@ -4,6 +4,7 @@ import 'package:go_router/go_router.dart';
 
 import '../app/extra_providers.dart';
 import '../app/providers.dart';
+import '../app/site_prefs.dart';
 import '../app/ui_hooks.dart';
 import '../features/downloads/enqueue.dart';
 import '../features/library/watch_repository.dart';
@@ -91,6 +92,7 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
             api: rt.api,
             detail: detail,
             history: ref.read(historyRepositoryProvider),
+            recordHistory: (await ref.read(sitePrefsProvider.future)).recordsHistory(site.key),
             line: _line,
             episode: episode,
             onOpened: () {
@@ -491,12 +493,8 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
                     child: SizedBox(
                       width: 119,
                       height: 167,
-                      child: d.item.pic == null
-                          ? ColoredBox(color: c.card, child: Icon(Icons.movie_outlined, color: c.secondaryLabel))
-                          : Image.network(d.item.pic!,
-                              fit: BoxFit.cover,
-                              errorBuilder: (_, __, ___) => ColoredBox(
-                                  color: c.card, child: Icon(Icons.movie_outlined, color: c.secondaryLabel))),
+                      child: posterFromUrl(d.item.pic,
+                          fallback: ColoredBox(color: c.card, child: Icon(Icons.movie_outlined, color: c.secondaryLabel))),
                     ),
                   ),
                   const SizedBox(width: 21),

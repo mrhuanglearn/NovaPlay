@@ -33,6 +33,9 @@ public class NovaPlayIosPlugin: NSObject, FlutterPlugin {
 
     // 4. Pigeon NativePlayerHostApi & NativePlayerFlutterApi
     NativePlayerHost.shared.register(with: registrar)
+
+    // 5. First-install first-launch network permission prompts (Wireless Data -> Local Network)
+    IosFirstLaunchPermissions.shared.startIfNeeded()
   }
 }
 

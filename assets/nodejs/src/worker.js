@@ -152,26 +152,37 @@ http.createServer = function createServer(...args) {
   return server;
 };
 
+/** Ports tried above the chosen one when it is taken between the host's check and the script's listen. */
+const LISTEN_RETRY_LIMIT = 50;
+
 globalThis.catServerFactory = (handler) => {
   const server = http.createServer(handler);
   let addr = null;
-  let retriedEphemeral = false;
+  let retries = 0;
+  let lastPort = port || 2333;
+  let lastHost = '0.0.0.0';
+  const originalListen = server.listen;
+  server.listen = function listenTracked(...largs) {
+    const first = largs[0];
+    if (typeof first === 'number') lastPort = first;
+    else if (first && typeof first === 'object' && typeof first.port === 'number') lastPort = first.port;
+    if (typeof largs[1] === 'string') lastHost = largs[1];
+    else if (first && typeof first === 'object' && typeof first.host === 'string') lastHost = first.host;
+    return originalListen.apply(server, largs);
+  };
   const origEmit = server.emit.bind(server);
   server.emit = function emitWithPortFallback(event, ...args) {
-    if (
-      event === 'error' &&
-      !addr &&
-      !port &&
-      !retriedEphemeral &&
-      args[0] &&
-      args[0].code === 'EADDRINUSE'
-    ) {
-      retriedEphemeral = true;
+    // The host picked the first free port from 2333 up; if another app took it in the meantime, go on upward
+    // (2334, 2335, …) instead of a random port, so CatPawPlay's address stays near 2333.
+    if (event === 'error' && !addr && retries < LISTEN_RETRY_LIMIT && args[0] && args[0].code === 'EADDRINUSE') {
+      retries++;
+      const next = lastPort + 1;
+      process.env.DEV_HTTP_PORT = String(next);
       if (enableLog) {
-        post({ type: WorkerMsg.log, message: '[catpaw] default port in use, falling back to ephemeral port' });
+        post({ type: WorkerMsg.log, message: `[catpaw] port ${lastPort} in use, trying ${next}` });
       }
       try {
-        server.listen(0, '0.0.0.0');
+        server.listen(next, lastHost);
         return true;
       } catch {
         /* fall through to original error emission */
@@ -184,6 +195,7 @@ globalThis.catServerFactory = (handler) => {
       const a = server.address();
       if (a && typeof a.port === 'number') {
         addr = { port: a.port, host: a.address };
+        process.env.DEV_HTTP_PORT = String(a.port);
         post({ type: WorkerMsg.port, port: a.port });
       }
     } catch { /* ignore */ }

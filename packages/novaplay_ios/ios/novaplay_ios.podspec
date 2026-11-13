@@ -40,6 +40,7 @@ Pod::Spec.new do |s|
     'CoreAudio',
     'CoreImage',
     'CoreMedia',
+    'CoreTelephony',
     'CoreGraphics',
     'CoreText',
     'CoreVideo',

@@ -926,6 +926,21 @@ class AppLocalizationsZh extends AppLocalizations {
   String get homeSwitchSite => '切换站点';
 
   @override
+  String get homeSiteSettings => '站点设置';
+
+  @override
+  String get homeSiteEnable => '启用';
+
+  @override
+  String get homeSiteHistory => '历史记录';
+
+  @override
+  String get homeSiteWebsite => '网页';
+
+  @override
+  String get homeSiteUnlock => '解锁站点';
+
+  @override
   String get homeBlockCategories => '分类屏蔽';
 
   @override

@@ -38,12 +38,16 @@ abstract class PlaybackSource {
 
 /// A video from a catpaw site: URLs come from the site's `play` route, progress goes to the watch history.
 class VodPlaybackSource extends PlaybackSource {
-  VodPlaybackSource({required this.site, required this.api, required this.detail, required this.history});
+  VodPlaybackSource(
+      {required this.site, required this.api, required this.detail, required this.history, this.recordHistory = true});
 
   final SpiderSite site;
   final SpiderApi api;
   final VodDetail detail;
   final HistoryRepository history;
+
+  /// 切换站点 → 站点设置 → 历史记录 of [site]: off keeps its videos out of 观看历史.
+  final bool recordHistory;
 
   @override
   String get title => detail.item.name;
@@ -80,6 +84,7 @@ class VodPlaybackSource extends PlaybackSource {
   @override
   Future<void> saveProgress(int lineIndex, int episodeIndex, double position, double duration,
       {int quality = 0}) async {
+    if (!recordHistory) return;
     final eps = detail.lines[lineIndex].episodes;
     await history.record(ProgressEntry(
       item: detail.item,

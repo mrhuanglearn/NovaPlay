@@ -38,8 +38,12 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_http._tcp</string>
+	</array>
 	<key>NSLocalNetworkUsageDescription</key>
-	<string>星映需要访问局域网以连接您的 Emby、Jellyfin、WebDAV 或局域网弹幕/订阅服务。</string>
+	<string>星映需要访问本地网络以连接 CatPawPlay 局域网管理页、Emby、Jellyfin、WebDAV 或局域网弹幕服务。</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>星映需要写入相册权限以保存视频播放截图。</string>
 	<key>NSPhotoLibraryUsageDescription</key>

@@ -69,14 +69,10 @@ class HistoryView extends ConsumerWidget {
                               child: SizedBox(
                                 width: 52,
                                 height: 72,
-                                child: e.item.pic == null
-                                    ? ColoredBox(
-                                        color: AppColors.of(context).cardHigh, child: const Icon(Icons.movie_outlined))
-                                    : Image.network(e.item.pic!,
-                                        fit: BoxFit.cover,
-                                        errorBuilder: (_, __, ___) => ColoredBox(
-                                            color: AppColors.of(context).cardHigh,
-                                            child: const Icon(Icons.movie_outlined))),
+                                child: posterFromUrl(e.item.pic,
+                                    fallback: ColoredBox(
+                                        color: AppColors.of(context).cardHigh,
+                                        child: const Icon(Icons.movie_outlined))),
                               ),
                             ),
                             const SizedBox(width: 12),

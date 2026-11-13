@@ -1,12 +1,16 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import '../app/providers.dart';
 import '../app/theme.dart';
 import '../core/haptics.dart';
+import '../features/catpaw/spider_api.dart';
 import '../l10n/l10n.dart';
 import '../models/vod.dart';
 import 'load_error.dart';
+import 'poster_image.dart';
 
 /// Poster grid used by home, search, favorites and history.
 class VodGrid extends StatelessWidget {
@@ -71,9 +75,27 @@ Widget vodPoster(VodItem item) => _poster(item);
 
 void _openVod(BuildContext context, VodItem item) {
   AppHaptics.selection();
+  // OBSERVED (UZN, 2026-11-13): an item of an index site (`indexs: 1`, e.g. 「荐」豆瓣) opens 搜索 with its name; the
+  // site has no detail of its own (its `detail` answers `{}`, so UZV showed 未找到 for every poster before).
+  if (_indexSiteOf(context, item) != null) {
+    context.push(Uri(path: '/search', queryParameters: {'q': item.name}).toString());
+    return;
+  }
   final q =
       Uri(path: '/video/detail', queryParameters: {'id': item.id, if (item.siteKey != null) 'site': item.siteKey!});
   context.push(q.toString());
+}
+
+SpiderSite? _indexSiteOf(BuildContext context, VodItem item) {
+  if (item.siteKey == null) return null;
+  final ProviderContainer container;
+  try {
+    container = ProviderScope.containerOf(context, listen: false);
+  } on StateError {
+    return null; // no ProviderScope (widget tests of the grid alone)
+  }
+  final site = container.read(homeSitesProvider).where((s) => s.key == item.siteKey).firstOrNull;
+  return site != null && site.indexs ? site : null;
 }
 
 const _defaultPosterUserAgent =
@@ -117,16 +139,17 @@ final _catVodHeaderTag = RegExp(
   return (url: clean, headers: headers);
 }
 
-Widget _poster(VodItem item) {
-  final raw = item.pic;
-  if (raw == null || raw.trim().isEmpty) return const _PosterFallback();
+Widget _poster(VodItem item) => posterFromUrl(item.pic, fallback: const _PosterFallback());
+
+/// A poster from a CatVod `vod_pic` value (with its `@Referer=` / anti-hotlink headers), or [fallback].
+Widget posterFromUrl(String? raw, {required Widget fallback}) {
+  if (raw == null || raw.trim().isEmpty) return fallback;
   final req = parsePosterRequest(raw);
-  if (req.url.isEmpty) return const _PosterFallback();
-  return Image.network(
-    req.url,
-    headers: req.headers,
+  if (req.url.isEmpty) return fallback;
+  return Image(
+    image: PosterImage(req.url, headers: req.headers),
     fit: BoxFit.cover,
-    errorBuilder: (_, __, ___) => const _PosterFallback(),
+    errorBuilder: (_, __, ___) => fallback,
   );
 }
 
