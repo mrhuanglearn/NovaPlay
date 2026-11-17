@@ -73,7 +73,8 @@ class CatpawClient {
 
   Future<void> _send(Map<String, Object?> cmd) => _bridge.send(Channels.catpaw, jsonEncode(cmd));
 
-  Future<void> setDartPort(int port) => _send({'action': Actions.setDartPort, 'port': port});
+  Future<void> setDartPort(int port, {String? token}) =>
+      _send({'action': Actions.setDartPort, 'port': port, if (token != null) 'token': token});
 
   /// Starts [name] and completes with its port once the script's HTTP server is listening.
   Future<int> startAndWait({

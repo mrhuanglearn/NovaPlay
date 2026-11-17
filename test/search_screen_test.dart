@@ -265,7 +265,7 @@ class _FakeApi extends SpiderApi {
   void release(String key) => (_gates[key] ??= Completer<void>()).complete();
 
   @override
-  Future<PagedVods> search(SpiderSite site, String keyword, {int page = 1}) async {
+  Future<PagedVods> search(SpiderSite site, String keyword, {int page = 1, CancelToken? cancelToken}) async {
     searched.add(site.key);
     if (!autoRelease) await (_gates[site.key] ??= Completer<void>()).future;
     order.add(site.key);

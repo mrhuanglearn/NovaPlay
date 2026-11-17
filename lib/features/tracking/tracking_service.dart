@@ -71,18 +71,31 @@ DateTime weekStart(DateTime day) {
 }
 
 class TrackingCalendar {
-  TrackingCalendar(this.store, this.tmdb);
+  TrackingCalendar(this.store, this.tmdb, {this.maxConcurrent = 6});
   final TrackingStore store;
   final TmdbClient tmdb;
+  final int maxConcurrent;
 
   /// Episodes airing between [from] (inclusive) and [from] + 7 days, ordered by date.
   Future<List<CalendarEntry>> week(DateTime from) async {
     final start = weekStart(from);
     final end = start.add(const Duration(days: 7));
+    final shows = await store.all();
+    if (shows.isEmpty) return const [];
+    final seasonLists = List<List<TmdbEpisode>?>.filled(shows.length, null);
+    var nextIdx = 0;
+    final workers = maxConcurrent.clamp(1, shows.length);
+    await Future.wait(List.generate(workers, (_) async {
+      while (true) {
+        final i = nextIdx++;
+        if (i >= shows.length) return;
+        seasonLists[i] = await tmdb.season(shows[i].tmdbId, shows[i].season);
+      }
+    }));
     final out = <CalendarEntry>[];
-    for (final show in await store.all()) {
-      final eps = await tmdb.season(show.tmdbId, show.season);
-      for (final ep in eps) {
+    for (var i = 0; i < shows.length; i++) {
+      final show = shows[i];
+      for (final ep in seasonLists[i] ?? const <TmdbEpisode>[]) {
         final d = ep.airDate;
         if (d == null || d.isBefore(start) || !d.isBefore(end)) continue;
         out.add(CalendarEntry(show: show, episode: ep, date: d, watched: show.watched.contains(ep.number)));

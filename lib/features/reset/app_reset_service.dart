@@ -4,6 +4,8 @@ import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../../core/json_store.dart';
+
 /// 设置 → 重置应用. OBSERVED in the original: the confirm text "将清空所有本地数据（订阅、历史、收藏、设置、字体、catpaw
 /// 实例数据等全部内容）并重启应用，相当于恢复出厂", and the strings "开始重置应用（清空 uzData）", "正在重置…",
 /// "所有数据已清空，应用将退出，请重新打开。" and "重置失败，请重试".
@@ -55,6 +57,7 @@ class AppResetService {
   /// entry is tried; the first failure is rethrown afterwards. Also run right before the process ends, for anything
   /// written in between.
   Future<void> wipe() async {
+    JsonStore.clearMemoryCaches();
     Object? failure;
     for (final dir in await _dirs()) {
       if (!await dir.exists()) continue;

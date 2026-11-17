@@ -1,6 +1,8 @@
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../core/app_http.dart';
 import '../features/live/live_store.dart';
 import '../features/live/m3u_epg.dart';
 
@@ -28,18 +30,24 @@ final Provider<LiveSource?> currentLiveSourceProvider = Provider<LiveSource?>((r
 
 /// Downloads a playlist with the source's User-Agent.
 Future<String> fetchLivePlaylist(LiveSource source) async {
-  final res = await Dio().get<String>(
+  final res = await createAppDio(connectTimeout: const Duration(seconds: 12), receiveTimeout: const Duration(seconds: 60)).get<String>(
     source.url,
     options: Options(
       responseType: ResponseType.plain,
-      receiveTimeout: const Duration(seconds: 60),
       headers: {if (source.userAgent.trim().isNotEmpty) 'User-Agent': source.userAgent.trim()},
     ),
   );
   return res.data ?? '';
 }
 
-final livePlaylistLoaderProvider = Provider((ref) => LivePlaylistLoader(fetch: fetchLivePlaylist));
+Future<List<int>> fetchLiveGuideBytes(String url) async {
+  final res = await createAppDio(connectTimeout: const Duration(seconds: 15), receiveTimeout: const Duration(seconds: 120))
+      .get<List<int>>(url, options: Options(responseType: ResponseType.bytes));
+  return res.data ?? const <int>[];
+}
+
+final livePlaylistLoaderProvider =
+    Provider((ref) => LivePlaylistLoader(fetch: fetchLivePlaylist, fetchGuideBytes: fetchLiveGuideBytes));
 
 /// The playlist text, downloaded or cached according to the source's 自动刷新 setting.
 final livePlaylistProvider = FutureProvider.family<String, String>((ref, sourceId) async {
@@ -49,7 +57,7 @@ final livePlaylistProvider = FutureProvider.family<String, String>((ref, sourceI
 });
 
 final liveChannelsProvider = FutureProvider.family<List<LiveChannel>, String>((ref, sourceId) async {
-  return parseM3u(await ref.watch(livePlaylistProvider(sourceId).future));
+  return parseM3uAsync(await ref.watch(livePlaylistProvider(sourceId).future));
 });
 
 /// Null when no guide is known or it could not be loaded (the channel list works without it).
@@ -60,9 +68,11 @@ final liveGuideProvider = FutureProvider.family<XmltvGuide?, String>((ref, sourc
   final url = guideUrlFor(source, await ref.watch(livePlaylistProvider(sourceId).future), prefs);
   if (url == null) return null;
   try {
-    final res = await Dio().get<List<int>>(url, options: Options(responseType: ResponseType.bytes, receiveTimeout: const Duration(seconds: 120)));
-    return parseXmltvGuide(res.data ?? const []);
-  } catch (_) {
+    final bytes = await ref.watch(livePlaylistLoaderProvider).loadGuideBytes(url, refresh: source.refresh);
+    if (bytes.isEmpty) return null;
+    return await parseXmltvGuideAsync(bytes);
+  } catch (e) {
+    debugPrint('liveGuideProvider load failed ($url): $e');
     return null;
   }
 });

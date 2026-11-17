@@ -9,6 +9,7 @@ import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
 import '../../app/providers.dart';
+import '../../core/app_http.dart';
 import '../../core/redact.dart';
 import '../danmaku/danmu_service.dart';
 import '../subscription/subscription.dart';
@@ -146,8 +147,9 @@ class CatpawDebugController extends AutoDisposeNotifier<CatpawDebugState> {
     final already = catpaw.attached;
     try {
       await catpaw.attach();
-      final port = await ref.read(dartCallbackServerProvider).start(preferredPort: dartPort);
-      await catpaw.setDartPort(port);
+      final cb = ref.read(dartCallbackServerProvider);
+      final port = await cb.start(preferredPort: dartPort);
+      await catpaw.setDartPort(port, token: cb.token);
       _listen();
       state = state.copyWith(node: DebugNodeState.running);
       _log(already ? 'Node 已在运行，跳过重复启动（回调沿用启动方端口）: $port' : 'Node ready; dart callback :$port');
@@ -247,7 +249,7 @@ class CatpawDebugController extends AutoDisposeNotifier<CatpawDebugState> {
     final service = debugInstanceName(url, name);
     await _install(service, defaultPort, (file) async {
       _log('安装服务 $service ← ${url.trim()}');
-      final r = await Dio().get<List<int>>(url.trim(), options: Options(responseType: ResponseType.bytes));
+      final r = await createAppDio().get<List<int>>(url.trim(), options: Options(responseType: ResponseType.bytes));
       await file.writeAsBytes(r.data ?? const []);
     });
   }

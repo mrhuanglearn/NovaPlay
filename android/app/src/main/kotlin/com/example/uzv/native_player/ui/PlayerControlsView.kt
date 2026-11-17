@@ -823,171 +823,37 @@ class PlayerControlsView(
         refresh()
     }
 
-    // -- menus ----------------------------------------------------------------------------------------------------------
+    // -- menus & panels (delegated to PlayerOverlayHost) ---------------------------------------------------------------
 
     class MenuItem(val label: String, val selected: Boolean = false, val dividerBefore: Boolean = false, val onClick: () -> Unit)
 
-    val menuOpen get() = menuHost.visibility == VISIBLE
-
-    fun closeMenu() {
-        menuHost.removeAllViews()
-        menuHost.visibility = GONE
-        if (visibleNow) touch()
+    private val overlays by lazy {
+        PlayerOverlayHost(
+            context = context,
+            root = this,
+            ui = ui,
+            menuHost = menuHost,
+            panelHost = panelHost,
+            isLandscape = { landscape },
+            isControlsVisible = { visibleNow },
+            cancelAutoHide = { removeCallbacks(hideTask) },
+            hideControls = ::hide,
+            touchControls = ::touch,
+            onHaptic = actions::onHaptic,
+        )
     }
 
-    /**
-     * A menu card dropped from [anchor]: below it for the top bar's buttons ([above] false, left edges aligned), above it
-     * for the bottom bar's pills (right edges aligned). Kept inside the page with an 8 dp margin.
-     */
-    fun showMenuCard(anchor: View, above: Boolean, card: View) {
-        removeCallbacks(hideTask)
-        menuHost.removeAllViews()
-        menuHost.addView(View(context).apply { setOnClickListener { closeMenu() } }, LayoutParams(-1, -1))
-        card.background = ui.rounded(PlayerUi.MENU_FILL, 16f, 0x14FFFFFF, 0.6f)
-        card.elevation = dp(6).toFloat()
-        card.isClickable = true
-        menuHost.addView(card, LayoutParams(-2, -2))
-        menuHost.visibility = VISIBLE
-        card.visibility = INVISIBLE
-        card.post {
-            val a = IntArray(2).also { anchor.getLocationInWindow(it) }
-            val me = IntArray(2).also { getLocationInWindow(it) }
-            val ax = a[0] - me[0]; val ay = a[1] - me[1]
-            val m = dp(8)
-            val x = if (above) ax + anchor.width - card.width else ax - dp(2)
-            val y = if (above) ay - card.height - dp(7) else ay + anchor.height + dp(7)
-            card.translationX = x.coerceIn(m, (width - card.width - m).coerceAtLeast(m)).toFloat()
-            card.translationY = y.coerceIn(m, (height - card.height - m).coerceAtLeast(m)).toFloat()
-            card.alpha = 0f
-            card.visibility = VISIBLE
-            card.animate().alpha(1f).setDuration(120).start()
-        }
-    }
+    val menuOpen get() = overlays.menuOpen
+    val panelOpen get() = overlays.panelOpen
+    var onPanelClosed: (() -> Unit)?
+        get() = overlays.onPanelClosed
+        set(v) { overlays.onPanelClosed = v }
 
-    /** A plain list menu: 44 dp rows, the current one bold with an accent ✓ at the right. */
-    fun showMenu(anchor: View, above: Boolean, items: List<MenuItem>) {
-        val list = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL; setPadding(0, dp(4), 0, dp(4)) }
-        for (item in items) {
-            if (item.dividerBefore) list.addView(View(context).apply { setBackgroundColor(0x1FFFFFFF) },
-                LinearLayout.LayoutParams(-1, 1).apply { leftMargin = dp(14); rightMargin = dp(14); topMargin = dp(4); bottomMargin = dp(4) })
-            list.addView(LinearLayout(context).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                minimumHeight = dp(44)
-                minimumWidth = dp(120)
-                setPadding(dp(18), 0, dp(14), 0)
-                addView(ui.text(item.label, 14.5f, if (item.selected) Color.WHITE else 0xB8FFFFFF.toInt(), bold = item.selected).apply {
-                    maxLines = 1; ellipsize = TextUtils.TruncateAt.END; maxWidth = dp(220)
-                }, LinearLayout.LayoutParams(0, -2, 1f))
-                if (item.selected) addView(ui.icon(Ic.CHECK, 15f, ui.accent), LinearLayout.LayoutParams(-2, -2).apply { leftMargin = dp(18) })
-                setOnClickListener { closeMenu(); actions.onHaptic(); item.onClick() }
-            }, LinearLayout.LayoutParams(-1, -2))
-        }
-        val scroll = ScrollView(context).apply { addView(list); isVerticalScrollBarEnabled = false }
-        showMenuCard(anchor, above, FrameLayout(context).apply {
-            addView(scroll, LayoutParams(-2, -2))
-            clipToOutline = true
-        })
-    }
-
-    /**
-     * The speed menu (OBSERVED): a tall slider on the left (0.5x at the bottom to 3.0x at the top, the value shown at its
-     * top), the presets 3x … 0.5x on the right with the current one tinted and ticked, and the current speed under a
-     * hairline. INFERRED: the slider moves in steps of 0.1 (the original's string 倍速调节 (+/- 0.1)).
-     */
-    fun showSpeedMenu(anchor: View, current: Double, onPick: (Double) -> Unit) {
-        val footer = ui.text(PlayerUiText.speedOption(current), 12.5f, 0x99FFFFFF.toInt()).apply { gravity = Gravity.CENTER }
-        val rows = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL }
-        lateinit var slider: VerticalFillSlider
-        fun fractionOf(v: Double) = ((v - 0.5) / 2.5).toFloat()
-        fun fillRows(value: Double) {
-            rows.removeAllViews()
-            for (s in PlayerUiText.speeds.reversed()) {
-                val sel = Math.abs(s - value) < 0.001
-                rows.addView(LinearLayout(context).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER_VERTICAL
-                    background = if (sel) ui.rounded(PlayerUi.withAlpha(ui.accent, 0.22f), 8f) else null
-                    setPadding(dp(10), 0, dp(10), 0)
-                    addView(if (sel) ui.icon(Ic.CHECK, 12f, ui.accent) else View(context), LinearLayout.LayoutParams(dp(12), dp(12)).apply { rightMargin = dp(8) })
-                    addView(ui.text(PlayerUiText.speedMenuLabel(s), 13f, if (sel) ui.accent else Color.WHITE, mono = true))
-                    setOnClickListener { actions.onHaptic(); onPick(s); closeMenu() }
-                }, LinearLayout.LayoutParams(-1, dp(32)))
-            }
-        }
-        slider = VerticalFillSlider(context, ui.accent) { f, done ->
-            val v = Math.round((0.5 + f * 2.5) * 10) / 10.0
-            slider.topLabel = PlayerUiText.speed(v)
-            footer.text = PlayerUiText.speedOption(v)
-            fillRows(v)
-            if (done) onPick(v)
-        }.apply { fraction = fractionOf(current); topLabel = PlayerUiText.speed(current); bottomLabel = "0.5" }
-        fillRows(current)
-        showMenuCard(anchor, true, LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-            addView(slider, LinearLayout.LayoutParams(dp(34), dp(254)))
-            addView(LinearLayout(context).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(8), 0, 0, 0)
-                addView(rows, LinearLayout.LayoutParams(dp(128), -2))
-                addView(View(context).apply { setBackgroundColor(0x1FFFFFFF) }, LinearLayout.LayoutParams(-1, 1).apply { topMargin = dp(4) })
-                addView(footer, LinearLayout.LayoutParams(-1, 0, 1f))
-            }, LinearLayout.LayoutParams(-2, -1))
-        })
-    }
-
-    // -- panels ---------------------------------------------------------------------------------------------------------
-
-    val panelOpen get() = panelHost.visibility == VISIBLE
-
-    /**
-     * A translucent sheet over the video: the right 44 % in landscape, the lower 53 % in portrait (OBSERVED). [header]
-     * stays fixed above the scrolling [fill]ed body. Tapping the video beside it closes it. Returns the scroll view.
-     */
-    fun showPanel(header: View? = null, fill: (LinearLayout) -> Unit): ScrollView {
-        val body = LinearLayout(context).apply { orientation = LinearLayout.VERTICAL; setPadding(dp(16), 0, dp(16), dp(20)) }
-        fill(body)
-        val scroll = ScrollView(context).apply { addView(body); isVerticalScrollBarEnabled = true }
-        showCustomPanel(header, scroll)
-        return scroll
-    }
-
-    /** Hosts a custom view (such as the 2-column Live TV Channel panel i2.o0) inside the right/bottom panel sheet. */
-    fun showCustomPanel(header: View? = null, content: View) {
-        removeCallbacks(hideTask)
-        hide()
-        closeMenu()
-        panelHost.removeAllViews()
-        panelHost.addView(View(context).apply { setOnClickListener { closePanel() } }, LayoutParams(-1, -1))
-        val sheet = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            isClickable = true
-            background = GradientDrawable().apply {
-                setColor(PlayerUi.PANEL_FILL)
-                val r = dp(16).toFloat()
-                cornerRadii = if (landscape) floatArrayOf(r, r, 0f, 0f, 0f, 0f, r, r) else floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
-            }
-            clipToOutline = true
-            if (header != null) addView(header) else setPadding(0, dp(6), 0, 0)
-            addView(content, LinearLayout.LayoutParams(-1, 0, 1f))
-        }
-        val lp = if (landscape) LayoutParams((width * 0.44f).toInt().coerceAtLeast(dp(300)).coerceAtMost(width), -1, Gravity.END)
-        else LayoutParams(-1, (height * 0.526f).toInt(), Gravity.BOTTOM)
-        panelHost.addView(sheet, lp)
-        panelHost.visibility = VISIBLE
-        if (landscape) { sheet.translationX = dp(40).toFloat(); sheet.animate().translationX(0f) } else { sheet.translationY = dp(40).toFloat(); sheet.animate().translationY(0f) }
-        sheet.alpha = 0f
-        sheet.animate().alpha(1f).setDuration(160).start()
-    }
-
-    fun closePanel() {
-        panelHost.removeAllViews()
-        panelHost.visibility = GONE
-        onPanelClosed?.invoke()
-        onPanelClosed = null
-    }
-
-    /** Runs once when the open panel closes (the 弹幕 panel saves its settings then). */
-    var onPanelClosed: (() -> Unit)? = null
+    fun closeMenu() = overlays.closeMenu()
+    fun showMenuCard(anchor: View, above: Boolean, card: View) = overlays.showMenuCard(anchor, above, card)
+    fun showMenu(anchor: View, above: Boolean, items: List<MenuItem>) = overlays.showMenu(anchor, above, items)
+    fun showSpeedMenu(anchor: View, current: Double, onPick: (Double) -> Unit) = overlays.showSpeedMenu(anchor, current, onPick)
+    fun showPanel(header: View? = null, fill: (LinearLayout) -> Unit): ScrollView = overlays.showPanel(header, fill)
+    fun showCustomPanel(header: View? = null, content: View) = overlays.showCustomPanel(header, content)
+    fun closePanel() = overlays.closePanel()
 }

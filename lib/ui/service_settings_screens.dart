@@ -604,7 +604,8 @@ class _BackupExportSheetState extends State<_BackupExportSheet> {
       final bytes = await widget.service.exportZip(_chosen);
       final path = await saver(backupFileName(DateTime.now()), bytes);
       if (mounted) Navigator.pop(context, path);
-    } catch (_) {
+    } catch (e) {
+      debugPrint('backup export failed: $e');
       showToast(l.exportFailed);
       if (mounted) setState(() => _busy = false);
     }
@@ -695,7 +696,8 @@ Future<void> _showExportDone(BuildContext context, WidgetRef ref, String path) a
   if (shareIt != true) return;
   try {
     await share(path, l.backupShareText);
-  } catch (_) {
+  } catch (e) {
+    debugPrint('backup share failed: $e');
     showToast(l.shareFailed);
   }
 }

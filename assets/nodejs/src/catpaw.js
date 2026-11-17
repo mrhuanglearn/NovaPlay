@@ -139,6 +139,7 @@ function createCatpawHost({ bridge, workerEntryPath }) {
   /** @type {Record<string, {worker: import('worker_threads').Worker, port: number|null, dataDir: string, running: boolean}>} */
   const instances = {};
   let dartServerPort = 0;
+  let dartServerToken = '';
   let chain = Promise.resolve();
 
   const status = (text) => bridge.channel(Channel.status).send(text);
@@ -178,7 +179,13 @@ function createCatpawHost({ bridge, workerEntryPath }) {
           if (msg.action === Action.start && !msg.ok) { dropInstance(name); report(); }
           break;
         case WorkerMsg.log:
-          status(`[log] catpaw ${name}: ${msg.message}`);
+          if (Array.isArray(msg.messages) && msg.messages.length > 0) {
+            const lines = msg.messages.map((line) => `[log] catpaw ${name}: ${line}`);
+            if (typeof bridge.sendBatch === 'function') bridge.sendBatch(Channel.status, lines);
+            else lines.forEach(status);
+          } else {
+            status(`[log] catpaw ${name}: ${msg.message}`);
+          }
           break;
         case WorkerMsg.netlog:
           bridge.channel(Channel.netlog).send(
@@ -250,7 +257,7 @@ function createCatpawHost({ bridge, workerEntryPath }) {
       workerEntryPath,
       name,
       workerData: {
-        name, scriptPath, startArg: config, dataDir, port: resolvedPort, dartPort: dartServerPort,
+        name, scriptPath, startArg: config, dataDir, port: resolvedPort, dartPort: dartServerPort, dartToken: dartServerToken,
         env: env || {}, allowWriteDirs: [dataDir, tempDir, ...extraDirs], allowReadDirs: [path.dirname(scriptPath), ...extraDirs],
         redirectRoot: tempDir, enableNetLog: !!enableNetLog, enableLog: enableLog !== false,
       },
@@ -324,8 +331,9 @@ function createCatpawHost({ bridge, workerEntryPath }) {
     try {
       if (action === Action.setDartPort) {
         dartServerPort = Number(cmd.port) || 0;
+        if (typeof cmd.token === 'string') dartServerToken = cmd.token;
         for (const inst of Object.values(instances)) {
-          try { inst.worker.postMessage({ type: LoaderMsg.setDartPort, port: dartServerPort }); } catch { /* gone */ }
+          try { inst.worker.postMessage({ type: LoaderMsg.setDartPort, port: dartServerPort, token: dartServerToken }); } catch { /* gone */ }
         }
         return;
       }

@@ -62,6 +62,11 @@ class NodeBridgePlugin private constructor(private val context: Context) :
         main.post { sink?.success(event) }
     }
 
+    internal fun deliverBatch(events: List<Map<String, String>>) {
+        if (events.isEmpty()) return
+        main.post { sink?.success(events) }
+    }
+
     override fun onListen(arguments: Any?, events: EventChannel.EventSink?) {
         sink = events
         NodeHost.attach(this)
@@ -110,6 +115,11 @@ internal object NodeHost {
         target?.deliver(mapOf("channel" to channel, "message" to message))
     }
 
+    private fun emitBatch(items: List<Pair<String, String>>) {
+        val target = synchronized(this) { listener } ?: return
+        target.deliverBatch(items.map { (c, m) -> mapOf("channel" to c, "message" to m) })
+    }
+
     private fun emitStatus(line: String) = emit("status", line)
 
     @Synchronized
@@ -130,6 +140,14 @@ internal object NodeHost {
                     synchronized(this@NodeHost) { readyLine = message }
                 }
                 emit(channel, message)
+            },
+            onEventBatch = { items ->
+                for ((ch, msg) in items) {
+                    if (ch == "status" && msg.startsWith("Node ready")) {
+                        synchronized(this@NodeHost) { readyLine = msg }
+                    }
+                }
+                emitBatch(items)
             },
             onStatusError = { emitStatus(it) },
         )
@@ -199,9 +217,12 @@ internal object NodeHost {
  */
 internal class LoopbackBridgeSession(
     private val token: String,
+    private val handshakeTimeoutMs: Int = 3_000,
     private val onEvent: (String, String) -> Unit,
+    private val onEventBatch: (List<Pair<String, String>>) -> Unit = { items -> items.forEach { (c, m) -> onEvent(c, m) } },
     private val onStatusError: (String) -> Unit = {},
     private val parseJson: (String) -> Map<String, String>? = ::parseAndroidJson,
+    private val parseBatchJson: (String) -> List<Pair<String, String>>? = ::parseAndroidBatchJson,
 ) {
     private var writer: OutputStreamWriter? = null
 
@@ -233,16 +254,25 @@ internal class LoopbackBridgeSession(
             var out: OutputStreamWriter? = null
             try {
                 runCatching { socket.tcpNoDelay = true }
+                socket.soTimeout = handshakeTimeoutMs
                 val reader = BufferedReader(InputStreamReader(socket.getInputStream(), Charsets.UTF_8))
                 val helloLine = reader.readLine() ?: continue
                 val hello = parseJson(helloLine) ?: continue
                 if (hello["hello"] != token) continue // reject foreign local processes, keep listening for Node
+                socket.soTimeout = 0
 
                 out = OutputStreamWriter(socket.getOutputStream(), Charsets.UTF_8)
                 synchronized(this) { writer = out }
                 while (true) {
                     val line = reader.readLine() ?: break
                     if (line.isBlank()) continue
+                    if (line.contains("\"b\"")) {
+                        val batch = parseBatchJson(line)
+                        if (!batch.isNullOrEmpty()) {
+                            onEventBatch(batch)
+                            continue
+                        }
+                    }
                     val frame = parseJson(line) ?: continue
                     val channel = frame["c"] ?: continue
                     val message = frame["m"] ?: continue
@@ -263,6 +293,19 @@ internal class LoopbackBridgeSession(
 private fun parseAndroidJson(raw: String): Map<String, String>? = try {
     val o = JSONObject(raw)
     buildMap { o.keys().forEach { k -> if (o.opt(k) is String) put(k, o.getString(k)) } }
+} catch (_: Exception) {
+    null
+}
+
+private fun parseAndroidBatchJson(raw: String): List<Pair<String, String>>? = try {
+    val arr = JSONObject(raw).optJSONArray("b") ?: return null
+    buildList(arr.length()) {
+        for (i in 0 until arr.length()) {
+            val item = arr.optJSONObject(i) ?: continue
+            val c = item.optString("c", "")
+            if (c.isNotEmpty() && item.has("m")) add(c to item.optString("m", ""))
+        }
+    }
 } catch (_: Exception) {
     null
 }

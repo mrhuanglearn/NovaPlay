@@ -38,23 +38,29 @@ Future<void> main() async {
       // The trimmed list is written again on the next change; starting matters more.
     }
   }
-  runApp(ProviderScope(overrides: [
+  final container = ProviderContainer(overrides: [
     initialAppPreferencesProvider.overrideWithValue(prefs),
     fontFilesProvider.overrideWithValue(fontFiles),
     initialFontSettingsProvider.overrideWithValue(fonts),
-  ], child: const UzvApp()));
-  unawaited(_startupWebDavSync());
+  ]);
+  runApp(UncontrolledProviderScope(container: container, child: const UzvApp()));
+  unawaited(_startupWebDavSync(container));
 }
 
 /// 启用同步 (WebDAV settings): sync the chosen data once per app start. Failures are shown, never thrown.
-Future<void> _startupWebDavSync() async {
-  final store = JsonStore('webdav_config.json');
+Future<void> _startupWebDavSync(ProviderContainer container) async {
+  final store = container.read(webDavConfigStoreProvider);
   try {
     final cfg = WebDavConfig.fromJson(await store.read<Map<String, dynamic>>(<String, dynamic>{}));
     if (!cfg.enabled || !cfg.isConfigured || cfg.documents.isEmpty) return;
-    await WebDavSync(WebDavClient(cfg)).sync(documents: cfg.documents);
-    final latest = WebDavConfig.fromJson(await store.read<Map<String, dynamic>>(<String, dynamic>{}));
-    await store.write(latest.copyWith(lastSyncMs: DateTime.now().millisecondsSinceEpoch).toJson());
+    final report = await container.read(webDavSyncProvider)(cfg).sync(documents: cfg.documents);
+    if (report.pulled.isNotEmpty) {
+      refreshProvidersAfterWebDavPull(container, report.pulled);
+    }
+    await store.update<Map<String, dynamic>>(
+      <String, dynamic>{},
+      (cur) => WebDavConfig.fromJson(cur).copyWith(lastSyncMs: DateTime.now().millisecondsSinceEpoch).toJson(),
+    );
   } catch (e) {
     final ctx = rootNavigatorKey.currentContext;
     if (ctx != null && ctx.mounted) showToast(ctx.l10n.webdavSyncFailed(e is WebDavException ? e.message : '$e'));

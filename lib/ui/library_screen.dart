@@ -44,6 +44,7 @@ class HistoryView extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final l = context.l10n;
+    final c = AppColors.of(context);
     return ref.watch(historyListProvider).when(
           loading: () => const Center(child: CircularProgressIndicator()),
           error: (e, _) => ErrorState(error: e, onRetry: () => ref.invalidate(historyListProvider)),
@@ -53,54 +54,75 @@ class HistoryView extends ConsumerWidget {
                   title: l.noData,
                   subtitle: l.historyEmptySubtitle,
                 )
-              : ListView(padding: EdgeInsets.only(bottom: tabBottomInset(context)), children: [
-                  SettingsSection(children: [
-                    for (final e in entries)
-                      InkWell(
-                        onTap: () => context.push(Uri(
-                          path: '/video/detail',
-                          queryParameters: {'id': e.item.id, if (e.item.siteKey != null) 'site': e.item.siteKey!},
-                        ).toString()),
-                        child: Padding(
-                          padding: const EdgeInsets.all(12),
-                          child: Row(children: [
-                            ClipRRect(
-                              borderRadius: BorderRadius.circular(8),
-                              child: SizedBox(
-                                width: 52,
-                                height: 72,
-                                child: posterFromUrl(e.item.pic,
-                                    fallback: ColoredBox(
-                                        color: AppColors.of(context).cardHigh,
-                                        child: const Icon(Icons.movie_outlined))),
-                              ),
-                            ),
-                            const SizedBox(width: 12),
-                            Expanded(
-                              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                                Text(e.item.name,
-                                    maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 15)),
-                                const SizedBox(height: 4),
-                                Text(e.episodeName,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(fontSize: 13, color: AppColors.of(context).secondaryLabel)),
-                                const SizedBox(height: 8),
+              : ListView.builder(
+                  padding: EdgeInsets.fromLTRB(16, 12, 16, 12 + tabBottomInset(context)),
+                  itemCount: entries.length,
+                  itemBuilder: (context, i) {
+                    final e = entries[i];
+                    final isFirst = i == 0;
+                    final isLast = i == entries.length - 1;
+                    final radius = BorderRadius.vertical(
+                      top: isFirst ? const Radius.circular(14) : Radius.zero,
+                      bottom: isLast ? const Radius.circular(14) : Radius.zero,
+                    );
+                    return Material(
+                      color: c.card,
+                      borderRadius: radius,
+                      clipBehavior: Clip.antiAlias,
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          InkWell(
+                            onTap: () => context.push(Uri(
+                              path: '/video/detail',
+                              queryParameters: {'id': e.item.id, if (e.item.siteKey != null) 'site': e.item.siteKey!},
+                            ).toString()),
+                            child: Padding(
+                              padding: const EdgeInsets.all(12),
+                              child: Row(children: [
                                 ClipRRect(
-                                  borderRadius: BorderRadius.circular(2),
-                                  child: LinearProgressIndicator(
-                                    value: e.fraction,
-                                    minHeight: 3,
-                                    backgroundColor: AppColors.of(context).cardHigh,
+                                  borderRadius: BorderRadius.circular(8),
+                                  child: SizedBox(
+                                    width: 52,
+                                    height: 72,
+                                    child: posterFromUrl(e.item.pic,
+                                        cacheWidth: 160,
+                                        fallback: ColoredBox(
+                                            color: c.cardHigh, child: const Icon(Icons.movie_outlined))),
                                   ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                                    Text(e.item.name,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(fontSize: 15)),
+                                    const SizedBox(height: 4),
+                                    Text(e.episodeName,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: TextStyle(fontSize: 13, color: c.secondaryLabel)),
+                                    const SizedBox(height: 8),
+                                    ClipRRect(
+                                      borderRadius: BorderRadius.circular(2),
+                                      child: LinearProgressIndicator(
+                                        value: e.fraction,
+                                        minHeight: 3,
+                                        backgroundColor: c.cardHigh,
+                                      ),
+                                    ),
+                                  ]),
                                 ),
                               ]),
                             ),
-                          ]),
-                        ),
+                          ),
+                          if (!isLast) Divider(height: 0.5, thickness: 0.5, indent: 76, color: c.separator),
+                        ],
                       ),
-                  ]),
-                ]),
+                    );
+                  },
+                ),
         );
   }
 }

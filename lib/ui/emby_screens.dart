@@ -207,11 +207,13 @@ class _MediaCard extends StatelessWidget {
             child: ClipRRect(
               borderRadius: BorderRadius.circular(8),
               child: SizedBox.expand(
-                child: Image.network(client.imageUrl(item.seriesId ?? item.id),
-                    fit: BoxFit.cover,
-                    errorBuilder: (_, __, ___) => ColoredBox(
-                        color: Theme.of(context).colorScheme.surfaceContainerHighest,
-                        child: const Icon(Icons.movie_outlined))),
+                child: posterFromUrl(
+                  client.imageUrl(item.seriesId ?? item.id),
+                  fallback: ColoredBox(
+                    color: Theme.of(context).colorScheme.surfaceContainerHighest,
+                    child: const Icon(Icons.movie_outlined),
+                  ),
+                ),
               ),
             ),
           ),
@@ -406,8 +408,11 @@ class _EmbyDetailScreenState extends ConsumerState<EmbyDetailScreen> {
       Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
         ClipRRect(
             borderRadius: BorderRadius.circular(8),
-            child: Image.network(client.imageUrl(item.id),
-                width: 120, fit: BoxFit.cover, errorBuilder: (_, __, ___) => const SizedBox(width: 120, height: 180))),
+            child: SizedBox(
+                width: 120,
+                height: 180,
+                child: posterFromUrl(client.imageUrl(item.id),
+                    cacheWidth: 360, fallback: const SizedBox(width: 120, height: 180)))),
         const SizedBox(width: 12),
         Expanded(
           child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [

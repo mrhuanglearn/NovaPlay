@@ -44,7 +44,9 @@ class CatpawSupervisor {
   }
 
   Future<int?> _recover({required bool probeFirst}) async {
-    if (probeFirst && (isRuntimeStarting?.call() ?? false) && currentApi() == null) return null;
+    final api = currentApi();
+    // Initial startup belongs to `catpawRuntimeProvider`; `onAppResumed` only supervises an already-started session.
+    if (probeFirst && api == null) return null;
     final sub = await activeSubscription();
     if (sub == null || sub.cloudUrl != null) return null;
 
@@ -52,15 +54,14 @@ class CatpawSupervisor {
     try {
       final cbPort = await callbackServer.ensureRunning();
       if (catpaw.attached) {
-        await catpaw.setDartPort(cbPort);
+        await catpaw.setDartPort(cbPort, token: callbackServer.token);
       }
     } catch (e) {
       log?.call('[recover] DartCallbackServer check failed: $e');
     }
 
-    final api = currentApi();
     if (probeFirst && api != null) {
-      if (await api.probe()) return api.port;
+      if (await api.probe(timeout: const Duration(seconds: 6))) return api.port;
       log?.call('[recover] /config 探活失败 port=${api.port}, 尝试 reload');
     }
 

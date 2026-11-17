@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 
 import '../../core/json_store.dart';
@@ -89,26 +90,40 @@ class SiteResults {
   final List<VodItem> items;
 }
 
-/// One search over several sites, run in parallel; each site's results are added when that site answers.
+/// One search over several sites with bounded concurrency and request cancellation on dispose.
 ///
 /// OBSERVED (UZN 1.1.7): the sites appear in the order they answer (two runs of the same keyword gave different
 /// orders), and only sites with results are listed, each with its count. INFERRED: a site that fails is left out like
 /// one without results; when every site fails, the first error is kept for the page to show.
 class SearchRun extends ChangeNotifier {
   /// [api] may be null only when there are no [sites] (no subscription running).
-  SearchRun({required this.keyword, required List<SpiderSite> sites, required SpiderApi? api})
-      : _total = api == null ? 0 : sites.length {
+  SearchRun({
+    required this.keyword,
+    required List<SpiderSite> sites,
+    required SpiderApi? api,
+    this.maxConcurrent = 6,
+  }) : _total = api == null ? 0 : sites.length {
     if (api == null || sites.isEmpty) {
       _done = true;
       return;
     }
-    for (final s in sites) {
-      unawaited(_searchOne(api, s));
+    var nextIndex = 0;
+    final workers = maxConcurrent.clamp(1, sites.length);
+    for (var w = 0; w < workers; w++) {
+      unawaited(() async {
+        while (!_disposed) {
+          final idx = nextIndex++;
+          if (idx >= sites.length) break;
+          await _searchOne(api, sites[idx]);
+        }
+      }());
     }
   }
 
   final String keyword;
+  final int maxConcurrent;
   final int _total;
+  final CancelToken _cancelToken = CancelToken();
   final List<SiteResults> _results = [];
   int _answered = 0;
   bool _done = false;
@@ -129,11 +144,11 @@ class SearchRun extends ChangeNotifier {
 
   Future<void> _searchOne(SpiderApi api, SpiderSite site) async {
     try {
-      final page = await api.search(site, keyword);
+      final page = await api.search(site, keyword, cancelToken: _cancelToken);
       if (_disposed) return;
       if (page.items.isNotEmpty) _results.add(SiteResults(site, page.items));
     } catch (e) {
-      if (_disposed) return;
+      if (_disposed || (e is DioException && CancelToken.isCancel(e))) return;
       _failures++;
       _firstError ??= e;
     }
@@ -145,6 +160,9 @@ class SearchRun extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    if (!_cancelToken.isCancelled) {
+      _cancelToken.cancel('search_disposed');
+    }
     super.dispose();
   }
 }

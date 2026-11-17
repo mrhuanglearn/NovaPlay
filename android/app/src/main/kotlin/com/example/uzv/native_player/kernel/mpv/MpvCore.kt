@@ -50,6 +50,7 @@ class MpvCore(
     private var thread: Thread? = null
 
     private var sidecars: List<MpvSidecar> = emptyList()
+    private var pendingSidecarSelect = false
     private var externalAudio = false
     private var pendingAudioAdd: String? = null // only when the `audio-files` option was refused
     private var userAgentTouched = false
@@ -105,6 +106,7 @@ class MpvCore(
         val h = handle
         if (h == 0L) return
         this.sidecars = sidecars
+        pendingSidecarSelect = sidecars.isNotEmpty()
         externalAudio = !audioUrl.isNullOrEmpty()
         awaitingStart = true
         loaded = false
@@ -314,6 +316,7 @@ class MpvCore(
         val h = handle
         if (h == 0L) return
         val subs = tracks("sub")
+        if (subs.any { it.external }) pendingSidecarSelect = false
         if (!subtitlesOff && subs.isNotEmpty()) {
             val firstExternal = subs.indexOfFirst { it.external }
             val pick = TrackLabels.chooseDefaultText(
@@ -362,6 +365,7 @@ class MpvCore(
             }
             MpvEvent.PLAYBACK_RESTART -> {
                 seeking = false
+                if (pendingSidecarSelect) applyTrackPreferences()
                 publishState()
             }
             MpvEvent.PROPERTY_CHANGE -> onProperty(h, ev[2].toLong(), ev[3])

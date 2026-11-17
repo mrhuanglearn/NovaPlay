@@ -268,7 +268,7 @@ class AppLocalizationsZh extends AppLocalizations {
   String get danmuModeBuiltinNote => '在内置 Node 运行时里运行你提供的 danmu_api 脚本。';
 
   @override
-  String get danmuModeSubscriptionNote => '使用当前订阅的 9321 端口。';
+  String get danmuModeSubscriptionNote => '使用当前订阅内置的弹幕服务。';
 
   @override
   String get danmuModeRemoteNote => '你自己的 danmu_api 服务器。';

@@ -58,7 +58,7 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
   final FocusNode _focus = FocusNode();
   SearchRun? _run;
   List<String> _history = const [];
-  String? _leftSite; // 左侧站点分类: the key of the site shown
+  final ValueNotifier<String?> _leftSite = ValueNotifier<String?>(null); // 左侧站点分类: the key of the site shown
 
   @override
   void initState() {
@@ -73,6 +73,7 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
   @override
   void dispose() {
     _run?.dispose();
+    _leftSite.dispose();
     _controller.dispose();
     _focus.dispose();
     super.dispose();
@@ -105,13 +106,10 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
     if (!mounted) return;
     final sites = [for (final s in ref.read(searchableSitesProvider)) if (!prefs.sitesOff.contains(s.key)) s];
     final run = SearchRun(keyword: k, sites: sites, api: rt?.api);
-    run.addListener(() {
-      if (mounted && identical(run, _run)) setState(() {});
-    });
+    _leftSite.value = null;
     setState(() {
       _run?.dispose();
       _run = run;
-      _leftSite = null;
     });
   }
 
@@ -188,7 +186,14 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
       ]),
       body: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
         _searchCard(context),
-        Expanded(child: _run == null ? _historyView(context) : _results(context, _run!, layout)),
+        Expanded(
+          child: _run == null
+              ? _historyView(context)
+              : ListenableBuilder(
+                  listenable: _run!,
+                  builder: (context, _) => _results(context, _run!, layout),
+                ),
+        ),
       ]),
     );
   }
@@ -351,28 +356,37 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
       );
 
   Widget _leftView(BuildContext context, List<SiteResults> results) {
-    final current = results.firstWhere((r) => r.site.key == _leftSite, orElse: () => results.first);
-    return Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
-      SizedBox(
-        width: 104,
-        child: ListView(padding: EdgeInsets.only(bottom: tabBottomInset(context)), children: [
-          for (final r in results)
-            _SiteColumnItem(
-              results: r,
-              selected: identical(r, current),
-              onTap: () => setState(() => _leftSite = r.site.key),
+    return ValueListenableBuilder<String?>(
+      valueListenable: _leftSite,
+      builder: (context, selectedKey, _) {
+        final current = results.firstWhere((r) => r.site.key == selectedKey, orElse: () => results.first);
+        return Row(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
+          SizedBox(
+            width: 104,
+            child: ListView.builder(
+              padding: EdgeInsets.only(bottom: tabBottomInset(context)),
+              itemCount: results.length,
+              itemBuilder: (context, i) {
+                final r = results[i];
+                return _SiteColumnItem(
+                  results: r,
+                  selected: identical(r, current),
+                  onTap: () => _leftSite.value = r.site.key,
+                );
+              },
             ),
-        ]),
-      ),
-      VerticalDivider(width: 1, thickness: 1, color: _m3(context).outlineVariant),
-      Expanded(
-        child: KeyedSubtree(
-          key: ValueKey(current.site.key),
-          child: _cards(context, [for (final i in current.items) (i, current.site.name)],
-              const EdgeInsets.fromLTRB(8, 8, 12, 0)),
-        ),
-      ),
-    ]);
+          ),
+          VerticalDivider(width: 1, thickness: 1, color: _m3(context).outlineVariant),
+          Expanded(
+            child: KeyedSubtree(
+              key: ValueKey(current.site.key),
+              child: _cards(context, [for (final i in current.items) (i, current.site.name)],
+                  const EdgeInsets.fromLTRB(8, 8, 12, 0)),
+            ),
+          ),
+        ]);
+      },
+    );
   }
 }
 

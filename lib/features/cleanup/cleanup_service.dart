@@ -4,6 +4,7 @@ import 'package:flutter/painting.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../../ui/poster_image.dart';
 import '../live/live_store.dart';
 
 /// Items of 设置 → 数据清理. OBSERVED in the original's sheet (group 缓存): 图片缓存, 临时文件, 同步缓存, 日志.
@@ -38,6 +39,7 @@ class CleanupService {
       switch (item) {
         case CleanupItem.images:
           _clearImages();
+          await PosterImage.clearDiskCache(tempDir: _tempDir);
         case CleanupItem.temp:
           final base = await _tempDir();
           for (final name in tempSubdirs) {

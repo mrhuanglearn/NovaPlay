@@ -1,5 +1,6 @@
 import 'package:dio/dio.dart';
 
+import '../../core/app_http.dart';
 import '../../models/vod.dart';
 
 /// One video source exposed by a running catpaw instance.
@@ -58,11 +59,11 @@ class SpiderApi {
   })  : _port = port,
         _isLocal = baseUrl == null,
         _dio = dio ??
-            Dio(BaseOptions(
+            createAppDio(
               baseUrl: (baseUrl ?? 'http://127.0.0.1:$port').replaceAll(RegExp(r'/+$'), ''),
               connectTimeout: const Duration(seconds: 10),
               receiveTimeout: receiveTimeout,
-            ));
+            );
 
   int _port;
   final bool _isLocal;
@@ -136,8 +137,15 @@ class SpiderApi {
         .toList();
   }
 
-  Future<Map<String, dynamic>> _post(SpiderSite site, String op, [Map<String, Object?> body = const {}]) async {
-    final res = await _withRecovery(() => _dio.post<Map<String, dynamic>>('${site.api}/$op', data: body));
+  Future<Map<String, dynamic>> _post(
+    SpiderSite site,
+    String op, [
+    Map<String, Object?> body = const {},
+    CancelToken? cancelToken,
+  ]) async {
+    final res = await _withRecovery(
+      () => _dio.post<Map<String, dynamic>>('${site.api}/$op', data: body, cancelToken: cancelToken),
+    );
     return res.data ?? const {};
   }
 
@@ -174,8 +182,8 @@ class SpiderApi {
     return VodDetail.fromJson((list.first as Map).cast<String, dynamic>(), siteKey: site.key).withRequestedId(vodId);
   }
 
-  Future<PagedVods> search(SpiderSite site, String keyword, {int page = 1}) async =>
-      PagedVods.fromJson(await _post(site, 'search', {'wd': keyword, 'page': page}), siteKey: site.key);
+  Future<PagedVods> search(SpiderSite site, String keyword, {int page = 1, CancelToken? cancelToken}) async =>
+      PagedVods.fromJson(await _post(site, 'search', {'wd': keyword, 'page': page}, cancelToken), siteKey: site.key);
 
   Future<PlayResult> play(SpiderSite site, String flag, String id) async =>
       PlayResult.fromJson(await _post(site, 'play', {'flag': flag, 'id': id}));

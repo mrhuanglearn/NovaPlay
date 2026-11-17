@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -356,7 +358,9 @@ class _DanmuSettingsScreenState extends ConsumerState<DanmuSettingsScreen> {
     try {
       final s = await _ctl.builtinStatus().timeout(const Duration(seconds: 8));
       if (mounted) setState(() => _status = s);
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('builtin danmu status refresh failed: $e');
+    }
   }
 
   @override
@@ -549,6 +553,20 @@ class _DanmuSettingsScreenState extends ConsumerState<DanmuSettingsScreen> {
       _ => SettingsSection(children: [
           SettingsTile(
               icon: Icons.cloud_outlined, title: l.danmuModeSubscription, subtitle: l.danmuModeSubscriptionNote),
+          SettingsTile(
+            icon: Icons.open_in_browser,
+            title: l.danmuOpenWeb,
+            onTap: _busy
+                ? null
+                : () => _run(() async {
+                      final rt = await ref.read(catpawRuntimeProvider.future);
+                      if (rt == null) return l.danmuNotReady;
+                      if (!context.mounted) return null;
+                      unawaited(context.push(
+                          Uri(path: '/website', queryParameters: {'url': '${rt.api.baseUrl}/danmu'}).toString()));
+                      return null;
+                    }),
+          ),
           SettingsTile(icon: Icons.bolt, title: l.testConnection, onTap: _busy ? null : () => _run(_test)),
         ]),
     };

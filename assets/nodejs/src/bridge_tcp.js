@@ -108,9 +108,18 @@ function connectTcpBridge({
           const bridge = {
             getDataDir: () => dataDir,
             send(name, message) { writeFrame({ c: name, m: String(message) }); },
+            sendBatch(name, messages) {
+              if (!Array.isArray(messages) || messages.length === 0) return;
+              if (messages.length === 1) {
+                writeFrame({ c: name, m: String(messages[0]) });
+                return;
+              }
+              writeFrame({ b: messages.map((m) => ({ c: name, m: String(m) })) });
+            },
             channel(name) {
               return {
                 send(message) { writeFrame({ c: name, m: String(message) }); },
+                sendBatch(messages) { bridge.sendBatch(name, messages); },
                 on(handler) { bus.on(name, handler); },
               };
             },

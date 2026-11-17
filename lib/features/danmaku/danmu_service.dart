@@ -1,10 +1,13 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:crypto/crypto.dart';
-
+import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../../core/app_http.dart';
 import '../../core/json_store.dart';
 import '../../services/danmu_client.dart';
 import '../catpaw/catpaw_client.dart';
@@ -111,8 +114,32 @@ String _local(int port, String? token) => 'http://127.0.0.1:$port${(token == nul
 
 String _trim(String url) => url.trim().replaceAll(RegExp(r'/+$'), '');
 
+final _configDanmuUrlPattern = RegExp(r'''["']?(?:danmuSearchUrl|danmuUrl)["']?\s*:\s*["']([^"']+)["']''');
+
+/// Extracts the danmaku base URL from a subscription's `config.js` (`danmuSearchUrl` / `danmuUrl`), stripping `/api/v2…`
+/// and rebasing loopback port 2333 onto [runtimePort] when the CatPaw instance stepped to another port.
+String? extractConfigDanmuBase(String? rawConfig, {int? runtimePort}) {
+  if (rawConfig == null || rawConfig.isEmpty) return null;
+  final match = _configDanmuUrlPattern.firstMatch(rawConfig);
+  var raw = match?.group(1)?.trim() ?? '';
+  if (raw.isEmpty) return null;
+  final apiIdx = raw.indexOf('/api/v2');
+  if (apiIdx > 0) raw = raw.substring(0, apiIdx);
+  raw = _trim(raw);
+  final uri = Uri.tryParse(raw);
+  if (uri == null || !uri.hasScheme || uri.host.isEmpty) return null;
+  if (runtimePort != null &&
+      (uri.host == '127.0.0.1' || uri.host == 'localhost') &&
+      uri.hasPort &&
+      uri.port == 2333 &&
+      runtimePort != 2333) {
+    return _trim(uri.replace(port: runtimePort).toString());
+  }
+  return raw;
+}
+
 /// Base URL of the danmaku server for [config], or null when danmaku is off / not configured.
-String? danmuBaseUrl(DanmuServiceConfig config, {Subscription? subscription}) {
+String? danmuBaseUrl(DanmuServiceConfig config, {Subscription? subscription, int? runtimePort}) {
   if (!config.enabled) return null;
   switch (config.mode) {
     case DanmuMode.off:
@@ -124,7 +151,7 @@ String? danmuBaseUrl(DanmuServiceConfig config, {Subscription? subscription}) {
       if (subscription == null) return null;
       // A cloud catpaw address (`http://ip:9321[/TOKEN]`) already is the danmaku address too.
       if (subscription.cloudUrl != null) return _trim(subscription.cloudUrl!);
-      return _local(subscriptionDanmuPort, subscription.danmuToken);
+      return _local(runtimePort ?? subscriptionDanmuPort, subscription.danmuToken);
     case DanmuMode.builtin:
       return _local(config.port, config.token);
   }
@@ -169,14 +196,19 @@ class DanmuServiceController {
     required this.manager,
     required this.installer,
     required this.activeSubscription,
+    this.ensureSubscriptionPort,
+    Dio? dio,
     Directory? root,
-  }) : _root = root;
+  })  : _dio = dio ?? createAppDio(connectTimeout: const Duration(seconds: 4), receiveTimeout: const Duration(seconds: 12)),
+        _root = root;
 
   final JsonStore store;
   final CatpawClient catpaw;
   final ManagerClient manager;
   final SubscriptionInstaller installer;
   final Future<Subscription?> Function() activeSubscription;
+  final Future<int?> Function()? ensureSubscriptionPort;
+  final Dio _dio;
   final Directory? _root;
 
   Future<DanmuServiceConfig> config() async =>
@@ -188,19 +220,127 @@ class DanmuServiceController {
   Future<DanmuClient?> resolve() async {
     final cfg = await config();
     final sub = await activeSubscription();
+    if (!cfg.enabled || cfg.mode == DanmuMode.off) return null;
+    if (cfg.mode == DanmuMode.subscription) {
+      if (sub == null) return null;
+      final resolved = await _resolveSubscriptionBase(sub);
+      return resolved == null ? null : DanmuClient(resolved, dio: _dio);
+    }
     final base = danmuBaseUrl(cfg, subscription: sub);
     if (base == null) return null;
     try {
-      if (cfg.mode == DanmuMode.subscription && sub != null && sub.cloudUrl == null) {
-        await catpaw.attach();
-        await catpaw.reloadDanmu(sub.key); // rebinds 9321 in case the network changed since the script started
-      } else if (cfg.mode == DanmuMode.builtin) {
+      if (cfg.mode == DanmuMode.builtin) {
         await _ensureBuiltin(cfg);
       }
     } catch (_) {
       return null;
     }
-    return DanmuClient(base);
+    return DanmuClient(base, dio: _dio);
+  }
+
+  Future<String?> _resolveSubscriptionBase(Subscription sub) async {
+    if (sub.cloudUrl != null) {
+      final cloudBase = _trim(sub.cloudUrl!);
+      final tok = await _probeCatpawDanmuToken(cloudBase);
+      if (tok != null && tok.isNotEmpty && !cloudBase.endsWith('/$tok')) return '$cloudBase/$tok';
+      return cloudBase;
+    }
+
+    int? runtimePort = catpaw.portOf(sub.key);
+    if (runtimePort == null && ensureSubscriptionPort != null) {
+      try {
+        runtimePort = await ensureSubscriptionPort!();
+      } catch (e) {
+        debugPrint('ensureSubscriptionPort failed for ${sub.key}: $e');
+      }
+    }
+
+    // 1. Explicit danmuSearchUrl / danmuUrl in installed config.js.
+    try {
+      final installed = await installer.installedScript(sub);
+      if (installed?.configPath != null) {
+        final rawCfg = await File(installed!.configPath!).readAsString();
+        final cfgBase = extractConfigDanmuBase(rawCfg, runtimePort: runtimePort);
+        if (cfgBase != null) {
+          if (cfgBase.contains(':$subscriptionDanmuPort') && !await _probeDanmuV2(cfgBase)) {
+            await _tryReloadDanmu(sub.key);
+          }
+          return cfgBase;
+        }
+      }
+    } catch (e) {
+      debugPrint('read config.js danmu base failed for ${sub.key}: $e');
+    }
+
+    // 2. Modern CatPaw integrated danmu server mounted on the subscription's own HTTP port (`/danmu` + `/api/v2`).
+    if (runtimePort != null) {
+      final hostBase = 'http://127.0.0.1:$runtimePort';
+      final catTok = await _probeCatpawDanmuToken(hostBase);
+      if (catTok != null) {
+        final effectiveTok = catTok.isNotEmpty ? catTok : sub.danmuToken;
+        return _local(runtimePort, effectiveTok);
+      }
+      final candidate = _local(runtimePort, sub.danmuToken);
+      if (await _probeDanmuV2(candidate)) return candidate;
+    }
+
+    // 3. Legacy standalone danmu server on port 9321.
+    final fallback9321 = _local(subscriptionDanmuPort, sub.danmuToken);
+    if (!await _probeDanmuV2(fallback9321)) {
+      await _tryReloadDanmu(sub.key);
+    }
+    return fallback9321;
+  }
+
+  /// Queries `<base>/danmu/api/config` (CatPaw built-in danmu server). Returns the configured token (`""` if none),
+  /// or `null` when `<base>` does not expose `/danmu/api/config`.
+  Future<String?> _probeCatpawDanmuToken(String base) async {
+    try {
+      final res = await _dio.get<Object?>(
+        '$base/danmu/api/config',
+        options: Options(
+          sendTimeout: const Duration(milliseconds: 1500),
+          receiveTimeout: const Duration(milliseconds: 1500),
+          validateStatus: (_) => true,
+        ),
+      );
+      if (res.statusCode != 200) return null;
+      final data = res.data is String ? jsonDecode(res.data as String) : res.data;
+      if (data is! Map) return null;
+      final envs = data['envs'];
+      final rawTok = envs is Map ? '${envs['TOKEN'] ?? ''}'.trim() : '';
+      if (rawTok.isNotEmpty && !RegExp(r'^\*+$').hasMatch(rawTok)) return rawTok;
+      return '';
+    } catch (_) {
+      return null;
+    }
+  }
+
+  Future<bool> _probeDanmuV2(String base) async {
+    try {
+      final res = await _dio.get<Object?>(
+        '$base/api/v2/search/anime',
+        queryParameters: const {'keyword': 'a'},
+        options: Options(
+          sendTimeout: const Duration(milliseconds: 1500),
+          receiveTimeout: const Duration(milliseconds: 2000),
+          validateStatus: (_) => true,
+        ),
+      );
+      final code = res.statusCode ?? 0;
+      return code >= 200 && code < 400;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  Future<void> _tryReloadDanmu(String subKey) async {
+    try {
+      await catpaw.attach();
+      await catpaw.reloadDanmu(subKey);
+    } catch (_) {
+      // Many subscriptions serve danmu on their main HTTP port and register no 9321 server; never abort resolve().
+    }
   }
 
   Future<File> _scriptFile() async {

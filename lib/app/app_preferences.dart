@@ -215,9 +215,7 @@ class AppPreferencesNotifier extends Notifier<AppPreferences> {
       ref.read(catpawRuntimeProvider).valueOrNull?.api.receiveTimeout = next.catpawTimeout;
     }
     final store = ref.read(settingsStoreProvider);
-    final settings = Map<String, dynamic>.of(await store.read<Map<String, dynamic>>(const {}));
-    settings.addAll(next.toJson());
-    await store.write(settings);
+    await store.update<Map<String, dynamic>>(const {}, (cur) => {...cur, ...next.toJson()});
   }
 
   Future<void> setLockHash(String? hash) => update(state.withLockHash(hash));

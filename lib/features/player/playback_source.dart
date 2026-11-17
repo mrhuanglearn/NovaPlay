@@ -30,7 +30,7 @@ abstract class PlaybackSource {
 
   /// [quality] is the source quality being played (index into the play result's qualities).
   Future<void> saveProgress(int lineIndex, int episodeIndex, double position, double duration,
-      {int quality = 0}) async {}
+      {int quality = 0, bool flush = true}) async {}
 
   /// The player page closed at [position] seconds (after the last [saveProgress]).
   Future<void> finish(int lineIndex, int episodeIndex, double position) async {}
@@ -83,19 +83,22 @@ class VodPlaybackSource extends PlaybackSource {
 
   @override
   Future<void> saveProgress(int lineIndex, int episodeIndex, double position, double duration,
-      {int quality = 0}) async {
+      {int quality = 0, bool flush = true}) async {
     if (!recordHistory) return;
     final eps = detail.lines[lineIndex].episodes;
-    await history.record(ProgressEntry(
-      item: detail.item,
-      lineIndex: lineIndex,
-      episodeIndex: episodeIndex,
-      episodeName: episodeIndex < eps.length ? eps[episodeIndex].name : '',
-      positionSeconds: position,
-      durationSeconds: duration,
-      updatedAt: 0, // stamped by the repository
-      qualityIndex: quality,
-    ));
+    await history.record(
+      ProgressEntry(
+        item: detail.item,
+        lineIndex: lineIndex,
+        episodeIndex: episodeIndex,
+        episodeName: episodeIndex < eps.length ? eps[episodeIndex].name : '',
+        positionSeconds: position,
+        durationSeconds: duration,
+        updatedAt: 0, // stamped by the repository
+        qualityIndex: quality,
+      ),
+      flush: flush,
+    );
     await _replaceEntryUnderAnsweredId();
   }
 

@@ -1,4 +1,7 @@
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
+
+import '../core/app_http.dart';
 
 /// TMDB metadata (posters, episode lists, calendar air dates).
 ///
@@ -83,9 +86,28 @@ class TmdbEpisode {
 }
 
 class TmdbClient {
-  TmdbClient(this.settings, {Dio? dio}) : _dio = dio ?? Dio();
+  TmdbClient(this.settings, {Dio? dio})
+      : _dio = dio ?? createAppDio(connectTimeout: const Duration(seconds: 10), receiveTimeout: const Duration(seconds: 15));
   final TmdbSettings settings;
   final Dio _dio;
+  final Map<(int, int), Future<List<TmdbEpisode>>> _seasonCache = {};
+
+  Duration? get dioConnectTimeout => _dio.options.connectTimeout;
+
+  /// Memoises season episode lookups per `(tvId, seasonNumber)` so switching weeks in the calendar never re-fetches.
+  @protected
+  Future<List<TmdbEpisode>> cachedSeason(
+      int tvId, int seasonNumber, Future<List<TmdbEpisode>> Function() loader) {
+    final key = (tvId, seasonNumber);
+    final existing = _seasonCache[key];
+    if (existing != null) return existing;
+    final task = loader().catchError((Object e, StackTrace st) {
+      _seasonCache.remove(key);
+      Error.throwWithStackTrace(e, st);
+    });
+    _seasonCache[key] = task;
+    return task;
+  }
 
   Future<Map<String, dynamic>> _get(String path, [Map<String, Object?> query = const {}]) async {
     final key = settings.apiKey;
@@ -120,10 +142,14 @@ class TmdbClient {
 
   Future<Map<String, dynamic>> details(TmdbMatch m) => _get('/${m.mediaType}/${m.id}', {'append_to_response': 'credits'});
 
-  Future<List<TmdbEpisode>> season(int tvId, int seasonNumber) async {
-    final j = await _get('/tv/$tvId/season/$seasonNumber');
-    return ((j['episodes'] as List?) ?? const []).whereType<Map>().map((e) => TmdbEpisode.fromJson(e.cast<String, dynamic>())).toList();
-  }
+  Future<List<TmdbEpisode>> season(int tvId, int seasonNumber) =>
+      cachedSeason(tvId, seasonNumber, () async {
+        final j = await _get('/tv/$tvId/season/$seasonNumber');
+        return ((j['episodes'] as List?) ?? const [])
+            .whereType<Map>()
+            .map((e) => TmdbEpisode.fromJson(e.cast<String, dynamic>()))
+            .toList();
+      });
 
   String imageUrl(String path, {String size = 'w500'}) => '${settings.effectiveImage}/$size$path';
 }

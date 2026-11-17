@@ -1,3 +1,6 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:uzv_reimpl/features/player/native_player_api.g.dart';
 import 'package:uzv_reimpl/features/player/player_session.dart';
@@ -7,8 +10,11 @@ import 'package:uzv_reimpl/models/vod.dart';
 
 class FakeHost extends NativePlayerHostApi {
   final payloads = <SourcePayload>[];
+  final danmakus = <DanmakuPayload>[];
   @override
   Future<void> provideSource(SourcePayload payload) async => payloads.add(payload);
+  @override
+  Future<void> updateDanmaku(DanmakuPayload payload) async => danmakus.add(payload);
 }
 
 class FakeSniffer extends SnifferService {
@@ -103,7 +109,30 @@ void main() {
       expect(r.subtitles.first.language, 'en');
       expect(r.subtitles.first.mimeType, 'application/x-subrip');
       expect(PlayResult.fromJson({'url': 'u', 'sub': {'url': 'http://s/x.srt'}}).subtitles, hasLength(1));
+      expect(
+        PlayResult.fromJson({'url': 'u', 'subtitleUrl': 'http://s/z.ass', 'subtitleName': '中文字幕'}).subtitles.single.name,
+        '中文字幕',
+      );
+      expect(
+        PlayResult.fromJson({'url': 'u', 'subtitle': r'简中$$$http://s/1.srt#繁中$$$http://s/2.srt'}).subtitles.map((s) => s.name),
+        ['简中', '繁中'],
+      );
       expect(PlayResult.fromJson({'url': 'u'}).subtitles, isEmpty);
+    });
+
+    test('video-returned danmaku url and inline comments survive quality selection', () {
+      final r = PlayResult.fromJson({
+        'url': ['HD', 'http://a/hd', 'SD', 'http://a/sd'],
+        'danmaku': 'http://d/1.xml',
+      }).withQuality(1);
+      expect(r.videoDanmuUrl, 'http://d/1.xml');
+      final inline = PlayResult.fromJson({
+        'url': 'http://a/1',
+        'danmu': [
+          {'p': '2,1,16777215,u', 'm': 'inline-hit'}
+        ],
+      });
+      expect(inline.videoDanmuComments.single.text, 'inline-hit');
     });
   });
 
@@ -169,6 +198,34 @@ void main() {
       );
       await session.onEpisodeRequest(request(0));
       expect(host.payloads.single.errorMessage, 'HTTP 401：boom');
+    });
+
+    test('preferVideoDanmu loads XML danmaku from video play response and falls back on empty', () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      server.listen((req) async {
+        req.response.write('<?xml version="1.0"?><i><d p="3.5,1,25,16777215,0,0,0,0">xml-danmu</d></i>');
+        await req.response.close();
+      });
+
+      final host = FakeHost();
+      final source = ScriptedSource(PlayResult.fromJson({
+        'url': 'http://a/1.mp4',
+        'danmaku': 'http://127.0.0.1:${server.port}/ep1.xml',
+      }));
+      final session = PlayerSession(
+        sessionId: 's',
+        source: source,
+        host: host,
+        sniffer: FakeSniffer(),
+        preferVideoDanmu: () async => true,
+        onPreferences: (_) {},
+      );
+      await session.onEpisodeRequest(request(0));
+      await session.onDanmakuRequest(DanmakuRequest(sessionId: 's', lineIndex: 0, episodeIndex: 0));
+      expect(host.danmakus, hasLength(1));
+      final decoded = jsonDecode(host.danmakus.single.commentsJson) as List;
+      expect(decoded.single['x'], 'xml-danmu');
     });
   });
 }

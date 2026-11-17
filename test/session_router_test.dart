@@ -23,7 +23,7 @@ class RecordingSource extends PlaybackSource {
 
   @override
   Future<void> saveProgress(int lineIndex, int episodeIndex, double position, double duration,
-          {int quality = 0}) async =>
+          {int quality = 0, bool flush = true}) async =>
       saved.add((lineIndex, episodeIndex, position, duration));
 
   @override

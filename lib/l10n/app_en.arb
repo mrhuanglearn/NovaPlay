@@ -86,7 +86,7 @@
   "danmuModeRemote": "Remote",
   "danmuModeOffNote": "No danmaku server is used.",
   "danmuModeBuiltinNote": "Runs a danmu_api script you supply inside the Node runtime.",
-  "danmuModeSubscriptionNote": "Uses port 9321 of the active subscription.",
+  "danmuModeSubscriptionNote": "Uses the danmaku service bundled with the active subscription.",
   "danmuModeRemoteNote": "Your own danmu_api server.",
   "danmuScriptUrl": "danmu_api script URL (server.cjs)",
   "danmuDownloadScript": "Download / update script",

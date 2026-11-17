@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 
 import 'package:xml/xml.dart';
 
@@ -57,6 +58,9 @@ List<LiveChannel> parseM3u(String text) {
   return out;
 }
 
+/// Parses an M3U playlist on a background isolate so large channel lists never stall the UI isolate.
+Future<List<LiveChannel>> parseM3uAsync(String text) => Isolate.run(() => parseM3u(text));
+
 class EpgEntry {
   const EpgEntry({required this.channelId, required this.start, required this.stop, required this.title, this.description});
   final String channelId;
@@ -66,9 +70,11 @@ class EpgEntry {
   final String? description;
 }
 
+final _xmltvTimeRe = RegExp(r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})?\s*([+-]\d{4})?$');
+
 /// XMLTV timestamps: `20261108183000 +0800`.
 DateTime? parseXmltvTime(String s) {
-  final m = RegExp(r'^(\d{4})(\d{2})(\d{2})(\d{2})(\d{2})(\d{2})?\s*([+-]\d{4})?$').firstMatch(s.trim());
+  final m = _xmltvTimeRe.firstMatch(s.trim());
   if (m == null) return null;
   final utc = DateTime.utc(int.parse(m[1]!), int.parse(m[2]!), int.parse(m[3]!), int.parse(m[4]!), int.parse(m[5]!),
       int.parse(m[6] ?? '0'));
@@ -100,13 +106,22 @@ List<EpgEntry> _programmes(XmlDocument doc) {
 /// Accepts plain XMLTV bytes or gzip (`.xml.gz` is the documented example in the UI strings).
 List<EpgEntry> parseXmltv(List<int> bytes) => _programmes(_xmltvDocument(bytes));
 
-/// A parsed XMLTV file: programmes per channel id plus the channels' display names (used for fallback matching).
+Map<String, String> _buildLowerNameIndex(Map<String, String> displayNames) {
+  final map = <String, String>{};
+  for (final e in displayNames.entries) {
+    map.putIfAbsent(e.value.toLowerCase(), () => e.key);
+  }
+  return map;
+}
+
+/// A parsed XMLTV file: programmes per channel id plus pre-indexed case-insensitive display names for O(1) fallback.
 class XmltvGuide {
-  const XmltvGuide(this.byChannel, this.displayNames);
+  XmltvGuide(this.byChannel, this.displayNames) : _lowerNameToId = _buildLowerNameIndex(displayNames);
   final Map<String, List<EpgEntry>> byChannel;
   final Map<String, String> displayNames;
+  final Map<String, String> _lowerNameToId;
 
-  List<EpgEntry> forChannel(LiveChannel ch) => epgFor(ch, byChannel, displayNames);
+  List<EpgEntry> forChannel(LiveChannel ch) => _epgForIndexed(ch, byChannel, _lowerNameToId);
 }
 
 XmltvGuide parseXmltvGuide(List<int> bytes) {
@@ -127,6 +142,9 @@ XmltvGuide parseXmltvGuide(List<int> bytes) {
   return XmltvGuide(byChannel, names);
 }
 
+/// Decompresses gzip and parses XMLTV DOM on a background isolate so large guides never freeze UI frames.
+Future<XmltvGuide> parseXmltvGuideAsync(List<int> bytes) => Isolate.run(() => parseXmltvGuide(bytes));
+
 /// The programme on air at [now], if the guide has one.
 EpgEntry? currentProgramme(List<EpgEntry> entries, DateTime now) {
   for (final e in entries) {
@@ -135,14 +153,20 @@ EpgEntry? currentProgramme(List<EpgEntry> entries, DateTime now) {
   return null;
 }
 
-/// EPG lookup (changelog 1.1.8: "match by several keywords with fallback"): tvg-id, then tvg-name, then name.
-List<EpgEntry> epgFor(LiveChannel ch, Map<String, List<EpgEntry>> byChannel, Map<String, String> displayNames) {
-  final candidates = [ch.tvgId, ch.tvgName, ch.name].whereType<String>().map((s) => s.trim()).where((s) => s.isNotEmpty);
-  for (final c in candidates) {
-    final hit = byChannel[c];
-    if (hit != null) return hit;
-    final id = displayNames.entries.firstWhere((e) => e.value.toLowerCase() == c.toLowerCase(), orElse: () => const MapEntry('', '')).key;
-    if (id.isNotEmpty && byChannel[id] != null) return byChannel[id]!;
+List<EpgEntry> _epgForIndexed(
+    LiveChannel ch, Map<String, List<EpgEntry>> byChannel, Map<String, String> lowerNameToId) {
+  for (final raw in [ch.tvgId, ch.tvgName, ch.name]) {
+    if (raw == null) continue;
+    final c = raw.trim();
+    if (c.isEmpty) continue;
+    final direct = byChannel[c];
+    if (direct != null) return direct;
+    final id = lowerNameToId[c.toLowerCase()];
+    if (id != null && byChannel[id] != null) return byChannel[id]!;
   }
   return const [];
 }
+
+/// EPG lookup (changelog 1.1.8: "match by several keywords with fallback"): tvg-id, then tvg-name, then name.
+List<EpgEntry> epgFor(LiveChannel ch, Map<String, List<EpgEntry>> byChannel, Map<String, String> displayNames) =>
+    _epgForIndexed(ch, byChannel, _buildLowerNameIndex(displayNames));

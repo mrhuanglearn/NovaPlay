@@ -617,7 +617,7 @@ abstract class AppLocalizations {
   /// No description provided for @danmuModeSubscriptionNote.
   ///
   /// In en, this message translates to:
-  /// **'Uses port 9321 of the active subscription.'**
+  /// **'Uses the danmaku service bundled with the active subscription.'**
   String get danmuModeSubscriptionNote;
 
   /// No description provided for @danmuModeRemoteNote.

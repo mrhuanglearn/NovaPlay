@@ -3,6 +3,7 @@ import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 
+import '../core/app_http.dart';
 import '../core/json_store.dart';
 import '../core/restore_error.dart';
 
@@ -123,17 +124,19 @@ abstract class WebDavRemote {
 class WebDavClient implements WebDavRemote {
   WebDavClient(this.config, {Dio? dio})
       : _dio = dio ??
-            Dio(BaseOptions(
+            createAppDio(
               connectTimeout: const Duration(seconds: 10),
               receiveTimeout: const Duration(seconds: 30),
               validateStatus: (_) => true,
-            )) {
+            ) {
     final token = base64Encode(utf8.encode('${config.username}:${config.password}'));
     _dio.options.headers['Authorization'] = 'Basic $token';
   }
 
   final WebDavConfig config;
   final Dio _dio;
+
+  Duration? get dioConnectTimeout => _dio.options.connectTimeout;
 
   String _url(String relative) {
     final base = config.url.replaceAll(RegExp(r'/+$'), '');

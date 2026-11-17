@@ -101,7 +101,7 @@ final class NodeBridgePlugin: NSObject, FlutterStreamHandler {
     }
   }
 
-  func deliver(_ event: [String: String]) {
+  func deliver(_ event: Any) {
     DispatchQueue.main.async { [weak self] in
       self?.sink?(event)
     }
@@ -157,6 +157,14 @@ private final class NodeHostIos {
     let target = listener
     lock.unlock()
     target?.deliver(["channel": channel, "message": message])
+  }
+
+  private func emitBatch(_ batch: [[String: String]]) {
+    guard !batch.isEmpty else { return }
+    lock.lock()
+    let target = listener
+    lock.unlock()
+    target?.deliver(batch)
   }
 
   private func emitStatus(_ line: String) {
@@ -413,6 +421,8 @@ private final class NodeHostIos {
   private func serveConnection(connFd: Int32) {
     var noSigPipe: Int32 = 1
     setsockopt(connFd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
+    var handshakeTimeout = timeval(tv_sec: 3, tv_usec: 0)
+    setsockopt(connFd, SOL_SOCKET, SO_RCVTIMEO, &handshakeTimeout, socklen_t(MemoryLayout<timeval>.size))
 
     defer {
       lock.lock()
@@ -429,7 +439,10 @@ private final class NodeHostIos {
       let n = Darwin.read(connFd, &chunk, chunk.count)
       if n < 0 {
         let err = errno
-        if err == EINTR || err == EAGAIN {
+        if err == EINTR {
+          continue
+        }
+        if (err == EAGAIN || err == EWOULDBLOCK) && handshakeVerified {
           continue
         }
         break
@@ -450,9 +463,23 @@ private final class NodeHostIos {
         if !handshakeVerified {
           guard (obj["hello"] as? String) == token else { return }
           handshakeVerified = true
+          var noTimeout = timeval(tv_sec: 0, tv_usec: 0)
+          setsockopt(connFd, SOL_SOCKET, SO_RCVTIMEO, &noTimeout, socklen_t(MemoryLayout<timeval>.size))
           lock.lock()
           clientFd = connFd
           lock.unlock()
+          continue
+        }
+
+        if let rawBatch = obj["b"] as? [[String: Any]] {
+          var mapped: [[String: String]] = []
+          mapped.reserveCapacity(rawBatch.count)
+          for item in rawBatch {
+            if let ch = item["c"] as? String, let msg = item["m"] as? String {
+              mapped.append(["channel": ch, "message": msg])
+            }
+          }
+          emitBatch(mapped)
           continue
         }
 

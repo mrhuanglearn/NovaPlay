@@ -1,3 +1,5 @@
+import 'package:flutter/foundation.dart';
+
 import '../../core/json_store.dart';
 import '../../models/vod.dart';
 import '../../services/media_server_client.dart';
@@ -61,11 +63,11 @@ class MediaServerPlaybackSource extends PlaybackSource {
 
   @override
   Future<void> saveProgress(int lineIndex, int episodeIndex, double position, double duration,
-      {int quality = 0}) async {
+      {int quality = 0, bool flush = true}) async {
     try {
       await client.reportProgress(items[episodeIndex].id, (position * _ticksPerSecond).round());
-    } catch (_) {
-      // progress reporting must never interrupt playback
+    } catch (e) {
+      debugPrint('mediaServer.reportProgress failed: $e');
     }
   }
 
@@ -73,7 +75,9 @@ class MediaServerPlaybackSource extends PlaybackSource {
   Future<void> finish(int lineIndex, int episodeIndex, double position) async {
     try {
       await client.reportStopped(items[episodeIndex].id, (position * _ticksPerSecond).round());
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('mediaServer.reportStopped failed: $e');
+    }
   }
 }
 

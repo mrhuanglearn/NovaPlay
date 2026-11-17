@@ -2,9 +2,12 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:archive/archive.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:uzv_reimpl/app/providers.dart';
 import 'package:uzv_reimpl/core/json_store.dart';
 import 'package:uzv_reimpl/features/backup/backup_service.dart';
+import 'package:uzv_reimpl/features/library/watch_repository.dart';
 import 'package:uzv_reimpl/services/webdav_sync.dart';
 
 class MemoryRemote implements WebDavRemote {
@@ -194,6 +197,37 @@ void main() {
       final r = await WebDavSync(remote, storeFor: (f) => JsonStore(f, baseDir: dir), state: JsonStore('s.json', baseDir: dir))
           .sync(documents: documentsForTypes(['history']));
       expect(r.pushed, ['history.json']);
+    });
+
+    test('separate JsonStore("settings.json") instances share singleton queue and cache without losing updates', () async {
+      final dir = await Directory.systemTemp.createTemp('storeSingleton');
+      addTearDown(() => dir.delete(recursive: true));
+      final s1 = JsonStore('settings.json', baseDir: dir);
+      final s2 = JsonStore('settings.json', baseDir: dir);
+      expect(s1, equals(s2));
+
+      await Future.wait([
+        s1.update<Map<String, dynamic>>(<String, dynamic>{}, (m) => {...m, 'a': 1}),
+        s2.update<Map<String, dynamic>>(<String, dynamic>{}, (m) => {...m, 'b': 2}),
+      ]);
+      expect(await JsonStore('settings.json', baseDir: dir).read<Map<String, dynamic>>({}), {'a': 1, 'b': 2});
+    });
+
+    test('refreshProvidersAfterWebDavPull invalidates providers so pulled favorites appear immediately', () async {
+      final dir = await Directory.systemTemp.createTemp('webdavRefresh');
+      addTearDown(() => dir.delete(recursive: true));
+      final container = ProviderContainer(overrides: [
+        favoriteRepositoryProvider.overrideWithValue(FavoriteRepository(store: JsonStore('favorites.json', baseDir: dir))),
+      ]);
+      addTearDown(container.dispose);
+
+      expect(await container.read(favoriteListProvider.future), isEmpty);
+      await JsonStore('favorites.json', baseDir: dir).write([
+        {'vod_id': 'v1', 'vod_name': 'Pulled Movie', 'siteKey': 's1'}
+      ]);
+      refreshProvidersAfterWebDavPull(container, const ['favorites.json']);
+      final updated = await container.read(favoriteListProvider.future);
+      expect(updated.single.name, 'Pulled Movie');
     });
   });
 }

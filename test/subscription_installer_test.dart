@@ -199,6 +199,38 @@ void main() {
       expect((await repo.all()).map((s) => s.key), [b.key]);
       expect(await SubscriptionInstaller(root: dir).installedScript(a), isNull);
     });
+
+    test('updateSubscription edits URL & name and preserves existing install on download failure', () async {
+      put('/v1/index.js', script);
+      const v2 = 'module.exports = { start() {}, v: 2 };';
+      put('/v2/index.js', v2);
+      final installer = SubscriptionInstaller(root: dir);
+      final sub = await service.addNetwork(url: '${base()}/v1/index.js.md5', name: 'Old');
+
+      await expectLater(
+        service.updateSubscription(sub, url: '${base()}/missing/index.js.md5', name: 'Broken'),
+        throwsA(anything),
+      );
+      expect((await repo.all()).single.indexJsUrl, '${base()}/v1/index.js.md5');
+      expect((await installer.installedScript(sub))!.md5, md5Of(script));
+
+      clock = clock.add(const Duration(minutes: 5));
+      final updated = await service.updateSubscription(sub, url: ' ${base()}/v2/index.js.md5 ', name: 'NewName');
+      expect(updated.name, 'NewName');
+      expect(updated.indexJsUrl, '${base()}/v2/index.js.md5');
+      expect(updated.installedMd5, md5Of(v2));
+      expect(updated.updatedAt, clock.millisecondsSinceEpoch);
+      expect((await repo.all()).single.indexJsUrl, '${base()}/v2/index.js.md5');
+
+      // Saving again with the same URL does not collide with itself, while colliding with another subscription fails.
+      final same = await service.updateSubscription(updated, url: '${base()}/v2/index.js.md5', name: 'RenamedAgain');
+      expect(same.name, 'RenamedAgain');
+      final other = await service.addNetwork(url: '${base()}/v1/index.js.md5', name: 'Other');
+      await expectLater(
+        service.updateSubscription(other, url: '${base()}/v2/index.js.md5'),
+        throwsA(isA<DuplicateSubscriptionException>()),
+      );
+    });
   });
 
   test('discard removes an install so the next start downloads again', () async {

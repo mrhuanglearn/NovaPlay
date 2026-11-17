@@ -1,5 +1,7 @@
+import 'dart:convert';
 import 'dart:io';
 
+import 'package:crypto/crypto.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -42,12 +44,18 @@ class LiveSource {
   Map<String, dynamic> toJson() => {'id': id, 'name': name, 'url': url, 'epgUrl': epgUrl, 'userAgent': userAgent, 'refresh': refresh.name};
 }
 
-/// Keeps the last download of each playlist (`live_cache/<id>.m3u`) and decides when to fetch it again.
+/// Keeps the last download of each playlist (`live_cache/<id>.m3u`) and EPG guide (`live_cache/epg_<hash>.bin`) and
+/// decides when to fetch them again.
 class LivePlaylistLoader {
-  LivePlaylistLoader({required this.fetch, Directory? cacheDir, DateTime Function()? now})
-      : _cacheDir = cacheDir,
+  LivePlaylistLoader({
+    required this.fetch,
+    this.fetchGuideBytes,
+    Directory? cacheDir,
+    DateTime Function()? now,
+  })  : _cacheDir = cacheDir,
         _now = now ?? DateTime.now;
   final Future<String> Function(LiveSource source) fetch;
+  final Future<List<int>> Function(String url)? fetchGuideBytes;
   final Directory? _cacheDir;
   final DateTime Function() _now;
 
@@ -57,6 +65,38 @@ class LivePlaylistLoader {
     final dir = await _dir();
     await dir.create(recursive: true);
     return File(p.join(dir.path, '${id.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_')}.m3u'));
+  }
+
+  Future<File> _guideFile(String url) async {
+    final dir = await _dir();
+    await dir.create(recursive: true);
+    return File(p.join(dir.path, 'epg_${md5.convert(utf8.encode(url))}.bin'));
+  }
+
+  /// Loads raw XMLTV/gzip guide bytes from disk cache when fresh, downloading on miss and falling back to disk offline.
+  Future<List<int>> loadGuideBytes(String url, {LiveRefresh refresh = LiveRefresh.daily}) async {
+    final f = await _guideFile(url);
+    final cached = await f.exists();
+    final fresh = switch (refresh) {
+      LiveRefresh.off => cached,
+      LiveRefresh.always => false,
+      LiveRefresh.daily => cached && _now().difference(await f.lastModified()) < const Duration(hours: 24),
+    };
+    if (fresh) return f.readAsBytes();
+    final downloader = fetchGuideBytes;
+    if (downloader == null) return cached ? f.readAsBytes() : const <int>[];
+    try {
+      final bytes = await downloader(url);
+      if (bytes.isNotEmpty) {
+        final tmp = File('${f.path}.tmp');
+        await tmp.writeAsBytes(bytes, flush: true);
+        await tmp.rename(f.path);
+      }
+      return bytes;
+    } catch (_) {
+      if (cached) return f.readAsBytes();
+      rethrow;
+    }
   }
 
   /// The cached copy when it is fresh enough for [LiveSource.refresh], else a new download (falling back to the

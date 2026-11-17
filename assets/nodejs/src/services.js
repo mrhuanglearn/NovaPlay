@@ -50,7 +50,15 @@ function createServiceManager({ bridge, workerEntryPath }) {
   function onMessage(name) {
     return (m) => {
       switch (m && m.type) {
-        case WorkerMsg.log: status(`[log] svc ${name}: ${m.message}`); break;
+        case WorkerMsg.log:
+          if (Array.isArray(m.messages) && m.messages.length > 0) {
+            const lines = m.messages.map((line) => `[log] svc ${name}: ${line}`);
+            if (typeof bridge.sendBatch === 'function') bridge.sendBatch(Channel.status, lines);
+            else lines.forEach(status);
+          } else {
+            status(`[log] svc ${name}: ${m.message}`);
+          }
+          break;
         case WorkerMsg.netlog:
           bridge.channel(Channel.netlog).send(`[net] ${m.method} ${m.url} → ${m.status != null ? m.status : m.error || '?'} (${m.ms || 0}ms)`);
           break;

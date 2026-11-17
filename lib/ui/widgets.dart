@@ -12,6 +12,13 @@ import '../models/vod.dart';
 import 'load_error.dart';
 import 'poster_image.dart';
 
+bool _shouldTriggerNearEnd(ScrollNotification n) =>
+    n.depth == 0 &&
+    n.metrics.axis == Axis.vertical &&
+    n.metrics.maxScrollExtent > 0 &&
+    n.metrics.pixels >= n.metrics.maxScrollExtent - 300 &&
+    (n is ScrollUpdateNotification || n is OverscrollNotification);
+
 /// Poster grid used by home, search, favorites and history.
 class VodGrid extends StatelessWidget {
   const VodGrid(
@@ -40,7 +47,7 @@ class VodGrid extends StatelessWidget {
     final columns = (width / 130).floor().clamp(2, 10);
     return NotificationListener<ScrollNotification>(
       onNotification: (n) {
-        if (onNearEnd != null && n.metrics.pixels >= n.metrics.maxScrollExtent - 300) onNearEnd!();
+        if (onNearEnd != null && _shouldTriggerNearEnd(n)) onNearEnd!();
         return false;
       },
       child: CustomScrollView(controller: controller, slivers: [
@@ -141,15 +148,32 @@ final _catVodHeaderTag = RegExp(
 
 Widget _poster(VodItem item) => posterFromUrl(item.pic, fallback: const _PosterFallback());
 
-/// A poster from a CatVod `vod_pic` value (with its `@Referer=` / anti-hotlink headers), or [fallback].
-Widget posterFromUrl(String? raw, {required Widget fallback}) {
+/// A poster from a CatVod `vod_pic` value (with its `@Referer=` / anti-hotlink headers), decoded at display size,
+/// or [fallback].
+Widget posterFromUrl(String? raw, {required Widget fallback, int? cacheWidth, BoxFit fit = BoxFit.cover}) {
   if (raw == null || raw.trim().isEmpty) return fallback;
   final req = parsePosterRequest(raw);
   if (req.url.isEmpty) return fallback;
-  return Image(
-    image: PosterImage(req.url, headers: req.headers),
-    fit: BoxFit.cover,
-    errorBuilder: (_, __, ___) => fallback,
+  final base = PosterImage(req.url, headers: req.headers);
+  if (cacheWidth != null) {
+    return Image(
+      image: ResizeImage.resizeIfNeeded(cacheWidth, null, base),
+      fit: fit,
+      errorBuilder: (_, __, ___) => fallback,
+    );
+  }
+  return LayoutBuilder(
+    builder: (context, constraints) {
+      final dpr = MediaQuery.devicePixelRatioOf(context);
+      final targetWidth = constraints.hasBoundedWidth && constraints.maxWidth > 0
+          ? (constraints.maxWidth * dpr).round().clamp(64, 1080)
+          : 360;
+      return Image(
+        image: ResizeImage.resizeIfNeeded(targetWidth, null, base),
+        fit: fit,
+        errorBuilder: (_, __, ___) => fallback,
+      );
+    },
   );
 }
 
@@ -168,8 +192,10 @@ class VodCard extends StatelessWidget {
         Expanded(
           child: ClipRRect(
             borderRadius: BorderRadius.circular(12),
-            child: Stack(fit: StackFit.expand, children: [
-              _poster(item),
+            child: ColoredBox(
+              color: c.card,
+              child: Stack(fit: StackFit.expand, children: [
+                _poster(item),
               if ((item.remarks ?? '').isNotEmpty)
                 Positioned(
                   left: 7,
@@ -188,7 +214,8 @@ class VodCard extends StatelessWidget {
                     ),
                   ),
                 ),
-            ]),
+              ]),
+            ),
           ),
         ),
         const SizedBox(height: 7),
@@ -217,7 +244,7 @@ class VodList extends StatelessWidget {
     final c = AppColors.of(context);
     return NotificationListener<ScrollNotification>(
       onNotification: (n) {
-        if (onNearEnd != null && n.metrics.pixels >= n.metrics.maxScrollExtent - 300) onNearEnd!();
+        if (onNearEnd != null && _shouldTriggerNearEnd(n)) onNearEnd!();
         return false;
       },
       child: ListView.builder(

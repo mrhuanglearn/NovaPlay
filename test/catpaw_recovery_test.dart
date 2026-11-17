@@ -28,6 +28,7 @@ void main() {
 
     final http = HttpClient();
     final req = await http.postUrl(Uri.parse('http://127.0.0.1:$p2/ping'));
+    req.headers.set('x-uzv-token', server.token);
     req.write('{}');
     final res = await req.close();
     final body = jsonDecode(await utf8.decoder.bind(res).join()) as Map<String, dynamic>;

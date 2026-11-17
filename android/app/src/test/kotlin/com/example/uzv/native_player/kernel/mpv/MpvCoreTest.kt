@@ -355,6 +355,21 @@ class MpvCoreTest {
     }
 
     @Test
+    fun asyncRemoteSidecarSubtitleAppearingByPlaybackRestartGetsSelected() {
+        started()
+        api.setTracks(track(1, "sub", lang = "ja", title = "Embedded", selected = true))
+        load(sidecars = listOf(MpvSidecar("http://127.0.0.1:2333/sub?id=1", "中文字幕", "zh")))
+        api.event(MpvEvent.START_FILE)
+        api.event(MpvEvent.FILE_LOADED)
+        pumpAll()
+        // Remote HTTP sub-add finishes and populates track list right before PLAYBACK_RESTART:
+        api.setTracks(track(1, "sub", lang = "ja", title = "Embedded", selected = true), track(2, "sub", lang = "zh", title = "中文字幕", external = true))
+        api.event(MpvEvent.PLAYBACK_RESTART)
+        pumpAll()
+        assertTrue(api.calls.toString(), api.calls.contains("setp:sid=4:2.0"))
+    }
+
+    @Test
     fun preferredLanguageDecidesTheSubtitle() {
         started()
         core.applySubtitlePreferences("zh-CN", "Noto Sans", "/fonts")

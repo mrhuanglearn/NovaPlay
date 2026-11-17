@@ -36,31 +36,39 @@ class _SubCategoryScreenState extends ConsumerState<SubCategoryScreen> {
     setState(() => _loading = true);
     try {
       final site = ref.read(currentSiteProvider);
-      if (site == null) return;
+      if (site == null) {
+        if (mounted) setState(() => _loading = false);
+        return;
+      }
       final res = await ref
           .read(videoCategoryFeedProvider)((siteKey: site.key, typeId: widget.typeId, page: _page, filters: filters));
-      if (!mounted || res == null || !_sameFilters(filters)) return;
+      if (!mounted || !_sameFilters(filters)) return;
       setState(() {
-        _items.addAll(res.items);
-        _done = !res.hasMore || res.items.isEmpty;
-        _page++;
+        if (res != null) {
+          _items.addAll(res.items);
+          _done = !res.hasMore || res.items.isEmpty;
+          _page++;
+        }
+        _loading = false;
       });
     } catch (e) {
-      if (mounted) showToast(describeLoadError(e, context.l10n));
-    } finally {
-      if (mounted) setState(() => _loading = false);
+      if (mounted) {
+        setState(() => _loading = false);
+        showToast(describeLoadError(e, context.l10n));
+      }
     }
   }
 
   bool _sameFilters(Map<String, String> f) =>
       f.length == _filters.length && f.entries.every((e) => _filters[e.key] == e.value);
 
-  void _setFilter(String key, String value) {
+  void _setFilter(VodFilter filter, String value) {
+    if ((_filters[filter.key] ?? filter.init) == value) return;
     setState(() {
       if (value.isEmpty) {
-        _filters.remove(key);
+        _filters.remove(filter.key);
       } else {
-        _filters[key] = value;
+        _filters[filter.key] = value;
       }
       _items.clear();
       _page = 1;
@@ -78,7 +86,7 @@ class _SubCategoryScreenState extends ConsumerState<SubCategoryScreen> {
       appBar: AppBar(title: Text(category?.name ?? widget.typeId)),
       body: Column(children: [
         if ((category?.filters ?? const <VodFilter>[]).isNotEmpty)
-          CategoryFilterBar(filters: category!.filters, chosen: _filters, onChanged: (f, v) => _setFilter(f.key, v)),
+          CategoryFilterBar(filters: category!.filters, chosen: _filters, onChanged: _setFilter),
         Expanded(
           child: _items.isEmpty && !_loading
               ? EmptyState(icon: Icons.search_off, title: context.l10n.noData, subtitle: context.l10n.nothingHere)

@@ -26,6 +26,7 @@ const {
   dataDir,
   port,
   dartPort: initialDartPort,
+  dartToken: initialDartToken,
   env,
   allowWriteDirs = [],
   allowReadDirs = [],
@@ -34,10 +35,49 @@ const {
   enableLog = true,
 } = workerData || {};
 let currentDartPort = initialDartPort || 0;
+let currentDartToken = initialDartToken || '';
 
-function post(message) {
+const LOG_BATCH_MAX = 32;
+const LOG_BATCH_MS = 20;
+const pendingLogs = [];
+let logFlushTimer = null;
+
+function postRaw(message) {
   try { parentPort.postMessage({ name, ...message }); } catch { /* parent already gone */ }
 }
+
+function flushLogs() {
+  if (logFlushTimer) {
+    clearTimeout(logFlushTimer);
+    logFlushTimer = null;
+  }
+  if (pendingLogs.length === 0) return;
+  const batch = pendingLogs.splice(0);
+  if (batch.length === 1) postRaw({ type: WorkerMsg.log, message: batch[0] });
+  else postRaw({ type: WorkerMsg.log, messages: batch });
+}
+
+function enqueueLog(line) {
+  pendingLogs.push(line);
+  if (pendingLogs.length >= LOG_BATCH_MAX) {
+    flushLogs();
+  } else if (!logFlushTimer) {
+    logFlushTimer = setTimeout(flushLogs, LOG_BATCH_MS);
+    if (typeof logFlushTimer.unref === 'function') logFlushTimer.unref();
+  }
+}
+
+function post(message) {
+  if (message && message.type === WorkerMsg.log) {
+    enqueueLog(message.message);
+    return;
+  }
+  flushLogs();
+  postRaw(message);
+}
+
+process.on('beforeExit', flushLogs);
+process.on('exit', flushLogs);
 
 // --- console -> host log channel -------------------------------------------------------------
 const origLog = console.log;
@@ -45,11 +85,11 @@ const origErr = console.error;
 // With enableLog the line goes to the host once, as [log]. Writing it to stdout as well would forward it a second
 // time, because the host also reports the worker's stdout ([stdout] lines).
 console.log = (...args) => {
-  if (enableLog) post({ type: WorkerMsg.log, message: args.map(String).join(' ') });
+  if (enableLog) enqueueLog(args.map(String).join(' '));
   else origLog(...args);
 };
 console.error = (...args) => {
-  if (enableLog) post({ type: WorkerMsg.log, message: '[err] ' + args.map(String).join(' ') });
+  if (enableLog) enqueueLog('[err] ' + args.map(String).join(' '));
   else origErr(...args);
 };
 
@@ -123,6 +163,56 @@ function installNetLogger(mod, proto) {
 }
 if (enableNetLog) { installNetLogger(http, 'http'); installNetLogger(https, 'https'); }
 
+// --- automatic Dart callback token injection -------------------------------------------------
+function isCurrentDartCallbackTarget(host, targetPort) {
+  return currentDartPort > 0 && currentDartToken && isLoopback(host) && Number(targetPort) === currentDartPort;
+}
+
+const baseHttpRequest = http.request;
+http.request = function callbackAuthedRequest(...args) {
+  const req = baseHttpRequest.apply(this, args);
+  try {
+    const first = args[0];
+    let host = '';
+    let targetPort = 0;
+    if (typeof first === 'string' || first instanceof URL) {
+      const u = first instanceof URL ? first : new URL(first, 'http://127.0.0.1');
+      host = u.hostname;
+      targetPort = Number(u.port) || 80;
+    } else if (first && typeof first === 'object') {
+      host = first.hostname || (first.host || '').split(':')[0] || '127.0.0.1';
+      targetPort = Number(first.port || (first.host && first.host.includes(':') ? first.host.split(':')[1] : 80));
+    }
+    if (isCurrentDartCallbackTarget(host, targetPort) && !req.getHeader('x-uzv-token')) {
+      req.setHeader('x-uzv-token', currentDartToken);
+    }
+  } catch { /* ignore malformed options */ }
+  return req;
+};
+http.get = function callbackAuthedGet(...args) {
+  const req = http.request.apply(this, args);
+  req.end();
+  return req;
+};
+
+if (typeof globalThis.fetch === 'function') {
+  const baseFetch = globalThis.fetch.bind(globalThis);
+  globalThis.fetch = function callbackAuthedFetch(input, init) {
+    try {
+      const rawUrl = typeof input === 'string' ? input : (input instanceof URL ? input.toString() : (input && input.url));
+      if (rawUrl) {
+        const u = new URL(rawUrl);
+        if (isCurrentDartCallbackTarget(u.hostname, Number(u.port) || 80)) {
+          const headers = new Headers((init && init.headers) || (input && input.headers) || undefined);
+          if (!headers.has('x-uzv-token')) headers.set('x-uzv-token', currentDartToken);
+          return baseFetch(input, { ...(init || {}), headers });
+        }
+      }
+    } catch { /* fall through */ }
+    return baseFetch(input, init);
+  };
+}
+
 // --- server registry & globals ---------------------------------------------------------------
 globalThis._catServers = globalThis._catServers || [];
 globalThis._catDanmuServers = globalThis._catDanmuServers || [];
@@ -133,8 +223,9 @@ http.createServer = function createServer(...args) {
   const originalListen = server.listen;
   server.listen = function listen(...largs) {
     const first = largs[0];
-    const listenPort = typeof first === 'number' ? first
-      : first && typeof first === 'object' && typeof first.port === 'number' ? first.port : null;
+    const rawPort = typeof first === 'number' || typeof first === 'string' ? Number(first)
+      : first && typeof first === 'object' && first.port != null ? Number(first.port) : NaN;
+    const listenPort = Number.isInteger(rawPort) ? rawPort : null;
     if (listenPort === SUBSCRIPTION_DANMU_PORT && !globalThis._catDanmuServers.some((s) => s.server === server)) {
       let addr = null;
       server.on('listening', () => {
@@ -278,6 +369,7 @@ parentPort.on('message', (msg) => {
     reloadAll(globalThis._catDanmuServers, WorkerMsg.reloadedDanmu, 'no-danmu-server', { allowPortFallback: false });
   } else if (msg.type === LoaderMsg.setDartPort) {
     currentDartPort = Number(msg.port) || 0;
+    if (typeof msg.token === 'string') currentDartToken = msg.token;
   }
 });
 

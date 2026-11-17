@@ -34,6 +34,7 @@ class PlayerSession implements NativePlayerFlutterApi {
     required this.host,
     required this.sniffer,
     this.danmu,
+    this.preferVideoDanmu,
     this.refs,
     this.headTail,
     required this.onPreferences,
@@ -47,6 +48,7 @@ class PlayerSession implements NativePlayerFlutterApi {
 
   /// Resolves the configured danmaku server on first use (starting it if it is a local service). Null = no danmaku.
   final Future<DanmuClient?> Function()? danmu;
+  final Future<bool> Function()? preferVideoDanmu;
   final DanmuRefsRepository? refs;
 
   /// 片头片尾 marks of this video (记片头 / 记片尾 in the player). Null = not kept.
@@ -60,6 +62,7 @@ class PlayerSession implements NativePlayerFlutterApi {
   static String _plainError(Object e) => '$e';
 
   DateTime _lastSaved = DateTime.fromMillisecondsSinceEpoch(0);
+  DateTime? _lastFlushed;
   int _line = 0;
   int _episode = 0;
   int _quality = 0;
@@ -67,6 +70,10 @@ class PlayerSession implements NativePlayerFlutterApi {
   Future<DanmuClient?>? _clientFuture;
   DanmuRef? _anime;
   bool _pushedByVideo = false;
+  String? _episodeDanmuUrl;
+  List<DanmuComment> _episodeDanmuComments = const [];
+  Map<String, String> _episodeHeaders = const {};
+  Completer<void>? _episodeResolved;
   final Map<int, String> _searchTitles = {};
   final _closed = Completer<PageClosedEvent>();
 
@@ -118,7 +125,12 @@ class PlayerSession implements NativePlayerFlutterApi {
   Future<void> onEpisodeRequest(EpisodeRequest request) async {
     if (_line != request.lineIndex || _episode != request.episodeIndex) {
       _pushedByVideo = false;
+      _episodeDanmuUrl = null;
+      _episodeDanmuComments = const [];
+      _episodeHeaders = const {};
     }
+    final gate = Completer<void>();
+    _episodeResolved = gate;
     _line = request.lineIndex;
     _episode = request.episodeIndex;
     try {
@@ -140,8 +152,14 @@ class PlayerSession implements NativePlayerFlutterApi {
           headers: {...result.headers, ...found.headers},
           qualities: result.qualities,
           subtitles: result.subtitles,
+          videoDanmuUrl: result.videoDanmuUrl,
+          videoDanmuComments: result.videoDanmuComments,
         );
       }
+      _episodeDanmuUrl = result.videoDanmuUrl;
+      _episodeDanmuComments = result.videoDanmuComments;
+      _episodeHeaders = result.headers;
+      if (!gate.isCompleted) gate.complete();
       await host.provideSource(SourcePayload(
         requestId: request.requestId,
         success: true,
@@ -158,6 +176,7 @@ class PlayerSession implements NativePlayerFlutterApi {
         ],
       ));
     } catch (e) {
+      if (!gate.isCompleted) gate.complete();
       await host.provideSource(SourcePayload(requestId: request.requestId, success: false, errorMessage: describeError(e)));
     }
   }
@@ -170,6 +189,28 @@ class PlayerSession implements NativePlayerFlutterApi {
   @override
   Future<void> onDanmakuRequest(DanmakuRequest request) async {
     if (_pushedByVideo) return;
+    if (_episodeResolved != null && !_episodeResolved!.isCompleted) {
+      await _episodeResolved!.future.timeout(const Duration(seconds: 15), onTimeout: () {});
+    }
+    if (_pushedByVideo) return;
+    if (await (preferVideoDanmu?.call() ?? Future.value(false))) {
+      try {
+        var direct = _episodeDanmuComments;
+        if (direct.isEmpty && _episodeDanmuUrl != null) {
+          direct = await fetchVideoDanmakuUrl(_episodeDanmuUrl!, headers: _episodeHeaders);
+        }
+        if (direct.isNotEmpty) {
+          await host.updateDanmaku(DanmakuPayload(
+            sessionId: sessionId,
+            commentsJson: danmuCommentsToJson(direct),
+            animeTitle: source.title,
+          ));
+          return;
+        }
+      } catch (_) {
+        // Video-returned danmaku failed or returned empty: fall back to automatic danmu service matching.
+      }
+    }
     final client = await _client();
     if (client == null) return;
     try {
@@ -247,13 +288,23 @@ class PlayerSession implements NativePlayerFlutterApi {
     final now = DateTime.now();
     if (now.difference(_lastSaved) < const Duration(seconds: 5)) return;
     _lastSaved = now;
-    await source.saveProgress(_line, _episode, heartbeat.positionSeconds, heartbeat.durationSeconds, quality: _quality);
+    _lastFlushed ??= now;
+    final shouldFlush = now.difference(_lastFlushed!) >= const Duration(seconds: 30);
+    if (shouldFlush) _lastFlushed = now;
+    await source.saveProgress(
+      _line,
+      _episode,
+      heartbeat.positionSeconds,
+      heartbeat.durationSeconds,
+      quality: _quality,
+      flush: shouldFlush,
+    );
   }
 
   @override
   Future<void> onPageClosed(PageClosedEvent event) async {
     // The close event has no duration; keep the last one seen so the history progress bar does not reset to 0.
-    await source.saveProgress(_line, _episode, event.positionSeconds, _lastDuration, quality: _quality);
+    await source.saveProgress(_line, _episode, event.positionSeconds, _lastDuration, quality: _quality, flush: true);
     await source.finish(_line, _episode, event.positionSeconds);
     if (!_closed.isCompleted) _closed.complete(event);
   }

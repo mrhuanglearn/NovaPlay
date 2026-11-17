@@ -41,7 +41,11 @@ class MethodChannelNodeBridge implements NodeBridge {
 
   @override
   Stream<String> listen(String channel) {
-    _shared ??= _events.receiveBroadcastStream().cast<Map<Object?, Object?>>().asBroadcastStream();
+    _shared ??= _events.receiveBroadcastStream().expand<Map<Object?, Object?>>((raw) {
+      if (raw is List) return raw.whereType<Map<Object?, Object?>>();
+      if (raw is Map<Object?, Object?>) return [raw];
+      return const <Map<Object?, Object?>>[];
+    }).asBroadcastStream();
     return _shared!.where((e) => e['channel'] == channel).map((e) => e['message'] as String);
   }
 

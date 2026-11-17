@@ -87,8 +87,12 @@ class _TmdbSearchScreenState extends ConsumerState<TmdbSearchScreen> {
                             ? const Icon(Icons.movie_outlined)
                             : ClipRRect(
                                 borderRadius: BorderRadius.circular(6),
-                                child: Image.network(client.imageUrl(m.posterPath!, size: 'w92'),
-                                    width: 40, fit: BoxFit.cover),
+                                child: SizedBox(
+                                  width: 40,
+                                  height: 60,
+                                  child: posterFromUrl(client.imageUrl(m.posterPath!, size: 'w92'),
+                                      cacheWidth: 120, fallback: const Icon(Icons.movie_outlined)),
+                                ),
                               ),
                         title: Text(m.title),
                         subtitle: Text(

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:math';
 
 /// Loopback HTTP server that lets catpaw scripts call back into the Dart app.
 ///
@@ -21,10 +22,18 @@ class RawJsonResponse {
   final Object? body;
 }
 
+String _generateCallbackToken() {
+  final rng = Random.secure();
+  return List.generate(16, (_) => rng.nextInt(256).toRadixString(16).padLeft(2, '0')).join();
+}
+
 class DartCallbackServer {
-  DartCallbackServer({Map<String, DartActionHandler>? handlers}) : handlers = handlers ?? {};
+  DartCallbackServer({Map<String, DartActionHandler>? handlers, String? token})
+      : handlers = handlers ?? {},
+        token = token ?? _generateCallbackToken();
 
   final Map<String, DartActionHandler> handlers;
+  final String token;
   HttpServer? _server;
 
   int? get port => _server?.port;
@@ -57,10 +66,13 @@ class DartCallbackServer {
         );
         sock.destroy();
         return existing.port;
-      } catch (_) {
+      } catch (e) {
+        log('[DartServer] health probe failed ($e), rebinding');
         try {
           await existing.close(force: true);
-        } catch (_) {}
+        } catch (closeErr) {
+          log('[DartServer] close stale server ignored: $closeErr');
+        }
         if (identical(_server, existing)) _server = null;
       }
     }
@@ -72,6 +84,16 @@ class DartCallbackServer {
   void Function(String line) log = (_) {};
 
   Future<void> _handle(HttpRequest req) async {
+    final supplied = req.headers.value('x-uzv-token') ?? req.uri.queryParameters['token'];
+    if (supplied != token) {
+      await req.drain<void>().catchError((Object _) {});
+      req.response
+        ..statusCode = HttpStatus.forbidden
+        ..headers.contentType = ContentType.json
+        ..write('{"ok":false,"code":403,"error":"forbidden"}');
+      await req.response.close();
+      return;
+    }
     Object? reply;
     int status = 200;
     String action = '';

@@ -67,6 +67,14 @@ class NativePlayerActivity : AppCompatActivity() {
     private var rootView: FrameLayout? = null
     private var inPip = false
     private var wasInPip = false
+    private val danmakuPanel by lazy {
+        DanmakuPanelController(
+            activity = this,
+            controlsProvider = { controls },
+            onHaptic = ::haptic,
+            onToast = ::toast,
+        )
+    }
 
     private fun ensureKeepScreenOn() {
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
@@ -100,14 +108,14 @@ class NativePlayerActivity : AppCompatActivity() {
             override fun onQuality(anchor: View) = showQuality(c, anchor)
             override fun onSpeed(anchor: View) = showSpeed(c, anchor)
             override fun onEpisodes() = if (c.isLive) showChannels(c) else showEpisodes(c)
-            override fun onDanmaku() { danmakuSubScreen = 0; showDanmaku(c) }
+            override fun onDanmaku() = danmakuPanel.openRoot(c)
             override fun onEpg() = showEpg(c)
             override fun onAudio(anchor: View) = showAudio(c, anchor)
             override fun onSubtitles(anchor: View) = showSubtitles(c, anchor)
             override fun onMore(anchor: View) = showMore(c, anchor)
             override fun onSettings() = showSettings(c)
             override fun onPictureInPicture() = enterPip()
-            override fun onScreenshot() = takeScreenshot(kernel)
+            override fun onScreenshot() = PlayerScreenshotSaver.captureAndSave(this@NativePlayerActivity, kernel, ::toast)
             override fun onReload() = c.retry()
             override fun onRotate() = rotate()
             override fun onMarkIntro() = c.markIntro()
@@ -123,16 +131,9 @@ class NativePlayerActivity : AppCompatActivity() {
             override fun onToast(text: String, long: Boolean) =
                 Toast.makeText(this@NativePlayerActivity, text, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
         }
-        c.danmakuSearchListener = { results -> onDanmakuResults(c, results) }
-        c.danmakuEpisodesListener = { episodes -> onDanmakuEpisodes(c, episodes) }
-        c.danmakuCountListener = { count ->
-            danmakuCountBadge?.let {
-                it.text = PlayerUiText.t("$count 条", "$count")
-                it.visibility = if (count > 0) View.VISIBLE else View.GONE
-            }
-            danmakuStatusText?.text = if (count > 0) PlayerUiText.t("当前已加载 $count 条弹幕", "$count comments loaded")
-            else PlayerUiText.t("当前未加载弹幕", "No comments loaded")
-        }
+        c.danmakuSearchListener = { results -> danmakuPanel.onSearchResults(c, results) }
+        c.danmakuEpisodesListener = { episodes -> danmakuPanel.onEpisodeResults(c, episodes) }
+        c.danmakuCountListener = { count -> danmakuPanel.onCountChanged(count) }
         c.onSkipIntro = { fromMs -> controls.showSkipBanner(fromMs) }
         setContentView(root)
         hideSystemBars()
@@ -352,7 +353,9 @@ class NativePlayerActivity : AppCompatActivity() {
     private fun showMore(c: PlayerController, anchor: View) {
         val audio = c.audioOptions()
         controls?.showMenu(anchor, above = false, items = listOf(
-            PlayerControlsView.MenuItem(PlayerUiText.t("截图", "Screenshot")) { takeScreenshot(c.kernel) },
+            PlayerControlsView.MenuItem(PlayerUiText.t("截图", "Screenshot")) {
+                PlayerScreenshotSaver.captureAndSave(this, c.kernel, ::toast)
+            },
             PlayerControlsView.MenuItem(PlayerUiText.t("重新加载", "Reload")) { c.retry() },
             PlayerControlsView.MenuItem(PlayerUiText.t("画中画", "Picture-in-picture")) { enterPip() },
         ) + subtitleItems(c, divider = true) + (if (audio.size < 2) emptyList() else audio.mapIndexed { i, t ->
@@ -572,7 +575,7 @@ class NativePlayerActivity : AppCompatActivity() {
                 })
             }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(6) })
             if (episodesSearching) {
-                val searchInput = field(ui, episodesQuery, PlayerUiText.t("搜索剧集名称...", "Search episodes...")).apply {
+                val searchInput = danmakuPanel.field(ui, episodesQuery, PlayerUiText.t("搜索剧集名称...", "Search episodes...")).apply {
                     addTextChangedListener(object : android.text.TextWatcher {
                         override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
                         override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {
@@ -857,445 +860,6 @@ class NativePlayerActivity : AppCompatActivity() {
         recreate()
     }
 
-    // -- 截图 -----------------------------------------------------------------------------------------------------------
-
-    private fun findSurface(view: View): View? = when (view) {
-        is SurfaceView, is TextureView -> view
-        is ViewGroup -> (0 until view.childCount).firstNotNullOfOrNull { findSurface(view.getChildAt(it)) }
-        else -> null
-    }
-
-    /** 截图: the video frame as it is shown, saved to Pictures/NovaPlay (the gallery). */
-    private fun takeScreenshot(kernel: PlayerKernel) {
-        val failed = PlayerUiText.t("截图失败", "Screenshot failed")
-        val surface = findSurface(kernel.view)
-        if (surface == null || surface.width <= 0 || surface.height <= 0) { toast(failed); return }
-        when (surface) {
-            is TextureView -> surface.bitmap?.let(::saveScreenshot) ?: toast(failed)
-            is SurfaceView -> {
-                val bitmap = Bitmap.createBitmap(surface.width, surface.height, Bitmap.Config.ARGB_8888)
-                try {
-                    PixelCopy.request(surface, bitmap, { result -> if (result == PixelCopy.SUCCESS) saveScreenshot(bitmap) else toast(failed) }, Handler(Looper.getMainLooper()))
-                } catch (e: IllegalArgumentException) {
-                    toast(failed)
-                }
-            }
-        }
-    }
-
-    private fun saveScreenshot(bitmap: Bitmap) {
-        val name = "NovaPlay_" + java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.ROOT).format(java.util.Date()) + ".jpg"
-        Thread {
-            val ok = try {
-                if (Build.VERSION.SDK_INT >= 29) {
-                    val values = android.content.ContentValues().apply {
-                        put(MediaStore.Images.Media.DISPLAY_NAME, name)
-                        put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                        put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/NovaPlay")
-                    }
-                    val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)!!
-                    contentResolver.openOutputStream(uri)!!.use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-                } else {
-                    val dir = java.io.File(getExternalFilesDir(Environment.DIRECTORY_PICTURES), "NovaPlay").apply { mkdirs() }
-                    java.io.File(dir, name).outputStream().use { bitmap.compress(Bitmap.CompressFormat.JPEG, 95, it) }
-                }
-                true
-            } catch (e: Exception) { false }
-            runOnUiThread { toast(if (ok) PlayerUiText.t("截图已保存到相册", "Screenshot saved") else PlayerUiText.t("截图失败", "Screenshot failed")) }
-        }.start()
-    }
-
-    // -- 弹幕 -----------------------------------------------------------------------------------------------------------
-
-    private var danmakuTab = 0
-    private var danmakuSubScreen = 0 // 0 = tabs, 1 = anime results, 2 = episode results, 3 = blocked words
-    private var danmakuDirect: Int? = null
-    private var lastAnimeResults: List<DanmakuSearchResultItem> = emptyList()
-    private var lastEpisodeResults: List<EpisodeItem> = emptyList()
-    private var danmakuCountBadge: TextView? = null
-    private var danmakuStatusText: TextView? = null
-
-    private fun field(ui: PlayerUi, value: String, hint: String, number: Boolean = false) = EditText(this).apply {
-        setText(value)
-        this.hint = hint
-        setHintTextColor(0x66FFFFFF)
-        setTextColor(Color.WHITE)
-        textSize = 14f
-        setSingleLine()
-        if (number) inputType = android.text.InputType.TYPE_CLASS_NUMBER
-        background = ui.rounded(0x14FFFFFF, 10f, 0x12FFFFFF, 0.6f)
-        setPadding(ui.dp(12), 0, ui.dp(12), 0)
-        imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE or android.view.inputmethod.EditorInfo.IME_FLAG_NO_EXTRACT_UI
-    }
-
-    /**
-     * 弹 (matching original i2.J):
-     * Header has either the 2-tab pill (弹幕设置 / 样式调节) or `<` back button + sub-page title, and `{n} 条` badge on the right.
-     * Sub-screens: 1 = 搜索结果 — 选择剧集, 2 = 选择集数, 3 = 屏蔽词管理.
-     */
-    private fun showDanmaku(c: PlayerController, scrollY: Int = 0) {
-        val v = controls ?: return
-        val ui = v.ui
-        val count = c.loadedDanmakuCount
-        val badge = ui.text(PlayerUiText.t("$count 条", "$count"), 11f, ui.accent, bold = true).apply {
-            background = ui.rounded(PlayerUi.withAlpha(ui.accent, 0.16f), 10f)
-            setPadding(ui.dp(8), ui.dp(3), ui.dp(8), ui.dp(3))
-            visibility = if (count > 0) View.VISIBLE else View.GONE
-        }
-        danmakuCountBadge = badge
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(ui.dp(14), ui.dp(12), ui.dp(14), ui.dp(10))
-            if (danmakuSubScreen == 0) {
-                addView(LinearLayout(this@NativePlayerActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    background = ui.rounded(0x14FFFFFF, 17f)
-                    setPadding(ui.dp(3), ui.dp(3), ui.dp(3), ui.dp(3))
-                    listOf(Ic.FORUM to PlayerUiText.t("弹幕设置", "Danmaku"), Ic.TUNE to PlayerUiText.t("样式调节", "Style")).forEachIndexed { i, (code, label) ->
-                        val sel = i == danmakuTab
-                        addView(LinearLayout(this@NativePlayerActivity).apply {
-                            orientation = LinearLayout.HORIZONTAL
-                            gravity = Gravity.CENTER
-                            background = if (sel) ui.rounded(0x2EFFFFFF, 14f) else null
-                            setPadding(ui.dp(12), 0, ui.dp(13), 0)
-                            addView(ui.icon(code, 13f, if (sel) Color.WHITE else 0xB3FFFFFF.toInt()), LinearLayout.LayoutParams(-2, -2).apply { rightMargin = ui.dp(7) })
-                            addView(ui.text(label, 12.5f, if (sel) Color.WHITE else 0xB3FFFFFF.toInt(), bold = sel))
-                            setOnClickListener { if (danmakuTab != i) { haptic(c, Haptics.SELECTION); danmakuTab = i; showDanmaku(c) } }
-                        }, LinearLayout.LayoutParams(-2, ui.dp(28)))
-                    }
-                }, LinearLayout.LayoutParams(-2, -2))
-            } else {
-                addView(ui.circleButton(Ic.BACK, 30f, 16f, 0x24FFFFFF).apply {
-                    setOnClickListener {
-                        haptic(c, Haptics.SELECTION)
-                        danmakuSubScreen = if (danmakuSubScreen == 2) 1 else 0
-                        showDanmaku(c)
-                    }
-                }, LinearLayout.LayoutParams(ui.dp(30), ui.dp(30)).apply { rightMargin = ui.dp(10) })
-                val subTitle = when (danmakuSubScreen) {
-                    1 -> PlayerUiText.t("搜索结果 — 选择剧集", "Choose a show")
-                    2 -> PlayerUiText.t("选择集数", "Choose an episode")
-                    else -> PlayerUiText.t("屏蔽词管理", "Blocked words")
-                }
-                addView(ui.text(subTitle, 14.5f, bold = true))
-            }
-            addView(View(this@NativePlayerActivity), LinearLayout.LayoutParams(0, 1, 1f))
-            addView(badge)
-        }
-        val scroll = v.showPanel(header) { list ->
-            when (danmakuSubScreen) {
-                1 -> danmakuAnimeList(c, ui, list)
-                2 -> danmakuEpisodeList(c, ui, list)
-                3 -> danmakuBlockedWordsView(c, ui, list)
-                else -> if (danmakuTab == 0) danmakuSettings(c, ui, list) else danmakuStyle(c, ui, list)
-            }
-        }
-        if (scrollY > 0) scroll.post { scroll.scrollTo(0, scrollY) }
-    }
-
-    private fun danmakuSettings(c: PlayerController, ui: PlayerUi, list: LinearLayout) {
-        list.addView(ui.sectionLabel(PlayerUiText.t("弹幕状态", "Status")))
-        val search = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
-        fun dim() { search.alpha = if (c.danmakuEnabled) 1f else 0.38f }
-        val sw = SwitchView(this, ui.accent, c.danmakuEnabled) { on -> haptic(c, Haptics.SELECTION); c.setDanmakuEnabled(on); dim() }
-        val count = c.loadedDanmakuCount
-        val statusLabel = ui.text(
-            if (count > 0) PlayerUiText.t("当前已加载 $count 条弹幕", "$count comments loaded")
-            else PlayerUiText.t("当前未加载弹幕", "No comments loaded"),
-            12f,
-            if (count > 0) ui.accent else PlayerUi.TEXT_DIM,
-        )
-        danmakuStatusText = statusLabel
-        list.addView(ui.card().also { card ->
-            ui.addRow(card, ui.row(Ic.FORUM, PlayerUiText.t("启用弹幕", "Show danmaku"), null, sw).also { r -> r.setOnClickListener { sw.toggle() } })
-            ui.addRow(card, LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(ui.dp(16), ui.dp(9), ui.dp(14), ui.dp(9))
-                addView(ui.icon(Ic.CHECK_CIRCLE, 15f, if (count > 0) ui.accent else PlayerUi.TEXT_DIM), LinearLayout.LayoutParams(-2, -2).apply { rightMargin = ui.dp(10) })
-                addView(statusLabel)
-            })
-        })
-        search.addView(ui.sectionLabel(PlayerUiText.t("弹幕搜索与匹配", "Search and match")))
-        val name = field(ui, c.title, PlayerUiText.t("剧集名称", "Title"))
-        val season = field(ui, "1", PlayerUiText.t("第 1 季", "Season 1"), number = true)
-        val episode = field(ui, "${c.episode + 1}", "1", number = true)
-        c.danmakuPrompt { info -> info?.let { if (!isFinishing) { name.setText(it.keyword); episode.setText("${it.episodeNumber}") } } }
-        search.addView(ui.card().apply {
-            setPadding(ui.dp(14), ui.dp(12), ui.dp(14), ui.dp(14))
-            addView(ui.text(PlayerUiText.t("剧集名称", "Title"), 11f, PlayerUi.TEXT_DIM).apply { setPadding(0, 0, 0, ui.dp(6)) })
-            addView(name, LinearLayout.LayoutParams(-1, ui.dp(40)))
-            addView(LinearLayout(this@NativePlayerActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                fun column(label: String, f: EditText, left: Int) = addView(LinearLayout(this@NativePlayerActivity).apply {
-                    orientation = LinearLayout.VERTICAL
-                    addView(ui.text(label, 11f, PlayerUi.TEXT_DIM).apply { setPadding(0, ui.dp(10), 0, ui.dp(6)) })
-                    addView(f, LinearLayout.LayoutParams(-1, ui.dp(40)))
-                }, LinearLayout.LayoutParams(0, -2, 1f).apply { leftMargin = ui.dp(left) })
-                column(PlayerUiText.t("季数 (S)", "Season (S)"), season, 0)
-                column(PlayerUiText.t("集数 (E)", "Episode (E)"), episode, 10)
-            })
-            addView(LinearLayout(this@NativePlayerActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                fun button(code: Int, label: String, fill: Int, left: Int, onClick: () -> Unit) = addView(LinearLayout(this@NativePlayerActivity).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    gravity = Gravity.CENTER
-                    background = ui.rounded(fill, 10f, if (fill == ui.accent) 0 else 0x1FFFFFFF, 0.6f)
-                    addView(ui.icon(code, 14f), LinearLayout.LayoutParams(-2, -2).apply { rightMargin = ui.dp(8) })
-                    addView(ui.text(label, 13f, bold = fill == ui.accent))
-                    setOnClickListener {
-                        if (!c.danmakuEnabled) return@setOnClickListener
-                        haptic(c, Haptics.SELECTION)
-                        (getSystemService(INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager).hideSoftInputFromWindow(windowToken, 0)
-                        onClick()
-                    }
-                }, LinearLayout.LayoutParams(0, ui.dp(40), 1f).apply { leftMargin = ui.dp(left) })
-                // 分步搜索: pick the show, then the episode. 直接搜索匹配: the first hit and episode E, without asking.
-                button(Ic.MENU, PlayerUiText.t("分步搜索", "Step by step"), 0x14FFFFFF, 0) {
-                    danmakuDirect = null
-                    c.searchDanmaku(name.text.toString().trim())
-                }
-                button(Ic.BOLT, PlayerUiText.t("直接搜索匹配", "Search and match"), ui.accent, 10) {
-                    danmakuDirect = (episode.text.toString().toIntOrNull() ?: 1).coerceAtLeast(1) - 1
-                    c.searchDanmaku(name.text.toString().trim())
-                }
-            }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = ui.dp(14) })
-        })
-        search.addView(ui.text(PlayerUiText.t(
-            "提示：直接搜索匹配会自动关联剧名、季数与集数直接从弹幕库加载并保存记忆；若未命中，可尝试「分步搜索」手动选择剧集。",
-            "Search and match loads the comments for this title and episode and remembers the match; if it misses, use “Step by step”.",
-        ), 11f, PlayerUi.TEXT_DIM).apply { setPadding(ui.dp(2), ui.dp(12), ui.dp(2), 0); setLineSpacing(ui.dp(3).toFloat(), 1f) })
-        dim()
-        list.addView(search)
-    }
-
-    private fun danmakuStyle(c: PlayerController, ui: PlayerUi, list: LinearLayout) {
-        fun cfg() = c.danmakuConfig
-        list.addView(View(this), LinearLayout.LayoutParams(1, ui.dp(8)))
-        list.addView(ui.card().also { card ->
-            fun toggle(title: String, get: () -> Boolean, set: (Boolean) -> DanmakuConfig) {
-                val sw = SwitchView(this, ui.accent, get()) { on -> haptic(c, Haptics.SELECTION); c.updateDanmaku(set(on)) }
-                ui.addRow(card, ui.row(null, title, null, sw).also { r -> r.minimumHeight = ui.dp(51); r.setOnClickListener { sw.toggle() } })
-            }
-            toggle(PlayerUiText.t("显示顶部固定弹幕", "Show top comments"), { cfg().showTop }) { cfg().copy(showTop = it) }
-            toggle(PlayerUiText.t("显示底部固定弹幕", "Show bottom comments"), { cfg().showBottom }) { cfg().copy(showBottom = it) }
-        })
-        list.addView(ui.sectionLabel(PlayerUiText.t("颜色模式", "Colour")))
-        list.addView(ui.card().also { card ->
-            val value = ui.text(PlayerUiText.danmakuColorMode(cfg().colorMode), 12f, PlayerUi.TEXT_DIM)
-            val trailing = LinearLayout(this).apply {
-                gravity = Gravity.CENTER_VERTICAL
-                addView(value)
-                addView(ui.icon(Ic.CHEVRON, 16f, PlayerUi.TEXT_DIM), LinearLayout.LayoutParams(-2, -2).apply { leftMargin = ui.dp(4) })
-            }
-            ui.addRow(card, ui.row(Ic.BRUSH, PlayerUiText.t("颜色模式", "Colour"), null, trailing).also { r ->
-                r.setOnClickListener {
-                    controls?.showMenu(trailing, above = false, items = PlayerUiText.danmakuColorModes.map { m ->
-                        PlayerControlsView.MenuItem(PlayerUiText.danmakuColorMode(m), selected = m == cfg().colorMode) {
-                            c.updateDanmaku(cfg().copy(colorMode = m))
-                            showDanmaku(c)
-                        }
-                    })
-                }
-            })
-            val usesGradient = cfg().colorMode == "gradient" || cfg().colorMode == "3" || cfg().colorMode == "random_Mix" || cfg().colorMode == "0"
-            if (usesGradient) {
-                val gradValue = ui.text(PlayerUiText.danmakuGradientLabel(cfg().gradientStyle), 12f, PlayerUi.TEXT_DIM)
-                val gradTrailing = LinearLayout(this).apply {
-                    gravity = Gravity.CENTER_VERTICAL
-                    addView(gradValue)
-                    addView(ui.icon(Ic.CHEVRON, 16f, PlayerUi.TEXT_DIM), LinearLayout.LayoutParams(-2, -2).apply { leftMargin = ui.dp(4) })
-                }
-                ui.addRow(card, ui.row(Ic.AUTO_AWESOME, PlayerUiText.t("渐变色风格", "Gradient style"), null, gradTrailing).also { r ->
-                    r.setOnClickListener {
-                        val curPreset = PlayerUiText.parseGradientPreset(cfg().gradientStyle)
-                        val curWeight = PlayerUiText.parseFontWeight(cfg().gradientStyle)
-                        controls?.showMenu(gradTrailing, above = false, items = PlayerUiText.danmakuGradientPresets.map { (id, label) ->
-                            PlayerControlsView.MenuItem(label, selected = id == curPreset) {
-                                val nextStyle = PlayerUiText.encodeGradientAndWeight(id, curWeight)
-                                c.updateDanmaku(cfg().copy(gradientStyle = nextStyle))
-                                gradValue.text = label
-                            }
-                        })
-                    }
-                })
-            }
-        })
-        fun pct(v: Double) = "${Math.round(v * 100)}%"
-        fun sliders(title: String, rows: List<SliderRow>) {
-            list.addView(ui.sectionLabel(title))
-            list.addView(ui.card().also { card ->
-                for (r in rows) {
-                    val badge = ui.valueBadge(r.label(r.get()))
-                    val box = LinearLayout(this).apply {
-                        orientation = LinearLayout.VERTICAL
-                        setPadding(ui.dp(14), ui.dp(10), ui.dp(14), ui.dp(4))
-                        addView(LinearLayout(this@NativePlayerActivity).apply {
-                            orientation = LinearLayout.HORIZONTAL
-                            gravity = Gravity.CENTER_VERTICAL
-                            addView(ui.icon(r.icon, 14f, 0xB3FFFFFF.toInt()).apply { if (r.rotate) rotation = 90f }, LinearLayout.LayoutParams(ui.dp(16), ui.dp(16)).apply { rightMargin = ui.dp(10) })
-                            addView(ui.text(r.title, 13.5f), LinearLayout.LayoutParams(0, -2, 1f))
-                            addView(badge)
-                        })
-                        addView(SliderView(this@NativePlayerActivity, ui.accent, 0x33FFFFFF, 12f, 2.5f) { f, done ->
-                            val value = Math.round((r.min + (r.max - r.min) * f) / r.step) * r.step
-                            badge.text = r.label(value)
-                            c.updateDanmaku(r.set(value), save = done)
-                        }.apply { fraction = ((r.get() - r.min) / (r.max - r.min)).toFloat() })
-                    }
-                    ui.addRow(card, box)
-                }
-            })
-        }
-        sliders(PlayerUiText.t("外观与排版", "Appearance"), listOf(
-            SliderRow(Ic.TEXT_FORMAT, PlayerUiText.t("字号大小", "Font size"), 12.0, 32.0, 1.0, { cfg().fontSize }, { cfg().copy(fontSize = it) }) { "${Math.round(it)} pt" },
-            SliderRow(
-                Ic.TEXT_FORMAT,
-                PlayerUiText.t("字体粗细", "Font weight"),
-                0.0,
-                8.0,
-                1.0,
-                { PlayerUiText.parseFontWeight(cfg().gradientStyle).toDouble() },
-                { w -> cfg().copy(gradientStyle = PlayerUiText.encodeGradientAndWeight(PlayerUiText.parseGradientPreset(cfg().gradientStyle), Math.round(w).toInt())) },
-            ) { PlayerUiText.danmakuFontWeightLabel(Math.round(it).toInt()) },
-            SliderRow(Ic.UNFOLD, PlayerUiText.t("行高", "Line height"), 1.0, 2.5, 0.1, { cfg().lineHeight }, { cfg().copy(lineHeight = it) }) { PlayerSettings.num(Math.round(it * 10) / 10.0) },
-            SliderRow(Ic.CONTRAST, PlayerUiText.t("不透明度", "Opacity"), 0.1, 1.0, 0.05, { cfg().opacity }, { cfg().copy(opacity = it) }, label = ::pct),
-            SliderRow(Ic.COLUMNS, PlayerUiText.t("显示区域", "Area"), 0.1, 1.0, 0.05, { cfg().area }, { cfg().copy(area = it) }, label = ::pct),
-            SliderRow(Ic.DOUBLE_RIGHT, PlayerUiText.t("滚动速度", "Scroll speed"), 0.3, 2.0, 0.1, { cfg().scrollSpeed }, { cfg().copy(scrollSpeed = it) }) { PlayerSettings.num(Math.round(it * 10) / 10.0) },
-            SliderRow(Ic.BRUSH, PlayerUiText.t("文字描边", "Outline"), 0.0, 3.0, 0.1, { cfg().strokeWidth }, { cfg().copy(strokeWidth = it) }) { PlayerSettings.num(Math.round(it * 10) / 10.0) },
-        ))
-        sliders(PlayerUiText.t("时间同步", "Timing"), listOf(
-            SliderRow(Ic.CLOCK, PlayerUiText.t("弹幕延迟", "Delay"), -30.0, 30.0, 0.5, { cfg().delaySeconds }, { cfg().copy(delaySeconds = it) }, label = PlayerUiText::danmakuDelay),
-        ))
-        list.addView(View(this), LinearLayout.LayoutParams(1, ui.dp(12)))
-        list.addView(ui.card().also { card ->
-            val count = ui.text(PlayerUiText.t("${cfg().blackList.size} 个", "${cfg().blackList.size}"), 12f, PlayerUi.TEXT_DIM)
-            val trailing = LinearLayout(this).apply {
-                gravity = Gravity.CENTER_VERTICAL
-                addView(count)
-                addView(ui.icon(Ic.CHEVRON, 16f, PlayerUi.TEXT_DIM), LinearLayout.LayoutParams(-2, -2).apply { leftMargin = ui.dp(4) })
-            }
-            ui.addRow(card, ui.row(Ic.CANCEL, PlayerUiText.t("屏蔽词管理", "Blocked words"), null, trailing).also { r ->
-                r.setOnClickListener {
-                    haptic(c, Haptics.SELECTION)
-                    danmakuSubScreen = 3
-                    showDanmaku(c)
-                }
-            })
-        })
-    }
-
-    private class SliderRow(
-        val icon: Int, val title: String, val min: Double, val max: Double, val step: Double,
-        val get: () -> Double, val set: (Double) -> DanmakuConfig, val rotate: Boolean = false, val label: (Double) -> String,
-    )
-
-    /** Inline 屏蔽词管理 sub-view inside the danmaku panel (matching original i2.J). */
-    private fun danmakuBlockedWordsView(c: PlayerController, ui: PlayerUi, list: LinearLayout) {
-        val input = field(ui, "", PlayerUiText.t("输入屏蔽词后点击添加", "Enter blocked word"))
-        fun addWord() {
-            val w = input.text.toString().trim()
-            if (w.isEmpty()) return
-            val cur = c.danmakuConfig.blackList
-            if (w !in cur) {
-                haptic(c, Haptics.SELECTION)
-                c.updateDanmaku(c.danmakuConfig.copy(blackList = cur + w))
-            }
-            input.setText("")
-            showDanmaku(c)
-        }
-        list.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, ui.dp(8), 0, ui.dp(12))
-            addView(input, LinearLayout.LayoutParams(0, ui.dp(38), 1f))
-            addView(ui.text(PlayerUiText.t("添加", "Add"), 13f, Color.WHITE, bold = true).apply {
-                gravity = Gravity.CENTER
-                background = ui.rounded(ui.accent, 10f)
-                setPadding(ui.dp(14), 0, ui.dp(14), 0)
-                setOnClickListener { addWord() }
-            }, LinearLayout.LayoutParams(-2, ui.dp(38)).apply { leftMargin = ui.dp(8) })
-        })
-        val words = c.danmakuConfig.blackList
-        if (words.isEmpty()) {
-            list.addView(ui.text(PlayerUiText.t("暂无屏蔽词，命中屏蔽词的弹幕将被过滤", "No blocked words yet"), 12.5f, PlayerUi.TEXT_DIM).apply {
-                gravity = Gravity.CENTER
-                setPadding(0, ui.dp(32), 0, ui.dp(32))
-            })
-        } else {
-            list.addView(ui.card().also { card ->
-                for (w in words) {
-                    val del = ui.icon(Ic.CLOSE, 16f, PlayerUi.TEXT_DIM).apply {
-                        setPadding(ui.dp(8), ui.dp(6), ui.dp(4), ui.dp(6))
-                        setOnClickListener {
-                            haptic(c, Haptics.SELECTION)
-                            c.updateDanmaku(c.danmakuConfig.copy(blackList = words.filterNot { it == w }))
-                            showDanmaku(c)
-                        }
-                    }
-                    ui.addRow(card, ui.row(null, w, null, del))
-                }
-            })
-        }
-    }
-
-    private fun danmakuAnimeList(c: PlayerController, ui: PlayerUi, list: LinearLayout) {
-        list.addView(View(this), LinearLayout.LayoutParams(1, ui.dp(6)))
-        list.addView(ui.card().also { card ->
-            for (r in lastAnimeResults) {
-                val badge = ui.text(PlayerUiText.t("${r.episodeCount} 集", "${r.episodeCount} eps"), 12f, PlayerUi.TEXT_DIM)
-                ui.addRow(card, ui.row(null, r.animeTitle, null, badge).also { row ->
-                    row.setOnClickListener {
-                        haptic(c, Haptics.SELECTION)
-                        c.pickDanmakuAnime(r.animeId)
-                    }
-                })
-            }
-        })
-    }
-
-    private fun danmakuEpisodeList(c: PlayerController, ui: PlayerUi, list: LinearLayout) {
-        list.addView(View(this), LinearLayout.LayoutParams(1, ui.dp(6)))
-        list.addView(ui.card().also { card ->
-            lastEpisodeResults.forEachIndexed { i, ep ->
-                ui.addRow(card, ui.row(null, ep.episodeName, null, null).also { row ->
-                    row.setOnClickListener {
-                        haptic(c, Haptics.SELECTION)
-                        danmakuSubScreen = 0
-                        controls?.closePanel()
-                        c.pickDanmakuEpisode(i)
-                        toast(PlayerUiText.t("已匹配弹幕：${ep.episodeName}", "Danmaku matched"))
-                    }
-                })
-            }
-        })
-    }
-
-    private fun onDanmakuResults(c: PlayerController, results: List<DanmakuSearchResultItem>) {
-        if (results.isEmpty()) { danmakuDirect = null; toast(PlayerUiText.t("未匹配到相关弹幕", "No matching danmaku")); return }
-        if (danmakuDirect != null) { c.pickDanmakuAnime(results.first().animeId); return }
-        lastAnimeResults = results
-        danmakuSubScreen = 1
-        showDanmaku(c)
-    }
-
-    private fun onDanmakuEpisodes(c: PlayerController, episodes: List<EpisodeItem>) {
-        val direct = danmakuDirect
-        if (direct != null) {
-            danmakuDirect = null
-            if (episodes.isEmpty()) { toast(PlayerUiText.t("未匹配到相关弹幕", "No matching danmaku")); return }
-            c.pickDanmakuEpisode(direct.coerceIn(0, episodes.size - 1))
-            danmakuSubScreen = 0
-            controls?.closePanel()
-            toast(PlayerUiText.t("已匹配弹幕：${episodes[direct.coerceIn(0, episodes.size - 1)].episodeName}", "Danmaku matched"))
-            return
-        }
-        lastEpisodeResults = episodes
-        danmakuSubScreen = 2
-        showDanmaku(c)
-    }
-
     private fun enterPip() {
         if (Build.VERSION.SDK_INT < 26) { notice(PlayerUiText.t("画中画需要 Android 8.0 及以上", "Picture-in-picture needs Android 8.0")); return }
         controls?.hide()
@@ -1366,12 +930,7 @@ class NativePlayerActivity : AppCompatActivity() {
     override fun onBackPressed() {
         if (controls?.menuOpen == true) { controls?.closeMenu(); return }
         if (controls?.panelOpen == true) {
-            val c = controller
-            if (danmakuSubScreen != 0 && c != null) {
-                danmakuSubScreen = if (danmakuSubScreen == 2) 1 else 0
-                showDanmaku(c)
-                return
-            }
+            if (danmakuPanel.handleBack(controller)) return
             controls?.closePanel()
             return
         }

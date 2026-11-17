@@ -26,10 +26,16 @@ void main() {
       expect(danmuBaseUrl(const DanmuServiceConfig(mode: DanmuMode.remote, remoteUrl: ' http://h:1/tok// ')), 'http://h:1/tok');
     });
 
-    test('subscription mode uses the fixed 9321 port and the subscription token', () {
+    test('subscription mode prefers runtime port or config danmuSearchUrl and falls back to 9321', () {
       const cfg = DanmuServiceConfig(mode: DanmuMode.subscription);
       expect(danmuBaseUrl(cfg, subscription: local), 'http://127.0.0.1:9321/tok');
       expect(danmuBaseUrl(cfg, subscription: const Subscription(key: 'a', name: 'a', indexJsUrl: 'u')), 'http://127.0.0.1:9321');
+      expect(danmuBaseUrl(cfg, subscription: local, runtimePort: 2333), 'http://127.0.0.1:2333/tok');
+      expect(
+        extractConfigDanmuBase('module.exports = { danmuSearchUrl: "http://127.0.0.1:2333/sec/api/v2/search/episodes" };', runtimePort: 2334),
+        'http://127.0.0.1:2334/sec',
+      );
+      expect(extractConfigDanmuBase('module.exports = { danmuSearchUrl: "https://danmu.example.com/tok/" };'), 'https://danmu.example.com/tok');
     });
 
     test('cloud subscription: its own address is the danmaku address', () {
@@ -178,6 +184,60 @@ void main() {
         }
       };
       expect(await c.resolve(), isNull);
+    });
+  });
+
+  group('DanmuServiceController (subscription mode)', () {
+    test('resolves built-in CatPaw danmu on runtime port even when reloadDanmu has no 9321 server', () async {
+      final dir = await Directory.systemTemp.createTemp('sub_danmu');
+      addTearDown(() => dir.delete(recursive: true));
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(server.close);
+      server.listen((req) async {
+        req.response.headers.contentType = ContentType.json;
+        if (req.uri.path == '/danmu/api/config') {
+          req.response.write(jsonEncode({
+            'envs': {'TOKEN': 'cat_tok'}
+          }));
+        } else if (req.uri.path == '/cat_tok/api/v2/search/anime') {
+          req.response.write(jsonEncode({
+            'animes': [
+              {'animeId': 9, 'animeTitle': 'Hit', 'episodeCount': 12}
+            ]
+          }));
+        } else {
+          req.response.statusCode = 404;
+        }
+        await req.response.close();
+      });
+
+      final bridge = FakeBridge();
+      bridge.onSend = (channel, message) {
+        if (channel != 'catpaw') return;
+        final cmd = jsonDecode(message) as Map;
+        if (cmd['action'] == 'reloadDanmu') {
+          Future.microtask(() => bridge.emit(
+              'catpaw', jsonEncode({'type': 'reloadedDanmu', 'name': cmd['name'], 'ok': false, 'error': 'no-danmu-server'})));
+        }
+      };
+
+      final store = JsonStore('danmu_service_config.json', baseDir: dir);
+      await store.write(const DanmuServiceConfig(mode: DanmuMode.subscription).toJson());
+      const sub = Subscription(key: 'sub1', name: 'Sub', indexJsUrl: 'http://x/index.js');
+      final ctl = DanmuServiceController(
+        store: store,
+        catpaw: CatpawClient(bridge),
+        manager: ManagerClient(bridge),
+        installer: SubscriptionInstaller(root: dir),
+        activeSubscription: () async => sub,
+        ensureSubscriptionPort: () async => server.port,
+        root: dir,
+      );
+
+      final client = await ctl.resolve();
+      expect(client, isNotNull);
+      final found = await client!.searchAnime('a');
+      expect(found.single.title, 'Hit');
     });
   });
 }

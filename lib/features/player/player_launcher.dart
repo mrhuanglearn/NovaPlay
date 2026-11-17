@@ -1,4 +1,4 @@
-import 'package:flutter/foundation.dart' show TargetPlatform, defaultTargetPlatform;
+import 'package:flutter/foundation.dart' show TargetPlatform, debugPrint, defaultTargetPlatform;
 import 'package:wakelock_plus/wakelock_plus.dart';
 
 import '../../core/haptics.dart';
@@ -102,6 +102,7 @@ class PlayerLauncher {
     required this.configs,
     required this.sniffer,
     this.danmu,
+    this.preferVideoDanmu,
     this.refs,
     this.headTail,
     this.onSession,
@@ -119,18 +120,23 @@ class PlayerLauncher {
   static Future<void> _defaultEnableWakelock() async {
     try {
       await WakelockPlus.enable();
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('WakelockPlus.enable ignored: $e');
+    }
   }
 
   static Future<void> _defaultDisableWakelock() async {
     try {
       await WakelockPlus.disable();
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('WakelockPlus.disable ignored: $e');
+    }
   }
 
   final PlayerConfigRepository configs;
   final SnifferService sniffer;
   final Future<DanmuClient?> Function()? danmu;
+  final Future<bool> Function()? preferVideoDanmu;
   final DanmuRefsRepository? refs;
   final HeadTailRepository? headTail;
 
@@ -158,6 +164,7 @@ class PlayerLauncher {
       host: host,
       sniffer: sniffer,
       danmu: danmu,
+      preferVideoDanmu: preferVideoDanmu,
       refs: refs,
       headTail: headTail,
       onPreferences: (r) => configs.saveReport(r),

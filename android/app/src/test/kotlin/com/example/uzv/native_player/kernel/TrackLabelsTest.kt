@@ -21,6 +21,8 @@ class TrackLabelsTest {
         assertEquals(TrackLabels.SUBRIP, TrackLabels.subtitleMime("https://x/sub", "application/x-subrip"))
         assertEquals(TrackLabels.VTT, TrackLabels.subtitleMime("https://x/sub", "text/vtt"))
         assertEquals(TrackLabels.SSA, TrackLabels.subtitleMime("https://x/sub", "ass"))
+        assertEquals(TrackLabels.SSA, TrackLabels.subtitleMime("https://drive/download?file=ep01.ass&sig=1", null))
+        assertEquals(TrackLabels.SUBRIP, TrackLabels.subtitleMime("http://127.0.0.1:2333/proxy?id=9", null, "中文字幕.srt"))
         assertNull(TrackLabels.subtitleMime("https://x/sub", null))
         assertNull(TrackLabels.subtitleMime("https://x/sub", "image/png"))
     }

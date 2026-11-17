@@ -173,9 +173,13 @@ class MdkKernel(context: Context, hwDecode: Boolean) : PlayerKernel {
             val i = audioTracks().indexOfFirst { it.language.equals(lang, ignoreCase = true) || it.language?.startsWith(lang, ignoreCase = true) == true }
             if (i >= 0 && audioChoice < 0) selectAudio(i)
         }
-        if (subtitleChoice == -2) preferredSubtitle?.let { lang ->
-            val i = subtitleTracks().indexOfFirst { it.language.equals(lang, ignoreCase = true) || it.language?.startsWith(lang, ignoreCase = true) == true }
-            if (i >= 0) selectSubtitle(i)
+        if (subtitleChoice == -2) {
+            val langPick = preferredSubtitle?.let { lang ->
+                subtitleTracks().indexOfFirst { it.language.equals(lang, ignoreCase = true) || it.language?.startsWith(lang, ignoreCase = true) == true }
+                    .takeIf { it >= 0 }
+            }
+            val pick = langPick ?: if (sidecars.isNotEmpty()) embedded(3).size else -1
+            if (pick >= 0) selectSubtitle(pick)
         }
     }
 

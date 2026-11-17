@@ -100,4 +100,35 @@ class NodeBridgeServerTest {
             acceptThread.join(1000)
         }
     }
+
+    @Test
+    fun `silent stalled client times out handshake so Node can still connect`() {
+        val srv = ServerSocket(0, 16, InetAddress.getByName("127.0.0.1"))
+        val ready = CountDownLatch(1)
+        val server = LoopbackBridgeSession(
+            token = "tok_timeout",
+            handshakeTimeoutMs = 120,
+            onEvent = { ch, msg ->
+                if (ch == "status" && msg.startsWith("Node ready")) ready.countDown()
+            },
+            parseJson = ::parseFlatTestJson,
+        )
+        val acceptThread = thread(isDaemon = true) { server.acceptLoop(srv) }
+        try {
+            val stalled = Socket("127.0.0.1", srv.localPort)
+            // Stalled rogue client never writes anything!
+            val node = Socket("127.0.0.1", srv.localPort)
+            node.use { s ->
+                val w = OutputStreamWriter(s.getOutputStream(), Charsets.UTF_8)
+                w.write("{\"hello\":\"tok_timeout\"}\n")
+                w.write("{\"c\":\"status\",\"m\":\"Node ready\"}\n")
+                w.flush()
+                org.junit.Assert.assertTrue("Node should connect after stalled client times out", ready.await(1500, TimeUnit.MILLISECONDS))
+            }
+            stalled.close()
+        } finally {
+            srv.close()
+            acceptThread.join(1000)
+        }
+    }
 }

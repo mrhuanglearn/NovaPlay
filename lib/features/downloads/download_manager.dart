@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:path/path.dart' as p;
 
+import '../../core/app_http.dart';
 import '../../core/json_store.dart';
 
 /// Offline video download (changelog 1.1.2: batch download, resumable, keeps running in the background,
@@ -94,26 +95,68 @@ class HlsPlaylist {
     return bestRef;
   }
 
-  /// Rewrites every segment reference to `seg_00000.ts`-style local names.
-  String rewriteLocal() {
+  static final _uriAttrPattern = RegExp(r'URI="([^"]+)"');
+
+  /// Unique auxiliary URIs referenced by `#EXT-X-KEY` (excluding `METHOD=NONE`) and `#EXT-X-MAP`.
+  Map<String, String> auxiliaryAssets() {
+    final map = <String, String>{};
+    var keyIdx = 0;
+    var mapIdx = 0;
+    for (final raw in lines) {
+      final line = raw.trim();
+      if (line.startsWith('#EXT-X-KEY:')) {
+        if (RegExp(r'METHOD=NONE\b', caseSensitive: false).hasMatch(line)) continue;
+        final ref = _uriAttrPattern.firstMatch(line)?.group(1)?.trim();
+        if (ref != null && ref.isNotEmpty && !map.containsKey(ref)) {
+          map[ref] = 'key_${keyIdx++}.bin';
+        }
+      } else if (line.startsWith('#EXT-X-MAP:')) {
+        final ref = _uriAttrPattern.firstMatch(line)?.group(1)?.trim();
+        if (ref != null && ref.isNotEmpty && !map.containsKey(ref)) {
+          map[ref] = 'map_${mapIdx++}.bin';
+        }
+      }
+    }
+    return map;
+  }
+
+  /// Rewrites every segment reference to `seg_00000.ts`-style local names and rewrites KEY/MAP URIs to [auxMap].
+  String rewriteLocal([Map<String, String> auxMap = const {}]) {
     var n = 0;
     return lines.map((l) {
-      if (l.trim().isEmpty || l.startsWith('#')) return l;
+      final trimmed = l.trim();
+      if (trimmed.isEmpty) return l;
+      if (trimmed.startsWith('#EXT-X-KEY:') || trimmed.startsWith('#EXT-X-MAP:')) {
+        return l.replaceAllMapped(_uriAttrPattern, (m) {
+          final local = auxMap[m.group(1)?.trim()];
+          return local == null ? m.group(0)! : 'URI="$local"';
+        });
+      }
+      if (trimmed.startsWith('#')) return l;
       return 'seg_${(n++).toString().padLeft(5, '0')}.ts';
     }).join('\n');
   }
 }
 
 class DownloadManager {
-  DownloadManager({Dio? dio, this.concurrency = 3, JsonStore? store})
-      : _dio = dio ?? Dio(),
+  DownloadManager({
+    Dio? dio,
+    this.concurrency = 3,
+    this.maxActiveTasks = 2,
+    JsonStore? store,
+  })  : _dio = dio ?? createAppDio(connectTimeout: const Duration(seconds: 15), receiveTimeout: const Duration(seconds: 60)),
         _store = store;
   final Dio _dio;
   final JsonStore? _store;
   final int concurrency;
+  final int maxActiveTasks;
+
+  Duration? get dioConnectTimeout => _dio.options.connectTimeout;
   final Map<String, DownloadTask> tasks = {};
   final _updates = StreamController<DownloadTask>.broadcast();
   final _cancel = <String, CancelToken>{};
+  final List<String> _pendingIds = [];
+  int _activeTaskCount = 0;
 
   Stream<DownloadTask> get updates => _updates.stream;
 
@@ -132,14 +175,34 @@ class DownloadManager {
   Future<void> _persist() async => _store?.write([for (final t in tasks.values) t.toJson()]);
 
   DownloadTask enqueue(DownloadTask t) {
+    t.state = DownloadState.queued;
     tasks[t.id] = t;
     _updates.add(t);
     unawaited(_persist());
-    unawaited(_run(t));
+    _enqueueId(t.id);
     return t;
   }
 
+  void _enqueueId(String id) {
+    if (!_pendingIds.contains(id)) _pendingIds.add(id);
+    _pumpQueue();
+  }
+
+  void _pumpQueue() {
+    while (_activeTaskCount < maxActiveTasks && _pendingIds.isNotEmpty) {
+      final nextId = _pendingIds.removeAt(0);
+      final t = tasks[nextId];
+      if (t == null || t.state != DownloadState.queued) continue;
+      _activeTaskCount++;
+      unawaited(_run(t).whenComplete(() {
+        _activeTaskCount--;
+        _pumpQueue();
+      }));
+    }
+  }
+
   void pause(String id) {
+    _pendingIds.remove(id);
     _cancel[id]?.cancel('paused');
     tasks[id]?.state = DownloadState.paused;
     unawaited(_persist());
@@ -147,6 +210,7 @@ class DownloadManager {
 
   /// Stops every running download without saving anything (重置应用 deletes the files right after).
   void cancelAll() {
+    _pendingIds.clear();
     for (final token in _cancel.values) {
       token.cancel('reset');
     }
@@ -154,6 +218,7 @@ class DownloadManager {
 
   /// Cancels the task and forgets it; [deleteFiles] also removes what was downloaded.
   Future<void> remove(String id, {bool deleteFiles = true}) async {
+    _pendingIds.remove(id);
     _cancel[id]?.cancel('removed');
     final t = tasks.remove(id);
     await _persist();
@@ -165,7 +230,11 @@ class DownloadManager {
 
   void resume(String id) {
     final t = tasks[id];
-    if (t != null && (t.state == DownloadState.paused || t.state == DownloadState.failed)) unawaited(_run(t));
+    if (t != null && (t.state == DownloadState.paused || t.state == DownloadState.failed)) {
+      t.state = DownloadState.queued;
+      _updates.add(t);
+      _enqueueId(id);
+    }
   }
 
   Future<void> _run(DownloadTask t) async {
@@ -195,19 +264,44 @@ class DownloadManager {
   Future<void> _file(DownloadTask t, CancelToken token) async {
     final target = File(p.join(t.dir, 'video.mp4'));
     final existing = await target.exists() ? await target.length() : 0;
-    final res = await _dio.get<ResponseBody>(t.url,
-        cancelToken: token,
-        options: Options(
-            responseType: ResponseType.stream, headers: {...t.headers, if (existing > 0) 'Range': 'bytes=$existing-'}));
-    t.total = (int.tryParse(res.headers.value('content-length') ?? '') ?? 0) + existing;
-    final sink = target.openWrite(mode: existing > 0 ? FileMode.append : FileMode.write);
-    t.completed = existing;
+    final res = await _dio.get<ResponseBody>(
+      t.url,
+      cancelToken: token,
+      options: Options(
+        responseType: ResponseType.stream,
+        headers: {...t.headers, if (existing > 0) 'Range': 'bytes=$existing-'},
+        validateStatus: (code) => code != null && ((code >= 200 && code < 300) || (existing > 0 && code == 416)),
+      ),
+    );
+    if (existing > 0 && res.statusCode == 416) {
+      t.completed = existing;
+      t.total = existing;
+      t.localPlaylist = target.path;
+      return;
+    }
+    final resumed = existing > 0 && res.statusCode == 206;
+    final baseOffset = resumed ? existing : 0;
+    final contentLength = int.tryParse(res.headers.value('content-length') ?? '') ?? 0;
+    t.total = contentLength > 0 ? contentLength + baseOffset : baseOffset;
+    final sink = target.openWrite(mode: resumed ? FileMode.append : FileMode.write);
+    t.completed = baseOffset;
+    var unFlushedBytes = 0;
+    final throttle = Stopwatch()..start();
     try {
       await for (final chunk in res.data!.stream) {
         sink.add(chunk);
         t.completed += chunk.length;
-        _updates.add(t);
+        unFlushedBytes += chunk.length;
+        if (unFlushedBytes >= 512 * 1024) {
+          unFlushedBytes = 0;
+          await sink.flush();
+        }
+        if (throttle.elapsedMilliseconds >= 200) {
+          throttle.reset();
+          _updates.add(t);
+        }
       }
+      await sink.flush();
     } finally {
       await sink.close();
     }
@@ -230,10 +324,21 @@ class DownloadManager {
           '';
       parsed = HlsPlaylist(text.split(RegExp(r'\r?\n')));
     }
+    final auxAssets = parsed.auxiliaryAssets();
+    for (final entry in auxAssets.entries) {
+      final auxFile = File(p.join(t.dir, entry.value));
+      if (!(await auxFile.exists() && await auxFile.length() > 0)) {
+        final partPath = '${auxFile.path}.part';
+        await _dio.download(resolveUri(playlistUri, entry.key).toString(), partPath,
+            cancelToken: token, options: Options(headers: t.headers));
+        await File(partPath).rename(auxFile.path);
+      }
+    }
     final refs = parsed.segmentRefs;
     t.total = refs.length;
     t.completed = 0;
     var next = 0;
+    final throttle = Stopwatch()..start();
     Future<void> worker() async {
       while (true) {
         final i = next++;
@@ -245,13 +350,16 @@ class DownloadManager {
           await File('${file.path}.part').rename(file.path);
         }
         t.completed++;
-        _updates.add(t);
+        if (throttle.elapsedMilliseconds >= 200 || t.completed == t.total) {
+          throttle.reset();
+          _updates.add(t);
+        }
       }
     }
 
     await Future.wait(List.generate(concurrency, (_) => worker()));
     final local = File(p.join(t.dir, 'index.m3u8'));
-    await local.writeAsString(parsed.rewriteLocal());
+    await local.writeAsString(parsed.rewriteLocal(auxAssets));
     t.localPlaylist = local.path;
   }
 }

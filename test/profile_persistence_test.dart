@@ -9,22 +9,26 @@ import 'package:uzv_reimpl/core/json_store.dart';
 import 'package:uzv_reimpl/features/catpaw/dart_callback_server.dart';
 import 'package:uzv_reimpl/features/subscription/subscription.dart';
 
-Future<Object?> _postMsgRaw(int port, Map<String, Object?> payload) async {
+Future<({int status, Object? body})> _postMsgStatus(int port, Map<String, Object?> payload, {String? token}) async {
   final client = HttpClient();
   try {
     final req = await client.post('127.0.0.1', port, '/msg');
     req.headers.contentType = ContentType.json;
+    if (token != null) req.headers.set('x-uzv-token', token);
     req.add(utf8.encode(jsonEncode(payload)));
     final res = await req.close();
     final text = await utf8.decoder.bind(res).join();
-    return jsonDecode(text);
+    return (status: res.statusCode, body: jsonDecode(text));
   } finally {
     client.close(force: true);
   }
 }
 
-Future<Map<String, dynamic>> _postMsg(int port, Map<String, Object?> payload) async {
-  final decoded = await _postMsgRaw(port, payload);
+Future<Object?> _postMsgRaw(int port, Map<String, Object?> payload, {String? token}) async =>
+    (await _postMsgStatus(port, payload, token: token)).body;
+
+Future<Map<String, dynamic>> _postMsg(int port, Map<String, Object?> payload, {String? token}) async {
+  final decoded = await _postMsgRaw(port, payload, token: token);
   return (decoded as Map).cast<String, dynamic>();
 }
 
@@ -47,12 +51,35 @@ void main() {
     await c
         .read(subscriptionRepositoryProvider)
         .save([const Subscription(key: 'sub_empty', name: 'Empty', indexJsUrl: 'https://example.com/index.js')]);
-    final port = await c.read(dartCallbackServerProvider).start();
+    final srv = c.read(dartCallbackServerProvider);
+    final port = await srv.start();
 
-    final emptyReply = await _postMsg(port, {'action': 'queryProfile'});
+    final emptyReply = await _postMsg(port, {'action': 'queryProfile'}, token: srv.token);
     expect(emptyReply, isEmpty);
     expect(emptyReply.containsKey('ok'), isFalse);
     expect(emptyReply.containsKey('data'), isFalse);
+  });
+
+  test('unauthenticated or wrong-token requests to DartCallbackServer are rejected with 403', () async {
+    final tempDir = await Directory.systemTemp.createTemp('uzv-profile-auth-');
+    addTearDown(() => tempDir.delete(recursive: true));
+    final c = _makeContainer(tempDir);
+    addTearDown(c.dispose);
+    await c
+        .read(subscriptionRepositoryProvider)
+        .save([const Subscription(key: 'sub_sec', name: 'Sec', indexJsUrl: 'https://example.com/index.js')]);
+    final srv = c.read(dartCallbackServerProvider);
+    final port = await srv.start();
+
+    await _postMsg(port, {'action': 'saveProfile', 'opt': {'quark': 'secret_cookie'}}, token: srv.token);
+
+    final noTok = await _postMsgStatus(port, {'action': 'queryProfile'});
+    expect(noTok.status, 403);
+    expect('$noTok', isNot(contains('secret_cookie')));
+
+    final badWrite = await _postMsgStatus(port, {'action': 'saveProfile', 'opt': {'quark': 'hacked'}}, token: 'wrong');
+    expect(badWrite.status, 403);
+    expect(await _postMsg(port, {'action': 'queryProfile'}, token: srv.token), {'quark': 'secret_cookie'});
   });
 
   test('saveProfile via POST /msg {action, opt} persists and queryProfile returns raw profile map after cold restart',
@@ -75,7 +102,7 @@ void main() {
         'uc': {'cookie': 'uc_cookie_456'},
         'pan123': {'username': 'user@example.com', 'password': 'pw'},
       },
-    });
+    }, token: srv1.token);
     expect(saveReply['ok'], isTrue);
     await srv1.stop();
     c1.dispose();
@@ -91,7 +118,7 @@ void main() {
     final srv2 = c2.read(dartCallbackServerProvider);
     final port2 = await srv2.start();
 
-    final queryReply = await _postMsg(port2, {'action': 'queryProfile'});
+    final queryReply = await _postMsg(port2, {'action': 'queryProfile'}, token: srv2.token);
     expect(queryReply.containsKey('ok'), isFalse);
     expect(queryReply.containsKey('code'), isFalse);
     expect(queryReply.containsKey('data'), isFalse);
@@ -129,9 +156,10 @@ void main() {
     await c
         .read(subscriptionRepositoryProvider)
         .save([const Subscription(key: 'sub_corrupt', name: 'Heal', indexJsUrl: 'https://example.com/index.js')]);
-    final port = await c.read(dartCallbackServerProvider).start();
+    final srv = c.read(dartCallbackServerProvider);
+    final port = await srv.start();
 
-    final healed = await _postMsg(port, {'action': 'queryProfile'});
+    final healed = await _postMsg(port, {'action': 'queryProfile'}, token: srv.token);
     expect(healed, {
       'spider': {'thread': 6},
       'guazi': {'token': 'gz_tok'},
@@ -165,24 +193,24 @@ void main() {
     await _postMsg(port, {
       'action': 'saveProfile',
       'opt': {'quark': 'ck_q'},
-    });
+    }, token: srv.token);
     await _postMsg(port, {
       'action': 'saveProfile',
       'opt': {'ali': 'tk_a'},
-    });
+    }, token: srv.token);
 
     // Switch active subscription to sub_2 and save different profile.
     await c.read(activeSubscriptionKeyProvider.notifier).select('sub_2');
     await _postMsg(port, {
       'action': 'saveProfile',
       'opt': {'quark': 'other_q'},
-    });
+    }, token: srv.token);
 
-    final sub2Reply = await _postMsg(port, {'action': 'queryProfile'});
+    final sub2Reply = await _postMsg(port, {'action': 'queryProfile'}, token: srv.token);
     expect(sub2Reply, {'quark': 'other_q'});
 
     await c.read(activeSubscriptionKeyProvider.notifier).select('sub_1');
-    final sub1Reply = await _postMsg(port, {'action': 'queryProfile'});
+    final sub1Reply = await _postMsg(port, {'action': 'queryProfile'}, token: srv.token);
     expect(sub1Reply, {'quark': 'ck_q', 'ali': 'tk_a'});
   });
 
@@ -195,15 +223,16 @@ void main() {
     await c
         .read(subscriptionRepositoryProvider)
         .save([const Subscription(key: 'sub_s', name: 'StrSub', indexJsUrl: 'https://s.example/index.js')]);
-    final port = await c.read(dartCallbackServerProvider).start();
+    final srv = c.read(dartCallbackServerProvider);
+    final port = await srv.start();
 
     const rawEncoded = '{"bili":"SESSDATA=xyz"}';
     final r1 = resolveCall(Uri.parse('http://127.0.0.1/msg'), {'action': 'saveProfile', 'opt': rawEncoded});
     expect(r1.action, 'saveProfile');
     expect(r1.args, {'value': rawEncoded});
 
-    await _postMsg(port, {'action': 'saveProfile', 'opt': rawEncoded});
-    final res = await _postMsgRaw(port, {'action': 'queryProfile'});
+    await _postMsg(port, {'action': 'saveProfile', 'opt': rawEncoded}, token: srv.token);
+    final res = await _postMsgRaw(port, {'action': 'queryProfile'}, token: srv.token);
     expect(res, rawEncoded);
   });
 
@@ -216,7 +245,8 @@ void main() {
     await c
         .read(subscriptionRepositoryProvider)
         .save([const Subscription(key: 'sub_n', name: 'NamedSub', indexJsUrl: 'https://n.example/index.js')]);
-    final port = await c.read(dartCallbackServerProvider).start();
+    final srv = c.read(dartCallbackServerProvider);
+    final port = await srv.start();
 
     await _postMsg(port, {
       'action': 'saveProfile',
@@ -224,11 +254,11 @@ void main() {
         'name': 'quarkSlot',
         'profile': {'cookie': 'slot_ck'},
       },
-    });
+    }, token: srv.token);
     final res = await _postMsg(port, {
       'action': 'queryProfile',
       'opt': {'name': 'quarkSlot'},
-    });
+    }, token: srv.token);
     expect(res, {'cookie': 'slot_ck'});
   });
 

@@ -311,17 +311,18 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
         _items.addAll(res?.items ?? const []);
         _done = res == null || !res.hasMore || res.items.isEmpty;
         _page++;
+        _loading = false;
       });
     } catch (e) {
       if (!mounted || generation != _generation) return;
-      if (_items.isEmpty) {
-        setState(() => _error = e);
-      } else {
+      setState(() {
+        _loading = false;
+        if (_items.isEmpty) _error = e;
+      });
+      if (_items.isNotEmpty) {
         // A later page failed: keep what is shown; scrolling to the end again retries.
         showToast(describeLoadError(e, context.l10n));
       }
-    } finally {
-      if (mounted && generation == _generation) setState(() => _loading = false);
     }
   }
 
@@ -337,6 +338,9 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
   }
 
   void _pickFilter(VodFilter f, String value) {
+    final map = _chosen[_loadedFor];
+    final alreadySame = map != null && map.containsKey(f.key) ? map[f.key] == value : value.isEmpty;
+    if (alreadySame) return;
     // Kept even when empty, so 全部 stays selected for a filter whose `init` is something else.
     _chosen.putIfAbsent(_loadedFor ?? '', () => {})[f.key] = value;
     _reload();
@@ -442,7 +446,9 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
                         _CategoryTab(
                           label: cat.name,
                           selected: cat.id == typeId,
-                          onTap: () => ref.read(selectedTypeIdProvider.notifier).select(cat.id),
+                          onTap: () {
+                            if (cat.id != typeId) ref.read(selectedTypeIdProvider.notifier).select(cat.id);
+                          },
                         ),
                     ]),
               ),

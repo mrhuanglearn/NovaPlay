@@ -86,7 +86,7 @@
   "danmuModeRemote": "自定义远程",
   "danmuModeOffNote": "不使用弹幕服务。",
   "danmuModeBuiltinNote": "在内置 Node 运行时里运行你提供的 danmu_api 脚本。",
-  "danmuModeSubscriptionNote": "使用当前订阅的 9321 端口。",
+  "danmuModeSubscriptionNote": "使用当前订阅内置的弹幕服务。",
   "danmuModeRemoteNote": "你自己的 danmu_api 服务器。",
   "danmuScriptUrl": "danmu_api 脚本地址（server.cjs）",
   "danmuDownloadScript": "下载 / 更新脚本",

@@ -52,24 +52,58 @@ function isOpenWriteFlags(flags) {
   return false;
 }
 
+const MAX_NORM_CACHE = 1024;
+const normCache = new Map();
+let normCacheHits = 0;
+let normCacheMisses = 0;
+
+function clearNormPathCache() {
+  normCache.clear();
+  normCacheHits = 0;
+  normCacheMisses = 0;
+}
+
+function normPathCacheStats() {
+  return { size: normCache.size, hits: normCacheHits, misses: normCacheMisses };
+}
+
 /** Resolve a directory (including non-existent leaves under symlinked ancestors like iOS `/var`) canonically. */
 function normDir(p) {
   return normPath(p);
 }
 
-/** Resolve paths that may not exist yet via the deepest existing ancestor. */
+/** Resolve paths that may not exist yet via the deepest existing ancestor, cached across repeated fs calls. */
 function normPath(p) {
-  const abs = path.resolve(String(p));
-  try { return realpath(abs); } catch { /* fall through */ }
-  let head = path.dirname(abs);
-  let tail = path.basename(abs);
-  while (head !== path.dirname(head)) {
-    try { return path.join(realpath(head), tail); } catch {
-      tail = path.join(path.basename(head), tail);
-      head = path.dirname(head);
-    }
+  const key = String(p);
+  const cached = normCache.get(key);
+  if (cached !== undefined) {
+    normCacheHits++;
+    return cached;
   }
-  return path.join(head, tail);
+  normCacheMisses++;
+  const abs = path.resolve(key);
+  let resolved;
+  try {
+    resolved = realpath(abs);
+  } catch {
+    let head = path.dirname(abs);
+    let tail = path.basename(abs);
+    while (head !== path.dirname(head)) {
+      try {
+        resolved = path.join(realpath(head), tail);
+        break;
+      } catch {
+        tail = path.join(path.basename(head), tail);
+        head = path.dirname(head);
+      }
+    }
+    if (resolved === undefined) resolved = path.join(head, tail);
+  }
+  if (normCache.size >= MAX_NORM_CACHE) {
+    normCache.delete(normCache.keys().next().value);
+  }
+  normCache.set(key, resolved);
+  return resolved;
 }
 
 function isInside(dir, target) {
@@ -122,7 +156,10 @@ function createPolicy(cfg = {}) {
       if (cfg.onRedirect) cfg.onRedirect(isWrite ? 'write' : 'read', target, dest);
     }
     if (isWrite) {
-      try { mkdirSyncOriginal(path.dirname(dest), { recursive: true }); } catch { /* best effort */ }
+      try {
+        mkdirSyncOriginal(path.dirname(dest), { recursive: true });
+        normCache.clear();
+      } catch { /* best effort */ }
     }
     return dest;
   }
@@ -130,10 +167,16 @@ function createPolicy(cfg = {}) {
   return { resolve, redirectRoot, writeDirs, readDirs };
 }
 
+const STRUCTURAL_FS_OPS = new Set([
+  'mkdir', 'mkdirSync', 'rmdir', 'rmdirSync', 'unlink', 'unlinkSync',
+  'rename', 'renameSync', 'rm', 'rmSync', 'symlink', 'symlinkSync', 'link', 'linkSync',
+]);
+
 function patchMethods(target, names, isWrite, policy) {
   for (const name of names) {
     if (typeof target[name] !== 'function') continue;
     const original = target[name];
+    const invalidatesCache = STRUCTURAL_FS_OPS.has(name);
     target[name] = function patched(first, ...rest) {
       const effectiveWrite = isWrite || ((name === 'open' || name === 'openSync') && isOpenWriteFlags(rest[0]));
       // rename/copy style calls carry a second path; protect it as a write target as well.
@@ -142,7 +185,13 @@ function patchMethods(target, names, isWrite, policy) {
         name === 'cp' || name === 'cpSync' || name === 'link' || name === 'linkSync') && rest.length > 0) {
         rest[0] = policy.resolve(rest[0], true);
       }
-      return original.call(this, mapped, ...rest);
+      if (invalidatesCache) normCache.clear();
+      const out = original.call(this, mapped, ...rest);
+      if (invalidatesCache) {
+        if (out && typeof out.finally === 'function') return out.finally(() => normCache.clear());
+        normCache.clear();
+      }
+      return out;
     };
   }
 }
@@ -158,4 +207,4 @@ function installFsPolicy(policy) {
   patchMethods(fsp, FSP_WRITE, true, policy);
 }
 
-module.exports = { createPolicy, installFsPolicy, normDir, normPath, isInside };
+module.exports = { createPolicy, installFsPolicy, normDir, normPath, isInside, clearNormPathCache, normPathCacheStats };

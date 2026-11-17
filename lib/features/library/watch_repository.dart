@@ -64,21 +64,35 @@ class HistoryRepository {
   final int maxEntries;
   DateTime Function() now = DateTime.now;
 
-  Future<List<ProgressEntry>> all() async {
+  int _syncedRev = -1;
+  List<ProgressEntry> _entries = [];
+  final Map<String, ProgressEntry> _byKey = {};
+
+  Future<void> _ensureLoaded() async {
+    if (_syncedRev == _store.revision) return;
     final raw = await _store.read<List<dynamic>>(const []);
-    final list = raw.whereType<Map>().map((e) => ProgressEntry.fromJson(e.cast<String, dynamic>())).toList();
-    list.sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
-    return list;
+    final list = raw.whereType<Map>().map((e) => ProgressEntry.fromJson(e.cast<String, dynamic>())).toList()
+      ..sort((a, b) => b.updatedAt.compareTo(a.updatedAt));
+    _entries = list;
+    _byKey
+      ..clear()
+      ..addEntries(list.reversed.map((e) => MapEntry(vodKey(e.item.siteKey ?? '', e.item.id), e)));
+    _syncedRev = _store.revision;
+  }
+
+  Future<List<ProgressEntry>> all() async {
+    await _ensureLoaded();
+    return List<ProgressEntry>.unmodifiable(_entries);
   }
 
   Future<ProgressEntry?> find(String siteKey, String vodId) async {
-    for (final e in await all()) {
-      if (vodKey(e.item.siteKey ?? '', e.item.id) == vodKey(siteKey, vodId)) return e;
-    }
-    return null;
+    await _ensureLoaded();
+    return _byKey[vodKey(siteKey, vodId)];
   }
 
-  Future<void> record(ProgressEntry entry) async {
+  Future<void> record(ProgressEntry entry, {bool flush = true}) async {
+    await _ensureLoaded();
+    final key = vodKey(entry.item.siteKey ?? '', entry.item.id);
     final stamped = ProgressEntry(
       item: entry.item,
       lineIndex: entry.lineIndex,
@@ -89,47 +103,86 @@ class HistoryRepository {
       updatedAt: now().millisecondsSinceEpoch,
       qualityIndex: entry.qualityIndex,
     );
-    final list = (await all())
-        .where((e) => vodKey(e.item.siteKey ?? '', e.item.id) != vodKey(entry.item.siteKey ?? '', entry.item.id))
-        .toList()
-      ..insert(0, stamped);
-    await _store.write(list.take(maxEntries).map((e) => e.toJson()).toList());
+    _entries.removeWhere((e) => vodKey(e.item.siteKey ?? '', e.item.id) == key);
+    _entries.insert(0, stamped);
+    while (_entries.length > maxEntries) {
+      final dropped = _entries.removeLast();
+      _byKey.remove(vodKey(dropped.item.siteKey ?? '', dropped.item.id));
+    }
+    _byKey[key] = stamped;
+    final encoded = [for (final e in _entries) e.toJson()];
+    if (flush) {
+      await _store.write(encoded);
+    } else {
+      _store.writeMemory(encoded);
+    }
+    _syncedRev = _store.revision;
   }
+
+  Future<void> flush() => _store.flush();
 
   Future<void> remove(String siteKey, String vodId) async {
-    final list = (await all()).where((e) => vodKey(e.item.siteKey ?? '', e.item.id) != vodKey(siteKey, vodId)).toList();
-    await _store.write(list.map((e) => e.toJson()).toList());
+    await _ensureLoaded();
+    final key = vodKey(siteKey, vodId);
+    _entries.removeWhere((e) => vodKey(e.item.siteKey ?? '', e.item.id) == key);
+    _byKey.remove(key);
+    await _store.write([for (final e in _entries) e.toJson()]);
+    _syncedRev = _store.revision;
   }
 
-  Future<void> clear() => _store.write(<dynamic>[]);
+  Future<void> clear() async {
+    _entries = [];
+    _byKey.clear();
+    await _store.write(<dynamic>[]);
+    _syncedRev = _store.revision;
+  }
 }
 
 class FavoriteRepository {
   FavoriteRepository({JsonStore? store}) : _store = store ?? JsonStore('favorites.json');
   final JsonStore _store;
 
-  Future<List<VodItem>> all() async {
+  int _syncedRev = -1;
+  List<VodItem> _items = [];
+  final Set<String> _keys = {};
+
+  Future<void> _ensureLoaded() async {
+    if (_syncedRev == _store.revision) return;
     final raw = await _store.read<List<dynamic>>(const []);
-    return raw
+    _items = raw
         .whereType<Map>()
         .map((e) => VodItem.fromJson(e.cast<String, dynamic>(), siteKey: e['siteKey'] as String?))
         .toList();
+    _keys
+      ..clear()
+      ..addAll(_items.map((e) => vodKey(e.siteKey ?? '', e.id)));
+    _syncedRev = _store.revision;
   }
 
-  Future<bool> isFavorite(String siteKey, String vodId) async =>
-      (await all()).any((e) => vodKey(e.siteKey ?? '', e.id) == vodKey(siteKey, vodId));
+  Future<List<VodItem>> all() async {
+    await _ensureLoaded();
+    return List<VodItem>.unmodifiable(_items);
+  }
+
+  Future<bool> isFavorite(String siteKey, String vodId) async {
+    await _ensureLoaded();
+    return _keys.contains(vodKey(siteKey, vodId));
+  }
 
   /// Returns the new state.
   Future<bool> toggle(VodItem item) async {
-    final list = await all();
+    await _ensureLoaded();
     final key = vodKey(item.siteKey ?? '', item.id);
-    final idx = list.indexWhere((e) => vodKey(e.siteKey ?? '', e.id) == key);
+    final idx = _items.indexWhere((e) => vodKey(e.siteKey ?? '', e.id) == key);
     if (idx >= 0) {
-      list.removeAt(idx);
+      _items.removeAt(idx);
+      _keys.remove(key);
     } else {
-      list.insert(0, item);
+      _items.insert(0, item);
+      _keys.add(key);
     }
-    await _store.write(list.map((e) => e.toJson()).toList());
+    await _store.write([for (final e in _items) e.toJson()]);
+    _syncedRev = _store.revision;
     return idx < 0;
   }
 }

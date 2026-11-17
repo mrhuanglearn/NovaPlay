@@ -53,11 +53,14 @@ class SnifferService {
 
   /// Registers the report handler and the injected script on [controller]. Returns a stream of resources.
   Future<Stream<SniffedResource>> attach(InAppWebViewController controller) async {
-    final out = StreamController<SniffedResource>.broadcast();
+    late final StreamController<SniffedResource> out;
+    out = StreamController<SniffedResource>.broadcast(onCancel: () {
+      if (!out.isClosed) unawaited(out.close());
+    });
     controller.addJavaScriptHandler(
       handlerName: 'snifferReport',
       callback: (args) {
-        if (args.isEmpty) return;
+        if (args.isEmpty || out.isClosed) return;
         final report = args.first is String ? jsonDecode(args.first as String) : args.first;
         if (report is Map) out.add(SniffedResource.fromReport(report.cast<String, dynamic>()));
       },

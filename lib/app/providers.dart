@@ -1,25 +1,23 @@
 import 'dart:async';
-import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../core/json_store.dart';
 import '../core/node_bridge.dart';
+import '../features/backup/backup_service.dart';
 import '../features/catpaw/catpaw_client.dart';
 import '../features/catpaw/catpaw_protocol.dart';
 import '../features/catpaw/catpaw_recovery.dart';
 import '../features/catpaw/dart_callback_server.dart';
 import '../features/catpaw/manager_client.dart';
-import '../features/backup/backup_service.dart';
-import '../features/cleanup/cleanup_service.dart';
 import '../features/catpaw/spider_api.dart';
+import '../features/cleanup/cleanup_service.dart';
 import '../features/danmaku/danmu_service.dart';
 import '../features/library/watch_repository.dart';
 import '../features/player/head_tail.dart';
@@ -28,6 +26,7 @@ import '../features/player/player_launcher.dart';
 import '../features/player/player_session.dart';
 import '../features/search/search_state.dart';
 import '../features/sniffer/sniffer_service.dart';
+import '../features/subscription/profile_service.dart';
 import '../features/subscription/subscription.dart';
 import '../l10n/l10n.dart';
 import '../models/vod.dart';
@@ -36,10 +35,13 @@ import '../services/tmdb_client.dart';
 import '../services/webdav_sync.dart';
 import '../ui/load_error.dart';
 import 'app_preferences.dart';
+import 'extra_providers.dart';
 import 'live_providers.dart';
 import 'router.dart';
 import 'site_prefs.dart';
 import 'ui_hooks.dart';
+
+export '../features/subscription/profile_service.dart' show sanitizeSubscriptionProfile, mergeProfileMaps;
 
 // Provider names intentionally follow the ones recovered from the original string pool
 // (catpawRuntimeProvider, subscriptionsProvider, homeSitesProvider, selectedHomeSiteProvider, videoFeedProvider,
@@ -65,6 +67,8 @@ final playerConfigRepositoryProvider = Provider((ref) => PlayerConfigRepository(
 final snifferServiceProvider = Provider((ref) => SnifferService());
 final settingsStoreProvider = Provider((ref) => JsonStore('settings.json'));
 final subscriptionProfilesStoreProvider = Provider((ref) => JsonStore('subscription_profiles.json'));
+final subscriptionProfileServiceProvider =
+    Provider((ref) => SubscriptionProfileService(ref.watch(subscriptionProfilesStoreProvider)));
 final webDavConfigStoreProvider = Provider((ref) => JsonStore('webdav_config.json'));
 final backupServiceProvider = Provider((ref) => BackupService());
 
@@ -125,6 +129,7 @@ final danmuServiceControllerProvider = Provider((ref) => DanmuServiceController(
         final key = await ref.read(activeSubscriptionKeyProvider.future);
         return subs.firstWhere((s) => s.key == key, orElse: () => subs.first);
       },
+      ensureSubscriptionPort: () async => (await ref.read(catpawRuntimeProvider.future))?.api.port,
     ));
 
 final headTailRepositoryProvider = Provider((ref) => HeadTailRepository());
@@ -133,6 +138,10 @@ final playerLauncherProvider = Provider((ref) => PlayerLauncher(
       configs: ref.watch(playerConfigRepositoryProvider),
       sniffer: ref.watch(snifferServiceProvider),
       danmu: () => ref.read(danmuServiceControllerProvider).resolve(),
+      preferVideoDanmu: () async {
+        final cfg = await ref.read(danmuServiceControllerProvider).config();
+        return cfg.enabled && cfg.preferVideoDanmu;
+      },
       refs: ref.watch(danmuRefsProvider),
       headTail: ref.watch(headTailRepositoryProvider),
       onSession: (s) => ref.read(activePlayerSessionProvider.notifier).set(s),
@@ -158,12 +167,17 @@ class ActiveSubscriptionKey extends AsyncNotifier<String?> {
     return key is String ? key : null;
   }
 
-  Future<void> select(String key) async {
+  Future<void> select(String? key) async {
+    await ref.read(settingsStoreProvider).update<Map<String, dynamic>>(const {}, (cur) {
+      final out = Map<String, dynamic>.of(cur);
+      if (key == null) {
+        out.remove(_field);
+      } else {
+        out[_field] = key;
+      }
+      return out;
+    });
     state = AsyncData(key);
-    final store = ref.read(settingsStoreProvider);
-    final settings = Map<String, dynamic>.of(await store.read<Map<String, dynamic>>(const {}));
-    settings[_field] = key;
-    await store.write(settings);
   }
 }
 
@@ -177,33 +191,45 @@ class SpiderRuntime {
   final List<SpiderSite> sites;
 }
 
-String? _lastRunningCatpawSubKey;
+/// Container-scoped tracker for the currently running local CatPaw worker key and in-flight background auto-updates.
+class _CatpawRuntimeState {
+  String? lastRunningSubKey;
+  final Set<String> checkingAutoUpdate = {};
+}
 
-Future<String?> _prepareSubscriptionProfilePath(Ref ref, Subscription sub) async {
-  try {
-    final profileStore = ref.read(subscriptionProfilesStoreProvider);
-    final allProfiles = Map<String, dynamic>.of(await profileStore.read<Map<String, dynamic>>(<String, dynamic>{}));
-    final rawEntry = allProfiles[sub.key] ?? allProfiles['default'];
-    final sanitized = sanitizeSubscriptionProfile(rawEntry);
-    if (rawEntry != null && jsonEncode(sanitized) != jsonEncode(rawEntry)) {
-      allProfiles[sub.key] = sanitized;
-      await profileStore.write(allProfiles);
+final _catpawRuntimeStateProvider = Provider((ref) => _CatpawRuntimeState());
+
+/// Checks remote MD5 in the background so `sub.autoUpdate` never blocks app startup by up to 8s.
+void _scheduleBackgroundAutoUpdateCheck(
+    Ref ref, Subscription sub, String currentMd5, SubscriptionInstaller installer) {
+  final tracker = ref.read(_catpawRuntimeStateProvider);
+  if (!tracker.checkingAutoUpdate.add(sub.key)) return;
+  var alive = true;
+  ref.onDispose(() => alive = false);
+  unawaited(() async {
+    try {
+      final remote = await installer.remoteMd5(sub);
+      if (!alive || remote == null || remote == currentMd5) return;
+      final next = await installer.install(
+        sub,
+        confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey),
+      );
+      if (!alive) return;
+      await ref
+          .read(subscriptionRepositoryProvider)
+          .upsert(sub.copyWith(installedMd5: next.md5, updatedAt: DateTime.now().millisecondsSinceEpoch));
+      ref.invalidate(subscriptionsProvider);
+      // Keep the running worker alive so Home never resets mid-scroll; the staged script takes effect on next launch
+      // or explicit refresh.
+      if (tracker.lastRunningSubKey != sub.key) {
+        ref.invalidate(catpawRuntimeProvider);
+      }
+    } catch (e) {
+      debugPrint('background autoUpdate failed for ${sub.key}: $e');
+    } finally {
+      tracker.checkingAutoUpdate.remove(sub.key);
     }
-    final baseDir = await profileStore.resolveBaseDir();
-    final safeSubName = sub.key.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
-    final profileDir = Directory(p.join(baseDir.path, 'subscription_profiles'));
-    await profileDir.create(recursive: true);
-    final pf = File(p.join(profileDir.path, '$safeSubName.json'));
-    if (!await pf.exists() || sanitized != null) {
-      final seed = sanitized is Map ? sanitized : (sanitized ?? <String, dynamic>{});
-      final tmp = File('${pf.path}.tmp');
-      await tmp.writeAsString(jsonEncode(seed), flush: true);
-      await tmp.rename(pf.path);
-    }
-    return pf.path;
-  } catch (_) {
-    return null;
-  }
+  }());
 }
 
 /// Supervises the active local CatPaw instance across idle/background resume and connection drops.
@@ -229,9 +255,10 @@ final catpawSupervisorProvider = Provider<CatpawSupervisor>((ref) {
       }
       final catpaw = ref.read(catpawClientProvider);
       await catpaw.attach();
-      await catpaw.setDartPort(await ref.read(dartCallbackServerProvider).ensureRunning());
-      final profileFilePath = await _prepareSubscriptionProfilePath(ref, sub);
-      _lastRunningCatpawSubKey = sub.key;
+      final cb = ref.read(dartCallbackServerProvider);
+      await catpaw.setDartPort(await cb.ensureRunning(), token: cb.token);
+      final profileFilePath = await ref.read(subscriptionProfileServiceProvider).prepareProfilePath(sub.key);
+      ref.read(_catpawRuntimeStateProvider).lastRunningSubKey = sub.key;
       return catpaw.startAndWait(
         name: sub.key,
         scriptPath: installed.scriptPath,
@@ -254,19 +281,34 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
   // Renaming, 自动更新/上锁 and the 上次更新 stamp below must not restart the running script; pages that change the script
   // itself (refresh, a new zip) invalidate this provider explicitly.
   await ref.watch(subscriptionsProvider.selectAsync(_runtimeInputs));
+  final runtimeState = ref.watch(_catpawRuntimeStateProvider);
   final subs = await ref.read(subscriptionsProvider.future);
-  if (subs.isEmpty) return null; // UI: "Add a catpaw subscription on the Subscriptions page first"
+  if (subs.isEmpty) {
+    final prevKey = runtimeState.lastRunningSubKey;
+    if (prevKey != null) {
+      runtimeState.lastRunningSubKey = null;
+      try {
+        final catpaw = ref.read(catpawClientProvider);
+        if (catpaw.attached) await catpaw.stop(prevKey);
+      } catch (e) {
+        debugPrint('stop previous catpaw ($prevKey) failed: $e');
+      }
+    }
+    return null; // UI: "Add a catpaw subscription on the Subscriptions page first"
+  }
   final key = await ref.watch(activeSubscriptionKeyProvider.future);
   final sub = subs.firstWhere((s) => s.key == key, orElse: () => subs.first);
 
   if (sub.cloudUrl != null) {
-    final prevKey = _lastRunningCatpawSubKey;
+    final prevKey = runtimeState.lastRunningSubKey;
     if (prevKey != null && prevKey != sub.key) {
-      _lastRunningCatpawSubKey = null;
+      runtimeState.lastRunningSubKey = null;
       try {
         final catpaw = ref.read(catpawClientProvider);
         if (catpaw.attached) await catpaw.stop(prevKey);
-      } catch (_) {}
+      } catch (e) {
+        debugPrint('stop previous catpaw ($prevKey) failed: $e');
+      }
     }
     final uri = Uri.parse(sub.cloudUrl!);
     final api =
@@ -276,21 +318,19 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
 
   final catpaw = ref.watch(catpawClientProvider);
   await catpaw.attach(); // completes after "Node ready"
-  final prevKey = _lastRunningCatpawSubKey;
+  final prevKey = runtimeState.lastRunningSubKey;
   if (prevKey != null && prevKey != sub.key) {
     try {
       await catpaw.stop(prevKey);
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('stop previous catpaw ($prevKey) failed: $e');
+    }
   }
   // Scripts reach the app through this loopback server; the port must be announced before the script starts.
-  await catpaw.setDartPort(await ref.watch(dartCallbackServerProvider).ensureRunning());
+  final cb = ref.watch(dartCallbackServerProvider);
+  await catpaw.setDartPort(await cb.ensureRunning(), token: cb.token);
   final installer = ref.watch(subscriptionInstallerProvider);
   var installed = await installer.installedScript(sub); // reuse: no network needed on later launches
-  if (installed != null && sub.autoUpdate) {
-    // OBSERVED "activate: 更新检查 remoteMd5=… localMd5=": with 自动更新 on, reinstall when the server has a newer script.
-    final remote = await installer.remoteMd5(sub); // null when offline: keep the installed copy
-    if (remote != null && remote != installed.md5) installed = null;
-  }
   var freshlyInstalled = false;
   if (installed == null) {
     if (sub.local) throw StateError('the local script is missing; import the zip again on the edit page');
@@ -300,11 +340,13 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
         .read(subscriptionRepositoryProvider)
         .upsert(sub.copyWith(installedMd5: installed.md5, updatedAt: DateTime.now().millisecondsSinceEpoch));
     freshlyInstalled = true;
+  } else if (sub.autoUpdate && !sub.local) {
+    _scheduleBackgroundAutoUpdateCheck(ref, sub, installed.md5, installer);
   }
   final int port;
   try {
-    final profileFilePath = await _prepareSubscriptionProfilePath(ref, sub);
-    _lastRunningCatpawSubKey = sub.key;
+    final profileFilePath = await ref.read(subscriptionProfileServiceProvider).prepareProfilePath(sub.key);
+    runtimeState.lastRunningSubKey = sub.key;
     port = await catpaw.startAndWait(
       name: sub.key,
       scriptPath: installed.scriptPath,
@@ -356,11 +398,13 @@ class SelectedHomeSite extends AsyncNotifier<String?> {
     state = AsyncData(key);
     final sub = await _subscription();
     if (sub == null) return;
-    final store = ref.read(settingsStoreProvider);
-    final settings = Map<String, dynamic>.of(await store.read<Map<String, dynamic>>(const {}));
-    final saved = settings[_field];
-    settings[_field] = {if (saved is Map) ...saved, sub: key};
-    await store.write(settings);
+    await ref.read(settingsStoreProvider).update<Map<String, dynamic>>(const {}, (settings) {
+      final saved = settings[_field];
+      return {
+        ...settings,
+        _field: {if (saved is Map) ...saved, sub: key},
+      };
+    });
   }
 }
 
@@ -379,12 +423,12 @@ final currentSiteProvider = Provider<SpiderSite?>((ref) {
   final all = ref.watch(homeSitesProvider);
   if (all.isEmpty) return null;
   final selected = ref.watch(selectedHomeSiteProvider);
-  // Wait for the saved choice instead of loading the first site for nothing (it is read right after the runtime).
-  if (!selected.hasValue && !selected.hasError) return null;
+  // Wait for the saved choice (including across subscription switches) instead of flashing the first site first.
+  if (selected.isLoading || (!selected.hasValue && !selected.hasError)) return null;
   // Likewise wait for 站点设置, so a disabled or locked site is not loaded first. A site that is switched off or locked
   // while shown gives way to the first one still listed in 切换站点 (all sites when none is left).
   final prefs = ref.watch(sitePrefsProvider);
-  if (!prefs.hasValue && !prefs.hasError) return null;
+  if (prefs.isLoading || (!prefs.hasValue && !prefs.hasError)) return null;
   final visible = ref.watch(visibleHomeSitesProvider);
   final sites = visible.isEmpty ? all : visible;
   final key = selected.valueOrNull;
@@ -448,60 +492,13 @@ Duration toastDuration(Object? value) {
 }
 
 /// Whether a script's `openInternalWebview` replaces the page on top instead of opening over it.
-///
-/// OBSERVED on the phone (2026-11-10): tapping a QR card of 「设」配置 opens its detail page; the script answers the
-/// detail request with an empty item and, while that request is still running, asks for the web page. The original
-/// 1.1.7 leaves the empty 视频详情 under the web page. The user asked to land on the web page directly, so a detail page
-/// that is still loading is replaced (back then returns to the home page); any other page stays under the web page.
 bool webviewReplacesTop(Uri top, bool Function(DetailQuery q) detailLoading) =>
     top.path == '/video/detail' &&
     detailLoading((siteKey: top.queryParameters['site'], vodId: top.queryParameters['id'] ?? ''));
 
-/// Unwraps any accidental `{"ok": true, "code": 0, "data": ...}` envelope layers while preserving newer top-level site
-/// keys (`quark`, `spider`, `guazi`, ...) merged on top of older inner layers.
-Object? sanitizeSubscriptionProfile(Object? raw) {
-  if (raw is! Map) return raw;
-  final map = raw.cast<String, dynamic>();
-  final isEnvelope = map['ok'] is bool && map['code'] is num && map.containsKey('data');
-  if (isEnvelope) {
-    final inner = sanitizeSubscriptionProfile(map['data']);
-    final base = inner is Map ? Map<String, dynamic>.of(inner.cast<String, dynamic>()) : <String, dynamic>{};
-    final outer = <String, dynamic>{};
-    for (final entry in map.entries) {
-      final k = entry.key;
-      if (k == 'ok' || k == 'code' || k == 'data' || k == 'error') continue;
-      outer[k] = sanitizeSubscriptionProfile(entry.value);
-    }
-    return mergeProfileMaps(base, outer);
-  }
-  return <String, dynamic>{
-    for (final entry in map.entries)
-      entry.key: entry.value is Map
-          ? Map<String, dynamic>.of((entry.value as Map).cast<String, dynamic>())
-          : entry.value,
-  };
-}
-
-Map<String, dynamic> mergeProfileMaps(Map<String, dynamic> older, Map<String, dynamic> newer) {
-  final out = Map<String, dynamic>.of(older);
-  for (final entry in newer.entries) {
-    final prevVal = out[entry.key];
-    final nextVal = entry.value;
-    if (prevVal is Map && nextVal is Map) {
-      out[entry.key] = {
-        ...prevVal.cast<String, dynamic>(),
-        ...nextVal.cast<String, dynamic>(),
-      };
-    } else {
-      out[entry.key] = nextVal;
-    }
-  }
-  return out;
-}
-
 final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCallbackServer>((ref) {
   final history = ref.watch(historyRepositoryProvider);
-  final profiles = ref.watch(subscriptionProfilesStoreProvider);
+  final profileService = ref.watch(subscriptionProfileServiceProvider);
   String? str(Map<String, dynamic> a, List<String> keys) {
     for (final k in keys) {
       final v = a[k];
@@ -521,28 +518,11 @@ final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCal
     return 'default';
   }
 
-  Future<void> syncSidecarProfileFile(String subKey, Object? value) async {
-    try {
-      final baseDir = await profiles.resolveBaseDir();
-      final safeSubName = subKey.replaceAll(RegExp(r'[^a-zA-Z0-9_-]'), '_');
-      final dir = Directory(p.join(baseDir.path, 'subscription_profiles'));
-      await dir.create(recursive: true);
-      final pf = File(p.join(dir.path, '$safeSubName.json'));
-      final tmp = File('${pf.path}.tmp');
-      await tmp.writeAsString(jsonEncode(value ?? <String, dynamic>{}), flush: true);
-      await tmp.rename(pf.path);
-    } catch (_) {
-      // Ignore in pure memory/mocked environments without disk baseDir.
-    }
-  }
-
   // Every payload field name below is INFERRED (only the action names were observed), hence the alias lists.
   final server = DartCallbackServer(handlers: {
     DartActions.toast: (args) async {
       final message = str(args, ['message', 'msg', 'text', 'content']) ?? '';
       final duration = toastDuration(args['duration']);
-      // While a player page covers the app the SnackBar would be hidden behind it (OBSERVED 2026-11-10: a spider's
-      // 夸克登录状态失效 toast never showed and the page kept spinning), so the page shows it as a system toast.
       final onPlayer = await ref
           .read(playerLauncherProvider)
           .host
@@ -552,71 +532,10 @@ final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCal
       return true;
     },
     DartActions.queryHistory: (args) async => [for (final e in await history.all()) e.toJson()],
-    DartActions.queryProfile: (args) async {
-      final subKey = await activeProfileSubKey();
-      final all = Map<String, dynamic>.of(await profiles.read<Map<String, dynamic>>(<String, dynamic>{}));
-      final slot = args['name'];
-      if (slot is String && slot.isNotEmpty && args.length == 1) {
-        final scopedKey = all.containsKey('$subKey:$slot') ? '$subKey:$slot' : (all.containsKey(slot) ? slot : null);
-        if (scopedKey != null) {
-          final rawSlot = all[scopedKey];
-          final healedSlot = sanitizeSubscriptionProfile(rawSlot);
-          if (jsonEncode(healedSlot) != jsonEncode(rawSlot)) {
-            all[scopedKey] = healedSlot;
-            await profiles.write(all);
-          }
-          return RawJsonResponse(healedSlot ?? <String, dynamic>{});
-        }
-        return const RawJsonResponse(<String, dynamic>{});
-      }
-      final targetKey = all.containsKey(subKey)
-          ? subKey
-          : (subKey != 'default' && all.containsKey('default') ? 'default' : null);
-      if (targetKey != null) {
-        final rawEntry = all[targetKey];
-        final healed = sanitizeSubscriptionProfile(rawEntry);
-        if (jsonEncode(healed) != jsonEncode(rawEntry)) {
-          all[targetKey] = healed;
-          await profiles.write(all);
-          await syncSidecarProfileFile(targetKey, healed);
-        }
-        return RawJsonResponse(healed ?? <String, dynamic>{});
-      }
-      return const RawJsonResponse(<String, dynamic>{});
-    },
+    DartActions.queryProfile: (args) async => profileService.queryProfile(await activeProfileSubKey(), args),
     DartActions.saveProfile: (args) async {
       try {
-        final subKey = await activeProfileSubKey();
-        final all = Map<String, dynamic>.of(await profiles.read<Map<String, dynamic>>(<String, dynamic>{}));
-        if (all.containsKey('null') && all['null'] == null) {
-          all.remove('null');
-        }
-        final slot = args['name'];
-        if (slot is String && slot.isNotEmpty && args.containsKey('profile') && args.length == 2) {
-          all['$subKey:$slot'] = sanitizeSubscriptionProfile(args['profile']);
-        } else if (args.length == 1 && args.containsKey('value')) {
-          all[subKey] = sanitizeSubscriptionProfile(args['value']);
-          await syncSidecarProfileFile(subKey, all[subKey]);
-        } else if (args.length == 1 && args.containsKey('profile')) {
-          final inner = sanitizeSubscriptionProfile(args['profile']);
-          final prev = sanitizeSubscriptionProfile(all[subKey]);
-          if (inner is Map && inner.isNotEmpty && prev is Map) {
-            all[subKey] = mergeProfileMaps(prev.cast<String, dynamic>(), inner.cast<String, dynamic>());
-          } else {
-            all[subKey] = inner;
-          }
-          await syncSidecarProfileFile(subKey, all[subKey]);
-        } else {
-          final sanitizedIncoming = sanitizeSubscriptionProfile(Map<String, dynamic>.of(args));
-          final prev = sanitizeSubscriptionProfile(all[subKey]);
-          if (sanitizedIncoming is Map && sanitizedIncoming.isNotEmpty && prev is Map) {
-            all[subKey] = mergeProfileMaps(prev.cast<String, dynamic>(), sanitizedIncoming.cast<String, dynamic>());
-          } else {
-            all[subKey] = sanitizedIncoming;
-          }
-          await syncSidecarProfileFile(subKey, all[subKey]);
-        }
-        await profiles.write(all);
+        await profileService.saveProfile(await activeProfileSubKey(), args);
         return true;
       } catch (e) {
         final msg = '持久化订阅 profile 失败: $e';
@@ -697,7 +616,6 @@ final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCal
       return launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
     },
   });
-  // Logged to the device log (shape only, see DartCallbackServer.log) so the request format scripts use can be checked.
   server.log = (line) {
     debugPrint(line);
     ref.read(nodeBridgeProvider).logDiagnostic(line);
@@ -721,8 +639,7 @@ class SearchPrefsNotifier extends AsyncNotifier<SearchPrefs> {
 
   Future<void> _save(SearchPrefs next) async {
     state = AsyncData(next);
-    final store = ref.read(settingsStoreProvider);
-    await store.write(next.writeTo(await store.read<Map<String, dynamic>>(const {}), _subscription));
+    await ref.read(settingsStoreProvider).update<Map<String, dynamic>>(const {}, (cur) => next.writeTo(cur, _subscription));
   }
 
   Future<void> setLayout(SearchLayout layout) async {
@@ -746,11 +663,6 @@ class SearchPrefsNotifier extends AsyncNotifier<SearchPrefs> {
 
 final searchPrefsProvider = AsyncNotifierProvider<SearchPrefsNotifier, SearchPrefs>(SearchPrefsNotifier.new);
 
-/// The sites the search page lists and searches: the video sites (type 3) of the running subscription.
-///
-/// OBSERVED (UZN 1.1.7, 站点搜索管理 on the phone): every type 3 site is listed and switched on, 「盘」我的 included
-/// although its config says `searchable: 0`; 「推」推送 (type 4) and the Apple Music web page (type 7) are not listed.
-/// OBSERVED (2026-11-13): sites switched off (启用) or locked in 切换站点 → 站点设置 are not listed either.
 final searchableSitesProvider =
     Provider<List<SpiderSite>>((ref) => [for (final s in ref.watch(visibleHomeSitesProvider)) if (s.type == 3) s]);
 
@@ -764,3 +676,28 @@ final tmdbProvider = FutureProvider<TmdbClient?>((ref) async {
 
 final favoriteListProvider = FutureProvider<List<VodItem>>((ref) => ref.watch(favoriteRepositoryProvider).all());
 final historyListProvider = FutureProvider<List<ProgressEntry>>((ref) => ref.watch(historyRepositoryProvider).all());
+
+/// Invalidates Riverpod state for documents overwritten during a WebDAV pull so open screens show fresh data immediately.
+void refreshProvidersAfterWebDavPull(ProviderContainer container, Iterable<String> pulled) {
+  final set = pulled.toSet();
+  if (set.isEmpty) return;
+  if (set.contains('favorites.json')) container.invalidate(favoriteListProvider);
+  if (set.contains('auto_sync_favorites.json')) container.invalidate(autoSyncFavoritesProvider);
+  if (set.contains('history.json') || set.contains('play_progress.json') || set.contains('last_episode.json')) {
+    container.invalidate(historyListProvider);
+  }
+  if (set.contains('tracking.json')) {
+    container.invalidate(trackingListProvider);
+    container.invalidate(trackingWeekProvider);
+  }
+  if (set.contains('tmdb_settings.json') || set.contains('tmdb_refs.json')) {
+    container.invalidate(tmdbProvider);
+    container.invalidate(tmdbMatchProvider);
+    container.invalidate(trackingWeekProvider);
+  }
+  if (set.contains('live_sources.json')) container.invalidate(liveSourcesProvider);
+  if (set.contains('live_preferences.json')) container.invalidate(livePreferencesProvider);
+  if (set.contains('player_config.json')) {
+    unawaited(container.read(playerConfigRepositoryProvider).load());
+  }
+}

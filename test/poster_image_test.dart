@@ -1,6 +1,9 @@
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:uzv_reimpl/features/cleanup/cleanup_service.dart';
+import 'package:uzv_reimpl/features/live/live_store.dart';
 import 'package:uzv_reimpl/ui/poster_image.dart';
 import 'package:uzv_reimpl/ui/widgets.dart';
 
@@ -8,6 +11,10 @@ import 'package:uzv_reimpl/ui/widgets.dart';
 // Referer and 403 to `User-Agent: Dart/3.x (dart:io), Mozilla/5.0 …` — what Flutter's NetworkImage sends, because it
 // adds the given User-Agent next to dart:io's own. With the browser User-Agent alone it answers 200.
 // (No testWidgets in this file: the widget-test binding replaces every HttpClient with one that answers 400.)
+
+final _tinyPng = base64Decode(
+  'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
+);
 
 void main() {
   test('posters are fetched with the browser User-Agent alone (doubanio answers 403 to "Dart/…, Mozilla/…")', () async {
@@ -33,5 +40,44 @@ void main() {
     final r = parsePosterRequest('https://img3.doubanio.com/view/photo/s_ratio_poster/public/p2935488630.webp');
     expect(r.headers['Referer'], 'https://movie.douban.com/');
     expect(r.headers['User-Agent'], startsWith('Mozilla/5.0'));
+  });
+
+  test('PosterImage caches fetched bytes on disk and CleanupItem.images clears poster_cache', () async {
+    final tempRoot = await Directory.systemTemp.createTemp('poster_cache_test_');
+    addTearDown(() async {
+      PosterImage.debugCacheDir = null;
+      if (await tempRoot.exists()) await tempRoot.delete(recursive: true);
+    });
+    final posterDir = Directory('${tempRoot.path}/poster_cache');
+    PosterImage.debugCacheDir = posterDir;
+
+    var hits = 0;
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    server.listen((req) {
+      hits++;
+      req.response
+        ..statusCode = 200
+        ..headers.contentType = ContentType('image', 'png')
+        ..add(_tinyPng)
+        ..close();
+    });
+
+    final url = 'http://127.0.0.1:${server.port}/cover.png';
+    final first = await PosterImage.loadBytesCached(url, const {'User-Agent': 'Test'});
+    expect(first, _tinyPng);
+    expect(hits, 1);
+
+    final second = await PosterImage.loadBytesCached(url, const {'User-Agent': 'Test'});
+    expect(second, _tinyPng);
+    expect(hits, 1, reason: 'second load must hit disk cache without network request');
+
+    final cleanup = CleanupService(
+      livePlaylists: LivePlaylistLoader(fetch: (_) async => '', cacheDir: Directory('${tempRoot.path}/live')),
+      tempDir: () async => tempRoot,
+      clearImages: () {},
+    );
+    await cleanup.clear({CleanupItem.images});
+    expect(await posterDir.exists(), isFalse);
   });
 }

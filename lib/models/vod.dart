@@ -1,3 +1,5 @@
+import '../services/danmu_client.dart';
+
 /// MacCMS / CatVod style VOD models.
 ///
 /// OBSERVED field names in the Dart string pool: vod_id, vod_name, vod_pic, vod_remarks, vod_play_from,
@@ -241,10 +243,31 @@ List<PlayQuality> parsePlayQualities(List<dynamic> raw) {
   return const [];
 }
 
-/// `subs` / `subtitles` / `sub`: a list of objects (`url`, `name`/`label`, `lang`/`language`, `format`/`mime`/`type`),
-/// one such object, or a bare URL. Same caveat as above: the shape is the TVBox convention, not observed.
+/// `subs` / `subtitles` / `sub` / `subtitle`: a list of objects (`url`, `name`/`label`, `lang`/`language`,
+/// `format`/`mime`/`type`), one such object, a `name$$$url#name2$$$url2` string, or a bare URL.
 List<PlaySubtitle> parsePlaySubtitles(Object? raw) {
   String? text(Object? v) => v is String && v.trim().isNotEmpty ? v.trim() : null;
+  if (raw is String) {
+    final s = text(raw);
+    if (s == null) return const [];
+    if (s.contains(r'$$$') || s.contains('#') || (s.contains(r'$') && !_absoluteUrl.hasMatch(s))) {
+      final out = <PlaySubtitle>[];
+      for (final seg in s.split('#')) {
+        final trimmed = seg.trim();
+        if (trimmed.isEmpty) continue;
+        final parts = trimmed.contains(r'$$$') ? trimmed.split(r'$$$') : trimmed.split(r'$');
+        if (parts.length >= 2) {
+          final name = text(parts.first);
+          final url = text(parts.sublist(1).join(r'$'));
+          if (url != null) out.add(PlaySubtitle(url: url, name: name ?? 'Subtitle ${out.length + 1}'));
+        } else if (_absoluteUrl.hasMatch(trimmed)) {
+          out.add(PlaySubtitle(url: trimmed, name: 'Subtitle ${out.length + 1}'));
+        }
+      }
+      if (out.isNotEmpty) return out;
+    }
+    return [PlaySubtitle(url: s, name: 'Subtitle 1')];
+  }
   final items = raw is List ? raw : (raw == null ? const [] : [raw]);
   final out = <PlaySubtitle>[];
   for (final e in items) {
@@ -252,13 +275,13 @@ List<PlaySubtitle> parsePlaySubtitles(Object? raw) {
       final url = text(e);
       if (url != null) out.add(PlaySubtitle(url: url, name: 'Subtitle ${out.length + 1}'));
     } else if (e is Map) {
-      final url = text(e['url'] ?? e['src'] ?? e['link']);
+      final url = text(e['url'] ?? e['src'] ?? e['link'] ?? e['subtitleUrl']);
       if (url == null) continue;
       out.add(PlaySubtitle(
         url: url,
-        name: text(e['name'] ?? e['label'] ?? e['title']) ?? 'Subtitle ${out.length + 1}',
+        name: text(e['name'] ?? e['label'] ?? e['title'] ?? e['subtitleName']) ?? 'Subtitle ${out.length + 1}',
         language: text(e['lang'] ?? e['language']),
-        mimeType: text(e['format'] ?? e['mime'] ?? e['mimeType'] ?? e['type']),
+        mimeType: text(e['format'] ?? e['mime'] ?? e['mimeType'] ?? e['type'] ?? e['ext']),
       ));
     }
   }
@@ -274,18 +297,36 @@ class PlayResult {
     this.audioUrl,
     this.qualities = const [],
     this.subtitles = const [],
+    this.videoDanmuUrl,
+    this.videoDanmuComments = const [],
   });
 
   factory PlayResult.fromJson(Map<String, dynamic> j) {
     final raw = j['url'];
     final qualities = raw is List ? parsePlayQualities(raw) : const <PlayQuality>[];
+    final parsedSubs = [
+      ...parsePlaySubtitles(j['subs'] ?? j['subtitles'] ?? j['sub'] ?? j['subtitle']),
+      if (j['subtitleUrl'] is String && (j['subtitleUrl'] as String).trim().isNotEmpty)
+        PlaySubtitle(
+          url: (j['subtitleUrl'] as String).trim(),
+          name: (j['subtitleName'] is String && (j['subtitleName'] as String).trim().isNotEmpty)
+              ? (j['subtitleName'] as String).trim()
+              : 'Subtitle 1',
+        ),
+    ];
+    final rawDanmu = j['danmaku'] ?? j['danmu'] ?? j['danmuUrl'] ?? j['danmakuUrl'];
+    final danmuUrl = rawDanmu is String && rawDanmu.trim().isNotEmpty ? rawDanmu.trim() : null;
+    final danmuComments =
+        (rawDanmu is List || rawDanmu is Map) ? parseVideoDanmakuPayload(rawDanmu) : const <DanmuComment>[];
     return PlayResult(
       url: raw is List ? (qualities.isEmpty ? '' : qualities.first.url) : '${raw ?? ''}',
       headers: ((j['header'] ?? j['headers']) as Map?)?.map((k, v) => MapEntry('$k', '$v')) ?? const {},
       needsParse: '${j['parse']}' == '1',
       audioUrl: j['audio'] as String?,
       qualities: qualities,
-      subtitles: parsePlaySubtitles(j['subs'] ?? j['subtitles'] ?? j['sub']),
+      subtitles: parsedSubs,
+      videoDanmuUrl: danmuUrl,
+      videoDanmuComments: danmuComments,
     );
   }
 
@@ -299,6 +340,8 @@ class PlayResult {
   /// Alternative URLs of the same episode; [url] is the first one until [withQuality] picks another.
   final List<PlayQuality> qualities;
   final List<PlaySubtitle> subtitles;
+  final String? videoDanmuUrl;
+  final List<DanmuComment> videoDanmuComments;
 
   /// The same result with [url] taken from quality [index] (clamped; unchanged when there are no qualities).
   PlayResult withQuality(int index) {
@@ -311,6 +354,8 @@ class PlayResult {
       audioUrl: audioUrl,
       qualities: qualities,
       subtitles: subtitles,
+      videoDanmuUrl: videoDanmuUrl,
+      videoDanmuComments: videoDanmuComments,
     );
   }
 }

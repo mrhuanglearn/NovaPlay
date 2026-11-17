@@ -195,7 +195,8 @@ class ExoKernel(private val context: Context) : PlayerKernel {
         val factory = DefaultMediaSourceFactory(DefaultDataSource.Factory(context, http).setTransferListener(bandwidth))
         var first = true
         val sidecars = subtitles.mapNotNull { s ->
-            val mime = TrackLabels.subtitleMime(s.url, s.mimeType) ?: return@mapNotNull null // unknown format: Exo could not parse it
+            val mime = TrackLabels.subtitleMime(s.url, s.mimeType, s.name)
+                ?: if (s.mimeType.isNullOrBlank()) TrackLabels.SUBRIP else return@mapNotNull null
             MediaItem.SubtitleConfiguration.Builder(Uri.parse(s.url))
                 .setMimeType(mime)
                 .setLanguage(s.language)

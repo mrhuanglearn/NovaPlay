@@ -155,10 +155,11 @@ class _LiveScreenState extends ConsumerState<LiveScreen> {
                                 return ListTile(
                                   leading: SizedBox(
                                     width: 48,
+                                    height: 36,
                                     child: c.logo == null || c.logo!.isEmpty
                                         ? const Icon(Icons.tv)
-                                        : Image.network(c.logo!,
-                                            fit: BoxFit.contain, errorBuilder: (_, __, ___) => const Icon(Icons.tv)),
+                                        : posterFromUrl(c.logo,
+                                            cacheWidth: 144, fit: BoxFit.contain, fallback: const Icon(Icons.tv)),
                                   ),
                                   title: Text(c.name),
                                   subtitle: programme == null

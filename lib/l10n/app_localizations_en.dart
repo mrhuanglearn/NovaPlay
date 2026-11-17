@@ -277,7 +277,7 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get danmuModeSubscriptionNote =>
-      'Uses port 9321 of the active subscription.';
+      'Uses the danmaku service bundled with the active subscription.';
 
   @override
   String get danmuModeRemoteNote => 'Your own danmu_api server.';

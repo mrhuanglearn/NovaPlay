@@ -23,14 +23,23 @@ object TrackLabels {
      * Exo cannot sniff the format of a sidecar subtitle, so a mime type is required. The file extension wins, the
      * declared type is the fallback; null means unknown and the entry has to be dropped.
      */
-    fun subtitleMime(url: String, declared: String?): String? {
-        val path = url.substringBefore('#').substringBefore('?').lowercase(Locale.ROOT)
+    fun subtitleMime(url: String, declared: String?, name: String? = null): String? {
+        extMime(url.substringBefore('#').substringBefore('?'))?.let { return it }
+        val dec = declared?.trim()?.lowercase(Locale.ROOT).orEmpty()
+        if (dec.isNotEmpty()) return fromDeclared(dec)
+        extMime(url)?.let { return it }
+        name?.let { extMime(it) }?.let { return it }
+        return null
+    }
+
+    private fun extMime(raw: String): String? {
+        val s = raw.lowercase(Locale.ROOT)
         return when {
-            path.endsWith(".srt") -> SUBRIP
-            path.endsWith(".vtt") || path.endsWith(".webvtt") -> VTT
-            path.endsWith(".ass") || path.endsWith(".ssa") -> SSA
-            path.endsWith(".ttml") || path.endsWith(".dfxp") -> TTML
-            else -> fromDeclared(declared)
+            Regex("""\.srt(?:$|[?&#])""").containsMatchIn(s) -> SUBRIP
+            Regex("""\.(?:vtt|webvtt)(?:$|[?&#])""").containsMatchIn(s) -> VTT
+            Regex("""\.(?:ass|ssa)(?:$|[?&#])""").containsMatchIn(s) -> SSA
+            Regex("""\.(?:ttml|dfxp)(?:$|[?&#])""").containsMatchIn(s) -> TTML
+            else -> null
         }
     }
 

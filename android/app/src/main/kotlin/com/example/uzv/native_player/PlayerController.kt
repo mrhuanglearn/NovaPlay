@@ -372,6 +372,7 @@ class PlayerController(
         state = "buffering"
         uiListener?.onChanged()
         kernel.seekTo(target)
+        danmakuView.onSeek()
     }
     fun seekBy(deltaSeconds: Int) = seekTo(kernel.positionMs + deltaSeconds * 1000L)
 

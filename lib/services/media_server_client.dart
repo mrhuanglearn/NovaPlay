@@ -1,5 +1,7 @@
 import 'package:dio/dio.dart';
 
+import '../core/app_http.dart';
+
 /// Emby / Jellyfin client (changelog 1.1.6 added "Emby / Jellyfin / Plex module - completely untested", 1.1.8
 /// reworked the detail page and fixed gateway-style servers).
 ///
@@ -85,10 +87,13 @@ class MediaItem {
 }
 
 class MediaServerClient {
-  MediaServerClient(this.account, {Dio? dio, this.deviceId = 'uzv-reimpl'}) : _dio = dio ?? Dio();
+  MediaServerClient(this.account, {Dio? dio, this.deviceId = 'uzv-reimpl'})
+      : _dio = dio ?? createAppDio(connectTimeout: const Duration(seconds: 10), receiveTimeout: const Duration(seconds: 20));
   final MediaAccount account;
   final Dio _dio;
   final String deviceId;
+
+  Duration? get dioConnectTimeout => _dio.options.connectTimeout;
 
   String get _base => account.baseUrl.replaceAll(RegExp(r'/+$'), '');
 

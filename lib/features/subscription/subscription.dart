@@ -7,6 +7,7 @@ import 'package:dio/dio.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
+import '../../core/app_http.dart';
 import '../../core/json_store.dart';
 
 /// A "subscription" = a source bundle: a catpaw `index.js` (+ optional config) the Node runtime executes.
@@ -69,6 +70,8 @@ class Subscription {
 
   Subscription copyWith({
     String? name,
+    String? indexJsUrl,
+    String? cloudUrl,
     bool? locked,
     bool? autoUpdate,
     String? installedMd5,
@@ -78,9 +81,9 @@ class Subscription {
       Subscription(
         key: key,
         name: name ?? this.name,
-        indexJsUrl: indexJsUrl,
+        indexJsUrl: indexJsUrl ?? this.indexJsUrl,
         configUrl: configUrl,
-        cloudUrl: cloudUrl,
+        cloudUrl: cloudUrl ?? this.cloudUrl,
         local: local,
         locked: locked ?? this.locked,
         autoUpdate: autoUpdate ?? this.autoUpdate,
@@ -152,12 +155,48 @@ class SubscriptionService {
   String _newKey() => '${_now().microsecondsSinceEpoch}${(_seq++ % 1000).toString().padLeft(3, '0')}';
   String _name(String? name) => (name ?? '').trim().isEmpty ? defaultSubscriptionName : name!.trim();
 
-  Future<void> _ensureUnique({String? indexJsUrl, String? cloudUrl}) async {
+  Future<void> _ensureUnique({String? indexJsUrl, String? cloudUrl, String? excludeKey}) async {
     for (final s in await repository.all()) {
+      if (excludeKey != null && s.key == excludeKey) continue;
       if ((indexJsUrl != null && s.indexJsUrl == indexJsUrl) || (cloudUrl != null && s.cloudUrl == cloudUrl)) {
         throw const DuplicateSubscriptionException();
       }
     }
+  }
+
+  /// Updates an existing subscription's URL and/or name. Network URL changes (or [forceRefreshScript]) download and
+  /// verify the script before overwriting the saved record, preserving the existing installation on failure.
+  Future<Subscription> updateSubscription(
+    Subscription sub, {
+    String? url,
+    String? name,
+    bool forceRefreshScript = false,
+    Future<bool> Function()? confirmConfigMismatch,
+  }) async {
+    final current = (await repository.all()).where((s) => s.key == sub.key).firstOrNull ?? sub;
+    final nextName = _name(name ?? current.name);
+    if (current.local) {
+      final updated = current.copyWith(name: nextName);
+      await repository.upsert(updated);
+      return updated;
+    }
+    final nextUrl = (url ?? (current.cloudUrl ?? current.indexJsUrl ?? '')).trim();
+    if (nextUrl.isEmpty) throw ArgumentError('subscription url must not be empty');
+    if (current.cloudUrl != null) {
+      await _ensureUnique(cloudUrl: nextUrl, excludeKey: current.key);
+      final updated = current.copyWith(name: nextName, cloudUrl: nextUrl);
+      await repository.upsert(updated);
+      return updated;
+    }
+    await _ensureUnique(indexJsUrl: nextUrl, excludeKey: current.key);
+    final urlChanged = nextUrl != current.indexJsUrl;
+    var updated = current.copyWith(name: nextName, indexJsUrl: nextUrl);
+    if (urlChanged || forceRefreshScript) {
+      final installed = await installer.install(updated, confirmConfigMismatch: confirmConfigMismatch);
+      updated = updated.copyWith(installedMd5: installed.md5, updatedAt: _now().millisecondsSinceEpoch);
+    }
+    await repository.upsert(updated);
+    return updated;
   }
 
   Future<Subscription> addNetwork({
@@ -280,10 +319,12 @@ String redactUrl(Uri uri) => uri.userInfo.isEmpty ? uri.toString() : uri.replace
 /// them for the Node runtime.
 class SubscriptionInstaller {
   SubscriptionInstaller({Dio? dio, Directory? root})
-      : _dio = dio ?? Dio(),
+      : _dio = dio ?? createAppDio(connectTimeout: const Duration(seconds: 12), receiveTimeout: const Duration(seconds: 30)),
         _root = root;
   final Dio _dio;
   final Directory? _root;
+
+  Duration? get dioConnectTimeout => _dio.options.connectTimeout;
 
   /// Written last by [install]; an install without it (interrupted, or from before 2026-11-09) is not reused.
   static const _markerName = 'installed.json';
@@ -335,24 +376,42 @@ class SubscriptionInstaller {
     if (url == null) throw ArgumentError('subscription ${sub.key} has no index.js url');
     final dir = await _dir(sub);
     await dir.create(recursive: true);
+    final tmpScriptFile = File(p.join(dir.path, 'index.js.tmp'));
+    final scriptFile = File(p.join(dir.path, 'index.js'));
     final marker = File(p.join(dir.path, _markerName));
-    if (await marker.exists()) await marker.delete();
     final configFile = File(p.join(dir.path, 'config.js'));
-    if (await configFile.exists()) await configFile.delete();
 
-    final script = await downloadScript(url, File(p.join(dir.path, 'index.js')));
+    // Download & checksum-verify to a staging file first so a failed URL edit leaves any existing install intact.
+    final staged = await downloadScript(url, tmpScriptFile);
 
-    String? configPath;
-    if (sub.configUrl != null) {
-      final cfg = (await _dio.get<String>(sub.configUrl!)).data ?? '{}';
-      jsonDecode(cfg); // fail early if the server returned something that is not JSON
-      await configFile.writeAsString('module.exports = $cfg;', flush: true);
-      configPath = configFile.path;
-    } else if (ScriptUrls.parse(url).config case final configUri?) {
-      configPath = await _downloadConfig(configUri, configFile, confirmConfigMismatch);
+    String? stagedConfigPath;
+    final tmpConfigFile = File(p.join(dir.path, 'config.js.tmp'));
+    try {
+      if (sub.configUrl != null) {
+        final cfg = (await _dio.get<String>(sub.configUrl!)).data ?? '{}';
+        jsonDecode(cfg); // fail early if the server returned something that is not JSON
+        await tmpConfigFile.writeAsString('module.exports = $cfg;', flush: true);
+        stagedConfigPath = tmpConfigFile.path;
+      } else if (ScriptUrls.parse(url).config case final configUri?) {
+        stagedConfigPath = await _downloadConfig(configUri, tmpConfigFile, confirmConfigMismatch);
+      }
+    } catch (_) {
+      if (await tmpScriptFile.exists()) await tmpScriptFile.delete();
+      if (await tmpConfigFile.exists()) await tmpConfigFile.delete();
+      rethrow;
     }
-    await marker.writeAsString(jsonEncode({'format': _format, 'md5': script.md5}), flush: true);
-    return InstalledScript(scriptPath: script.path, configPath: configPath, md5: script.md5);
+
+    if (await marker.exists()) await marker.delete();
+    await tmpScriptFile.rename(scriptFile.path);
+    String? configPath;
+    if (stagedConfigPath != null) {
+      await tmpConfigFile.rename(configFile.path);
+      configPath = configFile.path;
+    } else if (await configFile.exists()) {
+      await configFile.delete();
+    }
+    await marker.writeAsString(jsonEncode({'format': _format, 'md5': staged.md5}), flush: true);
+    return InstalledScript(scriptPath: scriptFile.path, configPath: configPath, md5: staged.md5);
   }
 
   /// OBSERVED: a config that cannot be downloaded is not an error ("index.config.js 下载失败（将以空 config 启动）").
