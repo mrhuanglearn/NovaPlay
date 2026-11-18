@@ -1623,11 +1623,11 @@ function createWasmNamespace() {
 }
 
 function installJitlessPolyfill(opts = {}) {
-  if (typeof globalThis.WebAssembly !== 'undefined') return false;
   hardenHttpClientModule(opts.http || httpModule);
   hardenHttpClientModule(opts.https || httpsModule);
   if ((opts.http || httpModule) !== httpModule) hardenHttpClientModule(httpModule);
   if ((opts.https || httpsModule) !== httpsModule) hardenHttpClientModule(httpsModule);
+  if (typeof globalThis.WebAssembly !== 'undefined') return false;
   globalThis.WebAssembly = createWasmNamespace();
   globalThis.fetch = createJitlessFetch(opts);
   return true;
