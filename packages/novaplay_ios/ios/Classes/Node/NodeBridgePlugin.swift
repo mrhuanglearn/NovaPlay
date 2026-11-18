@@ -541,23 +541,6 @@ private enum NodeAssetsIos {
     var target = appSupport.appendingPathComponent("nodejs-project", isDirectory: true)
     let stampFile = target.appendingPathComponent(".version")
 
-    let info = Bundle.main.infoDictionary ?? [:]
-    let shortVer = (info["CFBundleShortVersionString"] as? String) ?? "0.1.0"
-    let buildVer = (info["CFBundleVersion"] as? String) ?? "1"
-    let execMtime: TimeInterval = {
-      guard let execPath = Bundle.main.executablePath,
-            let attrs = try? fm.attributesOfItem(atPath: execPath),
-            let date = attrs[.modificationDate] as? Date else { return 0 }
-      return date.timeIntervalSince1970
-    }()
-    let stamp = "\(shortVer)+\(buildVer)+\(Int64(execMtime))"
-
-    if let existing = try? String(contentsOf: stampFile, encoding: .utf8),
-       existing == stamp,
-       fm.fileExists(atPath: target.appendingPathComponent("src/main.js").path) {
-      return target
-    }
-
     let assetRel = registrar.lookupKey(forAsset: "assets/nodejs")
     let candidates = [
       (Bundle.main.bundlePath as NSString).appendingPathComponent(assetRel),
@@ -569,6 +552,25 @@ private enum NodeAssetsIos {
         code: 404,
         userInfo: [NSLocalizedDescriptionKey: "Bundled assets/nodejs directory not found in App.framework"]
       )
+    }
+
+    let info = Bundle.main.infoDictionary ?? [:]
+    let shortVer = (info["CFBundleShortVersionString"] as? String) ?? "0.1.0"
+    let buildVer = (info["CFBundleVersion"] as? String) ?? "1"
+    let execMtime: TimeInterval = {
+      guard let execPath = Bundle.main.executablePath,
+            let attrs = try? fm.attributesOfItem(atPath: execPath),
+            let date = attrs[.modificationDate] as? Date else { return 0 }
+      return date.timeIntervalSince1970
+    }()
+    let workerSize = ((try? fm.attributesOfItem(atPath: (srcPath as NSString).appendingPathComponent("src/worker.js")))?[.size] as? UInt64) ?? 0
+    let polyfillSize = ((try? fm.attributesOfItem(atPath: (srcPath as NSString).appendingPathComponent("src/jitless_polyfill.js")))?[.size] as? UInt64) ?? 0
+    let stamp = "\(shortVer)+\(buildVer)+\(Int64(execMtime))+\(workerSize)+\(polyfillSize)"
+
+    if let existing = try? String(contentsOf: stampFile, encoding: .utf8),
+       existing == stamp,
+       fm.fileExists(atPath: target.appendingPathComponent("src/main.js").path) {
+      return target
     }
 
     if fm.fileExists(atPath: target.path) {

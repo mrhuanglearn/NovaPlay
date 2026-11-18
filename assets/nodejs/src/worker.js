@@ -17,6 +17,7 @@ const http = require('http');
 const https = require('https');
 const { WorkerMsg, LoaderMsg, SUBSCRIPTION_DANMU_PORT } = require('./protocol');
 const { createPolicy, installFsPolicy } = require('./sandbox');
+const { installJitlessPolyfill } = require('./jitless_polyfill');
 
 const {
   name,
@@ -194,6 +195,8 @@ http.get = function callbackAuthedGet(...args) {
   req.end();
   return req;
 };
+
+installJitlessPolyfill({ http, https });
 
 if (typeof globalThis.fetch === 'function') {
   const baseFetch = globalThis.fetch.bind(globalThis);

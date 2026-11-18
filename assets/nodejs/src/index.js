@@ -5,9 +5,12 @@
  */
 
 const path = require('path');
+const { installJitlessPolyfill } = require('./jitless_polyfill');
 const { Channel } = require('./protocol');
 const { createCatpawHost } = require('./catpaw');
 const { createServiceManager } = require('./services');
+
+installJitlessPolyfill();
 
 const DEFAULT_WORKER = path.join(__dirname, 'worker.js');
 
