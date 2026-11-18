@@ -19,8 +19,58 @@ const zlib = require('zlib');
 
 // --- Native C++ http/https + zlib fetch for --jitless ------------------------------------------
 
-const keepAliveHttpAgent = new httpModule.Agent({ keepAlive: true, maxSockets: 64 });
-const keepAliveHttpsAgent = new httpsModule.Agent({ keepAlive: true, maxSockets: 64 });
+const keepAliveHttpAgent = new httpModule.Agent({ keepAlive: true, keepAliveMsecs: 4000, maxSockets: 64, maxFreeSockets: 16 });
+const keepAliveHttpsAgent = new httpsModule.Agent({ keepAlive: true, keepAliveMsecs: 4000, maxSockets: 64, maxFreeSockets: 16 });
+const kRstGuarded = Symbol('uzvPostCompleteRstGuarded');
+const kActiveReq = Symbol('uzvActiveClientRequest');
+
+function upgradeAgentKeepAlive(agent) {
+  if (!agent || typeof agent !== 'object' || agent.keepAlive !== false) return;
+  agent.keepAlive = true;
+  if (!agent.keepAliveMsecs) agent.keepAliveMsecs = 4000;
+  if (!agent.maxFreeSockets || agent.maxFreeSockets > 16) agent.maxFreeSockets = 16;
+  if (agent.options && typeof agent.options === 'object') agent.options.keepAlive = true;
+}
+
+function hardenHttpClientModule(mod) {
+  if (!mod || mod[kRstGuarded]) return;
+  mod[kRstGuarded] = true;
+  if (mod.globalAgent) upgradeAgentKeepAlive(mod.globalAgent);
+
+  const origRequest = mod.request;
+  mod.request = function jitlessHardenedRequest(...args) {
+    for (let i = 0; i < Math.min(args.length, 2); i++) {
+      const opt = args[i];
+      if (opt && typeof opt === 'object' && !(opt instanceof URL) && opt.agent && typeof opt.agent === 'object') {
+        upgradeAgentKeepAlive(opt.agent);
+      }
+    }
+    const req = origRequest.apply(this, args);
+    req.on('socket', (sock) => {
+      sock[kActiveReq] = req;
+      if (sock[kRstGuarded]) return;
+      sock[kRstGuarded] = true;
+      const origEmit = sock.emit;
+      sock.emit = function emitWithPostCompleteRstGuard(event, err, ...rest) {
+        if (event === 'error' && err && err.code === 'ECONNRESET') {
+          const activeReq = sock[kActiveReq];
+          const res = activeReq && activeReq.res;
+          if (res && res.complete === true) {
+            sock.destroy();
+            return true;
+          }
+        }
+        return origEmit.call(this, event, err, ...rest);
+      };
+    });
+    return req;
+  };
+  mod.get = function jitlessHardenedGet(...args) {
+    const req = mod.request.apply(this, args);
+    req.end();
+    return req;
+  };
+}
 
 function makeAbortError(reason) {
   if (reason instanceof Error) return reason;
@@ -1574,6 +1624,10 @@ function createWasmNamespace() {
 
 function installJitlessPolyfill(opts = {}) {
   if (typeof globalThis.WebAssembly !== 'undefined') return false;
+  hardenHttpClientModule(opts.http || httpModule);
+  hardenHttpClientModule(opts.https || httpsModule);
+  if ((opts.http || httpModule) !== httpModule) hardenHttpClientModule(httpModule);
+  if ((opts.https || httpsModule) !== httpsModule) hardenHttpClientModule(httpsModule);
   globalThis.WebAssembly = createWasmNamespace();
   globalThis.fetch = createJitlessFetch(opts);
   return true;
