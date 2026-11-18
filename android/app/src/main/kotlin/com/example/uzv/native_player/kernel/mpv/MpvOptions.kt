@@ -54,7 +54,7 @@ object MpvOptions {
         "sub-auto" to "no", // never go looking for sidecar files next to a URL
         "audio-file-auto" to "no",
         "ytdl" to "no",
-        "network-timeout" to "20",
+        "network-timeout" to "8",
         "demuxer-max-bytes" to "64MiB",
         "demuxer-max-back-bytes" to "32MiB",
         "msg-level" to "all=warn",

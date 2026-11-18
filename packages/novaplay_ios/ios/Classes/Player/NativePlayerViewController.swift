@@ -63,6 +63,9 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   private var screenLocked: Bool = false
   private var dismissedForPiP: Bool = false
   var isDismissedForPiP: Bool { dismissedForPiP }
+  private(set) var isExitingPlayer: Bool = false
+  private var exitCompletedFlag: Bool = false
+  private var pendingExitDismissWork: DispatchWorkItem?
   private var seekWaitUntil: TimeInterval = 0
 
   private var hideControlsWorkItem: DispatchWorkItem?
@@ -252,9 +255,18 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     if isBeingDismissed && !dismissedForPiP && !controller.isClosed {
       uiRefreshTimer?.invalidate()
       skipCountdownTimer?.invalidate()
-      controller.close(completed: false, dismissVC: false)
+      controller.close(completed: exitCompletedFlag, dismissVC: false)
     }
     NativePlayerHost.shared.syncIdleTimer()
+  }
+
+  override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
+    super.viewWillTransition(to: size, with: coordinator)
+    guard isExitingPlayer, size.width <= size.height, pendingExitDismissWork != nil else { return }
+    pendingExitDismissWork?.cancel()
+    coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+      self?.performFinalExitDismiss()
+    }
   }
 
   override func viewDidLayoutSubviews() {
@@ -310,6 +322,74 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     guard orientationStep != .portrait else { return }
     orientationStep = .portrait
     applyOrientationStep()
+  }
+
+  func exitPlayerSmoothly(completed: Bool) {
+    guard !isExitingPlayer else { return }
+    isExitingPlayer = true
+    exitCompletedFlag = completed
+
+    uiRefreshTimer?.invalidate()
+    skipCountdownTimer?.invalidate()
+    hideControlsWorkItem?.cancel()
+    overlayHost.closeMenu()
+    overlayHost.closePanel()
+    hideControlsAnimated(false)
+    loadingBox.isHidden = true
+    cornerSpeedLabel.isHidden = true
+    topNoticeLabel.isHidden = true
+    toastLabel.isHidden = true
+    skipBanner.isHidden = true
+    errorLayer.isHidden = true
+    sidecarSubtitleLabel.isHidden = true
+    controller.danmakuView.paused = true
+    controller.danmakuView.isHidden = true
+    if !controller.isClosed {
+      controller.kernel.pause()
+    }
+
+    let isPhone = UIDevice.current.userInterfaceIdiom == .phone
+    let currentlyLandscape = view.bounds.width > view.bounds.height
+    if isPhone && (currentlyLandscape || orientationStep != .portrait) {
+      orientationStep = .portrait
+      if currentlyLandscape && UIApplication.shared.applicationState == .active {
+        let work = DispatchWorkItem { [weak self] in
+          self?.performFinalExitDismiss()
+        }
+        pendingExitDismissWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.28, execute: work)
+        applyOrientationStep()
+        return
+      }
+      applyOrientationStep()
+    }
+    performFinalExitDismiss()
+  }
+
+  private func performFinalExitDismiss() {
+    pendingExitDismissWork?.cancel()
+    pendingExitDismissWork = nil
+    guard presentingViewController != nil else {
+      if !controller.isClosed {
+        controller.close(completed: exitCompletedFlag, dismissVC: false)
+      }
+      return
+    }
+    let isActive = UIApplication.shared.applicationState == .active
+    if !isActive {
+      if !controller.isClosed {
+        controller.close(completed: exitCompletedFlag, dismissVC: true)
+      } else {
+        dismiss(animated: false)
+      }
+      return
+    }
+    dismiss(animated: true) { [weak self] in
+      guard let self = self else { return }
+      if !self.controller.isClosed {
+        self.controller.close(completed: self.exitCompletedFlag, dismissVC: false)
+      }
+    }
   }
 
   private func cycleOrientationStep() {
@@ -664,7 +744,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   // MARK: - Orientation-Adaptive Controls Rebuild (1:1 `PlayerControlsView.rebuild()`)
 
   private func rebuildControlsIfNeeded(force: Bool) {
-    guard view.bounds.width > 0, view.bounds.height > 0 else { return }
+    guard !isExitingPlayer, view.bounds.width > 0, view.bounds.height > 0 else { return }
     let land = view.bounds.width > view.bounds.height
     let safe = view.safeAreaInsets
     let cutout = max(safe.left, safe.right)
@@ -808,8 +888,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     let backBtn = ui.circleButton(IosPlayerIcon.BACK, size: 38, iconSize: 20) { [weak self] in
       guard let self = self else { return }
       self.fireSelectionHaptic()
-      self.restorePortraitBeforeExit()
-      self.controller.close(completed: false, dismissVC: true)
+      self.exitPlayerSmoothly(completed: false)
     }
     row.addArrangedSubview(backBtn)
     row.setCustomSpacing(13, after: backBtn)
@@ -2071,7 +2150,9 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   // MARK: - IosPlayerControllerUiDelegate
 
   func controllerDidChangeState() {
+    guard !isExitingPlayer else { return }
     ui.accent = IosPlayerUiText.accentColor(hex: controller.playbackConfig.accentColorHex)
+    panels.refreshSettingsIfNeeded()
     refreshControlsState()
     refreshInfoLayer()
     if controlsVisible {

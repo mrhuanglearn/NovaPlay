@@ -291,11 +291,13 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
   private var mpvEngine: IosMpvEngine?
   private var mpvLoadedViaProxy: Bool = false
   private var mpvRetriedViaProxy: Bool = false
+  private var mpvRetriedDirect: Bool = false
 
   // MARK: - MobileVLCKit State
   #if canImport(MobileVLCKit)
   private var vlcPlayer: VLCMediaPlayer?
   private var vlcStatsTimer: Timer?
+  private var vlcOpenWatchdog: DispatchWorkItem?
   private var vlcAspectCString: UnsafeMutablePointer<CChar>?
   private var vlcPendingStartMs: Int64 = 0
   private var vlcAppliedInitialSeek: Bool = false
@@ -541,10 +543,19 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     return nil
   }
 
+  private static func isLoopbackHost(_ url: URL) -> Bool {
+    let h = (url.host ?? "").lowercased()
+    return h == "127.0.0.1" || h == "localhost" || h == "::1"
+  }
+
   private func switchActiveBackendTemporarily(to backend: String, notice: String?) {
+    let prev = activeKernelId
     applyActiveBackend(backend)
     if let notice = notice, !notice.isEmpty {
       delegate?.kernelDidFallbackNotice(notice)
+    }
+    if prev != activeKernelId {
+      delegate?.kernelDidChangeState(state)
     }
   }
 
@@ -701,6 +712,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     vlcRetriedDirect = false
     mpvLoadedViaProxy = false
     mpvRetriedViaProxy = false
+    mpvRetriedDirect = false
     lastAvFailureSummary = nil
     lastMpvFailureSummary = nil
     lastDiagnosticReport = nil
@@ -799,16 +811,15 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         proxiedUrl: defaultProxied
       )
 
-      // MPV sends arbitrary HTTP headers (Cookie, Referer, User-Agent, Origin) natively via FFmpeg libavformat,
-      // and avoids double-proxying CatPaw's 127.0.0.1:2333 chunk proxy.
+      let useProxyForMpv = !Self.isLoopbackHost(mediaURL) && !IosStreamProxy.shared.isOwnProxyURL(mediaURL)
       if isUsingMpv {
         loadWithMpvPlayer(
-          mediaURL: mediaURL,
+          mediaURL: useProxyForMpv ? defaultProxied : mediaURL,
           audioUrl: audioUrl,
           headers: effectiveHeaders,
           startMs: startMs,
           subtitles: subtitles,
-          viaProxy: false
+          viaProxy: useProxyForMpv
         )
         return
       }
@@ -841,12 +852,12 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         )
         if fb == "mpv" {
           loadWithMpvPlayer(
-            mediaURL: mediaURL,
+            mediaURL: useProxyForMpv ? defaultProxied : mediaURL,
             audioUrl: audioUrl,
             headers: effectiveHeaders,
             startMs: startMs,
             subtitles: subtitles,
-            viaProxy: false
+            viaProxy: useProxyForMpv
           )
         } else {
           #if canImport(MobileVLCKit)
@@ -890,37 +901,6 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         }
 
         if let failure = probeHardFailure {
-          if !self.didAutoFallbackFromAv, let fb = self.preferredFallbackBackendAfterAvPlayer() {
-            self.didAutoFallbackFromAv = true
-            if fb == "vlc" {
-              self.didAutoFallbackToVlc = true
-              self.vlcRetriedDirect = true
-            }
-            self.lastAvFailureSummary = failure.msg
-            self.switchActiveBackendTemporarily(to: fb, notice: nil)
-            if fb == "mpv" {
-              self.loadWithMpvPlayer(
-                mediaURL: mediaURL,
-                audioUrl: audioUrl,
-                headers: effectiveHeaders,
-                startMs: startMs,
-                subtitles: subtitles,
-                viaProxy: false
-              )
-            } else {
-              #if canImport(MobileVLCKit)
-              self.loadWithVlcPlayer(
-                mediaURL: mediaURL,
-                audioUrl: audioUrl,
-                headers: effectiveHeaders,
-                startMs: startMs,
-                subtitles: subtitles,
-                proxyToken: nil
-              )
-              #endif
-            }
-            return
-          }
           let diag = IosStreamProxy.shared.diagnosticsSummary(for: token) ?? "code=\(failure.code)"
           self.lastDiagnosticReport = "\(failure.msg)\n[\(diag)]"
           self.delegate?.kernelDidFail(message: failure.msg, code: failure.code)
@@ -950,12 +930,12 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
           )
           if fb == "mpv" {
             self.loadWithMpvPlayer(
-              mediaURL: mediaURL,
+              mediaURL: useProxyForMpv ? resolvedProxyURL : mediaURL,
               audioUrl: audioUrl,
               headers: effectiveHeaders,
               startMs: startMs,
               subtitles: subtitles,
-              viaProxy: false
+              viaProxy: useProxyForMpv
             )
           } else {
             #if canImport(MobileVLCKit)
@@ -1230,6 +1210,25 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     }
     RunLoop.main.add(timer, forMode: .common)
     vlcStatsTimer = timer
+
+    let expectedGen = loadGeneration
+    let watchdog = DispatchWorkItem { [weak self] in
+      guard let self = self,
+            self.loadGeneration == expectedGen,
+            self.isUsingVlc,
+            self.state == "buffering",
+            self.positionMs <= 0 else { return }
+      self.stopVlcPlaybackOnly()
+      let proxyDiag = IosStreamProxy.shared.diagnosticsSummary(for: proxyToken)
+      var msg = IosPlayerUiText.t("视频播放失败 (上游连接超时，请尝试切换线路)", "Playback failed (Upstream timed out, please switch source)")
+      if let proxyDiag = proxyDiag {
+        msg += " [\(proxyDiag)]"
+      }
+      self.lastDiagnosticReport = msg
+      self.delegate?.kernelDidFail(message: msg, code: -1001)
+    }
+    vlcOpenWatchdog = watchdog
+    DispatchQueue.main.asyncAfter(deadline: .now() + 10.0, execute: watchdog)
   }
 
   private func sampleVlcMetrics() {
@@ -1334,34 +1333,43 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
   func mpvEngineDidFail(message: String, diagnostic: String, code: Int) {
     guard isUsingMpv else { return }
     let proxyDiag = IosStreamProxy.shared.diagnosticsSummary(for: activeLoad?.proxyToken)
-    let hasHardHttpErr = (proxyDiag?.contains("HTTP 4") == true) || (proxyDiag?.contains("HTTP 5") == true)
+    let rootFailed = IosStreamProxy.shared.hasRootUpstreamFailure(for: activeLoad?.proxyToken)
 
-    // 1. Retry once via IosStreamProxy if direct HTTP open failed
-    if !mpvLoadedViaProxy,
-       !mpvRetriedViaProxy,
-       !hasHardHttpErr,
-       let ctx = activeLoad,
-       ctx.generation == loadGeneration,
-       let proxied = ctx.proxiedUrl,
-       !ctx.cleanUrl.isFileURL {
-      playerUsbLog.notice("[NovaPlay][Player] MPV direct open failed -> retrying via IosStreamProxy")
-      mpvRetriedViaProxy = true
-      let resumeAt = max(ctx.startMs, positionMs)
-      loadWithMpvPlayer(
-        mediaURL: proxied,
-        audioUrl: ctx.audioUrl,
-        headers: ctx.effectiveHeaders,
-        startMs: resumeAt,
-        subtitles: ctx.subtitles,
-        viaProxy: true
-      )
-      return
+    if !rootFailed, let ctx = activeLoad, ctx.generation == loadGeneration, !ctx.cleanUrl.isFileURL {
+      if !mpvLoadedViaProxy, !mpvRetriedViaProxy, let proxied = ctx.proxiedUrl {
+        playerUsbLog.notice("[NovaPlay][Player] MPV direct open failed -> retrying via IosStreamProxy")
+        mpvRetriedViaProxy = true
+        let resumeAt = max(ctx.startMs, positionMs)
+        loadWithMpvPlayer(
+          mediaURL: proxied,
+          audioUrl: ctx.audioUrl,
+          headers: ctx.effectiveHeaders,
+          startMs: resumeAt,
+          subtitles: ctx.subtitles,
+          viaProxy: true
+        )
+        return
+      }
+      if mpvLoadedViaProxy, !mpvRetriedDirect {
+        playerUsbLog.notice("[NovaPlay][Player] MPV proxy open failed -> retrying direct upstream")
+        mpvRetriedDirect = true
+        let resumeAt = max(ctx.startMs, positionMs)
+        loadWithMpvPlayer(
+          mediaURL: ctx.cleanUrl,
+          audioUrl: ctx.audioUrl,
+          headers: ctx.effectiveHeaders,
+          startMs: resumeAt,
+          subtitles: ctx.subtitles,
+          viaProxy: false
+        )
+        return
+      }
     }
 
     lastMpvFailureSummary = diagnostic
-    // 2. Fallback to VLC if available and not yet attempted
     #if canImport(MobileVLCKit)
-    if !didAutoFallbackToVlc,
+    if !rootFailed,
+       !didAutoFallbackToVlc,
        let ctx = activeLoad,
        ctx.generation == loadGeneration {
       playerUsbLog.notice("[NovaPlay][Player] MPV failed -> falling back to VLC")
@@ -1383,7 +1391,9 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     }
     #endif
 
-    var finalMsg = message
+    var finalMsg = rootFailed
+      ? IosPlayerUiText.t("视频播放失败 (上游连接失败或超时，请尝试切换线路)", "Playback failed (Upstream unreachable or timed out, please switch source)")
+      : message
     if let proxyDiag = proxyDiag, !finalMsg.contains(proxyDiag) {
       finalMsg += " (\(proxyDiag))"
     }
@@ -1460,6 +1470,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
   ) -> Bool {
     guard !didAutoFallbackFromAv,
           ctx.generation == loadGeneration,
+          !IosStreamProxy.shared.hasRootUpstreamFailure(for: ctx.proxyToken),
           let fb = preferredFallbackBackendAfterAvPlayer() else {
       return false
     }
@@ -1474,13 +1485,14 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
       notice: IosPlayerUiText.t("\(zhNoticePrefix)，已自动切换至 \(fbLabel) 内核", "\(enNoticePrefix); switched to \(fbLabel)")
     )
     if fb == "mpv" {
+      let useProxy = !ctx.cleanUrl.isFileURL && !Self.isLoopbackHost(ctx.cleanUrl) && ctx.proxiedUrl != nil
       loadWithMpvPlayer(
-        mediaURL: ctx.cleanUrl,
+        mediaURL: useProxy ? (ctx.proxiedUrl ?? ctx.cleanUrl) : ctx.cleanUrl,
         audioUrl: ctx.audioUrl,
         headers: ctx.effectiveHeaders,
         startMs: resumeAt,
         subtitles: ctx.subtitles,
-        viaProxy: false
+        viaProxy: useProxy
       )
     } else {
       #if canImport(MobileVLCKit)
@@ -2299,6 +2311,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
 
   private func stopVlcPlaybackOnly() {
     #if canImport(MobileVLCKit)
+    vlcOpenWatchdog?.cancel()
+    vlcOpenWatchdog = nil
     vlcStatsTimer?.invalidate()
     vlcStatsTimer = nil
     if let p = vlcPlayer {
@@ -2351,6 +2365,8 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
           self.updateState("buffering")
         }
       case .playing:
+        self.vlcOpenWatchdog?.cancel()
+        self.vlcOpenWatchdog = nil
         if self.state != "playing" {
           let viaProxy = self.vlcLoadedViaProxy
           let hw = self.hwDecode
@@ -2366,12 +2382,18 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
         player.rate = self.speed
         self.updateState("playing")
       case .paused:
+        self.vlcOpenWatchdog?.cancel()
+        self.vlcOpenWatchdog = nil
         self.updateState("paused")
       case .ended:
+        self.vlcOpenWatchdog?.cancel()
+        self.vlcOpenWatchdog = nil
         self.updateState("ended")
       case .error:
+        self.vlcOpenWatchdog?.cancel()
+        self.vlcOpenWatchdog = nil
         let proxyDiag = IosStreamProxy.shared.diagnosticsSummary(for: self.activeLoad?.proxyToken)
-        let hasHardHttpErr = (proxyDiag?.contains("HTTP 4") == true) || (proxyDiag?.contains("HTTP 5") == true)
+        let hasHardHttpErr = IosStreamProxy.shared.hasRootUpstreamFailure(for: self.activeLoad?.proxyToken)
         if !self.vlcRetriedDirect,
            !hasHardHttpErr,
            self.vlcLoadedViaProxy,

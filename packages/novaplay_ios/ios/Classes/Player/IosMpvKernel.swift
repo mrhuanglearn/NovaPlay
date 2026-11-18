@@ -207,7 +207,7 @@ final class IosMpvEngine {
     _ = uzv_ios_mpv_set_option_string(inst, "ytdl", "no")
     _ = uzv_ios_mpv_set_option_string(inst, "terminal", "no")
     _ = uzv_ios_mpv_set_option_string(inst, "tls-verify", "no")
-    _ = uzv_ios_mpv_set_option_string(inst, "network-timeout", "20")
+    _ = uzv_ios_mpv_set_option_string(inst, "network-timeout", "8")
     _ = uzv_ios_mpv_set_option_string(inst, "cache", "yes")
     _ = uzv_ios_mpv_set_option_string(inst, "demuxer-max-bytes", "64MiB")
     _ = uzv_ios_mpv_set_option_string(inst, "demuxer-max-back-bytes", "32MiB")

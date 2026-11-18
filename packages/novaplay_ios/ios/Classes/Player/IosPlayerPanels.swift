@@ -370,6 +370,10 @@ final class IosPlayerOverlayHost {
     guard let root = containerView else { return }
     onWillOpenOverlay()
     closeMenu()
+    if let prevClose = onPanelClosed {
+      onPanelClosed = nil
+      prevClose()
+    }
     panelHost.subviews.forEach { $0.removeFromSuperview() }
 
     let backdrop = PlayerTappableView()
@@ -1890,8 +1894,21 @@ final class IosPlayerPanels {
 
   // MARK: - 4. 播放设置 (1:1 Android `PlayerSettings.kt` + iOS Triple Kernels)
 
+  private var isSettingsPanelShowing: Bool = false
+  private weak var settingsScrollView: UIScrollView?
+  private var renderedSettingsKernelId: String?
+
+  func refreshSettingsIfNeeded() {
+    guard isSettingsPanelShowing, host.isPanelOpen else { return }
+    let activeKernel = IosPlayerUiText.normalizeIosKernel(controller.kernel.activeKernelId)
+    guard activeKernel != renderedSettingsKernelId else { return }
+    showSettings(scrollY: settingsScrollView?.contentOffset.y ?? 0)
+  }
+
   func showSettings(scrollY: CGFloat = 0) {
     var scrollRef: UIScrollView?
+    let activeKernel = IosPlayerUiText.normalizeIosKernel(controller.kernel.activeKernelId)
+    renderedSettingsKernelId = activeKernel
     let scroll = host.showPanel { [weak self] list in
       guard let self = self else { return }
 
@@ -1984,7 +2001,7 @@ final class IosPlayerPanels {
       // Group 3: 播放内核 (`AVPlayer (SYSTEM)`, `MPV (MPV)`, `VLC (FFmpeg)`)
       list.addArrangedSubview(self.ui.sectionLabel(IosPlayerUiText.t("播放内核", "Player kernel")))
       let kernelCard = self.ui.card()
-      let curKernel = IosPlayerUiText.normalizeIosKernel(self.controller.playbackConfig.kernel)
+      let curKernel = IosPlayerUiText.normalizeIosKernel(self.controller.kernel.activeKernelId)
       for kId in IosPlayerUiText.iosKernels {
         addOption(
           card: kernelCard,
@@ -2165,6 +2182,12 @@ final class IosPlayerPanels {
       list.addArrangedSubview(infoCard)
     }
     scrollRef = scroll
+    isSettingsPanelShowing = true
+    settingsScrollView = scroll
+    host.onPanelClosed = { [weak self] in
+      self?.isSettingsPanelShowing = false
+      self?.settingsScrollView = nil
+    }
     if scrollY > 0 {
       DispatchQueue.main.async {
         scroll.layoutIfNeeded()

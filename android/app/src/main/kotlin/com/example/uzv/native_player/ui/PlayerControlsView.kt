@@ -46,10 +46,10 @@ import java.util.Locale
 @SuppressLint("ViewConstructor")
 class PlayerControlsView(
     context: Context,
-    private val kernel: PlayerKernel,
     private val controller: PlayerController,
     private val actions: Actions,
 ) : FrameLayout(context) {
+    private val kernel: PlayerKernel get() = controller.kernel
     interface Actions {
         fun onQuality(anchor: View)
         fun onSpeed(anchor: View)

@@ -357,6 +357,15 @@ enum IosHlsRewriter {
     return head.uppercased() == "#EXTM3U"
   }
 
+  static func originString(of url: URL) -> String? {
+    guard let scheme = url.scheme?.lowercased(), !scheme.isEmpty,
+          let host = url.host, !host.isEmpty else { return nil }
+    if let port = url.port {
+      return "\(scheme)://\(host):\(port)"
+    }
+    return "\(scheme)://\(host)"
+  }
+
   static func rewrite(
     playlist: String,
     baseURL: URL,
@@ -367,6 +376,7 @@ enum IosHlsRewriter {
     var expectVariant = false
     var hasEncryption = false
     var hasByteRange = false
+    let baseOrigin = originString(of: baseURL)
 
     let rawLines = playlist.components(separatedBy: .newlines)
     outLines.reserveCapacity(rawLines.count)
@@ -404,11 +414,11 @@ enum IosHlsRewriter {
             guard let resolved = resolveReference(origRef, baseURL: baseURL) else { continue }
             let proxied: String
             if isPlaylistAttr {
-              proxied = buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "hls", fileName: "sub.m3u8", rawSeg: false)
+              proxied = buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "hls", fileName: "sub.m3u8", rawSeg: false, originHint: baseOrigin)
             } else if isMapAttr {
-              proxied = buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "raw", fileName: "init.mp4", rawSeg: false)
+              proxied = buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "raw", fileName: "init.mp4", rawSeg: false, originHint: baseOrigin)
             } else {
-              proxied = buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "key", fileName: "enc.key", rawSeg: false)
+              proxied = buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "key", fileName: "enc.key", rawSeg: false, originHint: baseOrigin)
             }
             nsMut.replaceCharacters(in: match.range, with: "URI=\"\(proxied)\"")
           }
@@ -428,16 +438,16 @@ enum IosHlsRewriter {
 
       let ext = resolved.pathExtension.lowercased()
       if expectVariant || ext == "m3u8" || ext == "m3u" {
-        outLines.append(buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "hls", fileName: "sub.m3u8", rawSeg: false))
+        outLines.append(buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "hls", fileName: "sub.m3u8", rawSeg: false, originHint: baseOrigin))
       } else if ["m4s", "mp4", "cmfv", "cmfa"].contains(ext) {
-        outLines.append(buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "raw", fileName: "seg.\(ext)", rawSeg: false))
+        outLines.append(buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "raw", fileName: "seg.\(ext)", rawSeg: false, originHint: baseOrigin))
       } else if ext == "vtt" || ext == "webvtt" {
-        outLines.append(buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "raw", fileName: "seg.vtt", rawSeg: false))
+        outLines.append(buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "raw", fileName: "seg.vtt", rawSeg: false, originHint: baseOrigin))
       } else if ["aac", "mp3", "ac3", "ec3"].contains(ext) {
-        outLines.append(buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "raw", fileName: "seg.\(ext)", rawSeg: false))
+        outLines.append(buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "raw", fileName: "seg.\(ext)", rawSeg: false, originHint: baseOrigin))
       } else {
         let rawFlag = hasEncryption || hasByteRange
-        outLines.append(buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "ts", fileName: "seg.ts", rawSeg: rawFlag))
+        outLines.append(buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "ts", fileName: "seg.ts", rawSeg: rawFlag, originHint: baseOrigin))
       }
 
       expectVariant = false
@@ -464,10 +474,16 @@ enum IosHlsRewriter {
     targetURL: URL,
     kind: String,
     fileName: String,
-    rawSeg: Bool
+    rawSeg: Bool,
+    originHint: String? = nil
   ) -> String {
     let encoded = IosUrlSanitizer.base64UrlEncode(targetURL.absoluteString)
-    let extra = rawSeg ? "&rawseg=1" : ""
+    var extra = rawSeg ? "&rawseg=1" : ""
+    if let hint = originHint,
+       let targetOrig = originString(of: targetURL),
+       targetOrig.caseInsensitiveCompare(hint) != .orderedSame {
+      extra += "&o=\(IosUrlSanitizer.base64UrlEncode(hint))"
+    }
     return "http://127.0.0.1:\(port)/proxy/\(token)/\(fileName)?u=\(encoded)&kind=\(kind)\(extra)"
   }
 }
@@ -494,10 +510,12 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     let createdAt: TimeInterval
 
     var redirectCookies: [String: String] = [:]
+    var hostFallbacks: [String: String] = [:]
     var cachedRootPlaylist: CachedPlaylist?
     var lastStatusCode: Int?
     var lastContentType: String?
     var lastError: String?
+    var rootRequestFailed: Bool = false
     var detectedContainer: IosStreamContainer = .unknown
     var lastFinalHost: String?
 
@@ -548,7 +566,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     cfg.httpShouldSetCookies = false
     cfg.httpCookieAcceptPolicy = .never
     cfg.httpMaximumConnectionsPerHost = 16
-    cfg.timeoutIntervalForRequest = 20
+    cfg.timeoutIntervalForRequest = 10
     cfg.timeoutIntervalForResource = 7200
     urlSession = URLSession(configuration: cfg, delegate: self, delegateQueue: delegateQueue)
   }
@@ -679,6 +697,74 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
       parts.append("net=\(err)")
     }
     return parts.isEmpty ? nil : parts.joined(separator: ", ")
+  }
+
+  func hasRootUpstreamFailure(for token: String?) -> Bool {
+    guard let token = token else { return false }
+    lock.lock()
+    defer { lock.unlock() }
+    guard let s = sessions[token] else { return false }
+    if s.rootRequestFailed || s.detectedContainer == .html {
+      return true
+    }
+    if let code = s.lastStatusCode, [401, 403, 404, 410, 451, 500, 502, 503, 504].contains(code) {
+      return true
+    }
+    return false
+  }
+
+  static func replaceOrigin(of target: URL, with originStr: String) -> URL? {
+    guard let originComps = URLComponents(string: originStr),
+          let scheme = originComps.scheme, !scheme.isEmpty,
+          let host = originComps.host, !host.isEmpty,
+          var targetComps = URLComponents(url: target, resolvingAgainstBaseURL: false) else {
+      return nil
+    }
+    targetComps.scheme = scheme
+    targetComps.host = host
+    targetComps.port = originComps.port
+    return targetComps.url
+  }
+
+  private static func authorityKey(of url: URL) -> String {
+    "\(url.scheme?.lowercased() ?? "")://\(url.host?.lowercased() ?? ""):\(url.port ?? -1)"
+  }
+
+  private func mappedTargetURL(_ url: URL, session: ProxySession) -> URL {
+    let key = Self.authorityKey(of: url)
+    lock.lock()
+    let winOrigin = session.hostFallbacks[key]
+    lock.unlock()
+    guard let winOrigin = winOrigin else { return url }
+    return Self.replaceOrigin(of: url, with: winOrigin) ?? url
+  }
+
+  private func fallbackTargetURL(
+    original: URL,
+    attempted: URL,
+    originHint: String?,
+    session: ProxySession
+  ) -> URL? {
+    guard let candidateOrigin = originHint ?? IosHlsRewriter.originString(of: session.rootURL),
+          let alt = Self.replaceOrigin(of: original, with: candidateOrigin),
+          Self.authorityKey(of: alt) != Self.authorityKey(of: attempted) else {
+      return nil
+    }
+    return alt
+  }
+
+  private func rememberHostFallback(deadURL: URL, workingOrigin: String, session: ProxySession) {
+    let key = Self.authorityKey(of: deadURL)
+    lock.lock()
+    session.hostFallbacks[key] = workingOrigin
+    lock.unlock()
+  }
+
+  private func markRootResult(session: ProxySession, targetURL: URL, failed: Bool) {
+    guard targetURL.absoluteString == session.rootURL.absoluteString else { return }
+    lock.lock()
+    session.rootRequestFailed = failed
+    lock.unlock()
   }
 
   // MARK: - Fast Container Probe (<= 1 KB)
@@ -820,6 +906,11 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
         let errText: String? = (err != nil && !isCancelledByCap) ? err?.localizedDescription : nil
         if let errText = errText {
           self.recordSessionError(session: session, errorText: errText)
+          if status == nil {
+            self.markRootResult(session: session, targetURL: session.rootURL, failed: true)
+          }
+        } else if let code = status {
+          self.markRootResult(session: session, targetURL: session.rootURL, failed: code >= 400)
         }
 
         let finalURL = resp?.url ?? session.rootURL
@@ -1088,13 +1179,14 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
 
     let kind = (queryMap["kind"] ?? "auto").lowercased()
     let isRawSeg = (queryMap["rawseg"] == "1")
+    let originHint = queryMap["o"].flatMap { IosUrlSanitizer.base64UrlDecode($0) }
 
     if kind == "hls" {
-      serveHlsPlaylist(fd: fd, isHead: isHead, targetURL: targetURL, session: session)
+      serveHlsPlaylist(fd: fd, isHead: isHead, targetURL: targetURL, session: session, originHint: originHint, allowOriginFallback: true)
     } else if kind == "key" {
-      serveHlsKey(fd: fd, isHead: isHead, targetURL: targetURL, session: session)
+      serveHlsKey(fd: fd, isHead: isHead, targetURL: targetURL, session: session, originHint: originHint, allowOriginFallback: true)
     } else if kind == "ts" && !isRawSeg && incomingRange == nil && !isHead {
-      serveSanitizedTsSegment(fd: fd, targetURL: targetURL, session: session)
+      serveSanitizedTsSegment(fd: fd, targetURL: targetURL, session: session, originHint: originHint, allowOriginFallback: true)
     } else {
       serveStreamingResource(
         fd: fd,
@@ -1103,7 +1195,9 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
         session: session,
         kind: kind,
         pathFileName: pathFileName,
-        incomingRange: incomingRange
+        incomingRange: incomingRange,
+        originHint: originHint,
+        allowOriginFallback: true
       )
     }
   }
@@ -1114,7 +1208,9 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     fd: Int32,
     isHead: Bool,
     targetURL: URL,
-    session: ProxySession
+    session: ProxySession,
+    originHint: String?,
+    allowOriginFallback: Bool
   ) {
     let proxyPortNow = currentBoundPort
     if proxyPortNow > 0,
@@ -1140,8 +1236,10 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
       return
     }
 
-    var req = URLRequest(url: targetURL)
+    let effectiveURL = allowOriginFallback ? mappedTargetURL(targetURL, session: session) : targetURL
+    var req = URLRequest(url: effectiveURL)
     req.httpMethod = "GET"
+    req.timeoutInterval = 8.0
     applyEffectiveHeaders(for: session, into: &req)
 
     let stateLock = NSLock()
@@ -1174,27 +1272,44 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
         if shouldAbort { task?.cancel() }
       },
       onComplete: { [weak self] err in
-        defer { Darwin.close(fd) }
-        guard let self = self else { return }
+        guard let self = self else {
+          Darwin.close(fd)
+          return
+        }
         stateLock.lock()
         let resp = upstreamResp
         let data = body
         let capped = exceededCap
         stateLock.unlock()
 
+        let status = resp?.statusCode ?? 200
+        if ((err != nil && !capped) || status >= 400),
+           allowOriginFallback,
+           targetURL.absoluteString != session.rootURL.absoluteString,
+           let altURL = self.fallbackTargetURL(original: targetURL, attempted: effectiveURL, originHint: originHint, session: session) {
+          if let winOrig = IosHlsRewriter.originString(of: altURL) {
+            self.rememberHostFallback(deadURL: effectiveURL, workingOrigin: winOrig, session: session)
+          }
+          self.serveHlsPlaylist(fd: fd, isHead: isHead, targetURL: altURL, session: session, originHint: nil, allowOriginFallback: false)
+          return
+        }
+
+        defer { Darwin.close(fd) }
         if let err = err, !capped {
+          self.markRootResult(session: session, targetURL: targetURL, failed: true)
           self.recordSessionError(session: session, errorText: err.localizedDescription)
           _ = self.writeAll(fd: fd, data: Data("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
           return
         }
-        let status = resp?.statusCode ?? 200
         if status >= 400 {
+          self.markRootResult(session: session, targetURL: targetURL, failed: true)
           let header = "HTTP/1.1 \(status) Upstream Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
           _ = self.writeAll(fd: fd, data: Data(header.utf8))
           return
         }
+        self.markRootResult(session: session, targetURL: targetURL, failed: false)
 
-        let finalURL = resp?.url ?? targetURL
+        let finalURL = resp?.url ?? effectiveURL
         let proxyPort = self.currentBoundPort
         if proxyPort > 0,
            IosHlsRewriter.looksLikeHlsPlaylist(data),
@@ -1239,10 +1354,14 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     fd: Int32,
     isHead: Bool,
     targetURL: URL,
-    session: ProxySession
+    session: ProxySession,
+    originHint: String?,
+    allowOriginFallback: Bool
   ) {
-    var req = URLRequest(url: targetURL)
+    let effectiveURL = allowOriginFallback ? mappedTargetURL(targetURL, session: session) : targetURL
+    var req = URLRequest(url: effectiveURL)
     req.httpMethod = "GET"
+    req.timeoutInterval = 8.0
     applyEffectiveHeaders(for: session, into: &req)
 
     let stateLock = NSLock()
@@ -1275,20 +1394,33 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
         if shouldAbort { task?.cancel() }
       },
       onComplete: { [weak self] err in
-        defer { Darwin.close(fd) }
-        guard let self = self else { return }
+        guard let self = self else {
+          Darwin.close(fd)
+          return
+        }
         stateLock.lock()
         let resp = upstreamResp
         let data = body
         let capped = exceededCap
         stateLock.unlock()
 
+        let status = resp?.statusCode ?? 200
+        if ((err != nil && !capped) || status >= 400),
+           allowOriginFallback,
+           let altURL = self.fallbackTargetURL(original: targetURL, attempted: effectiveURL, originHint: originHint, session: session) {
+          if let winOrig = IosHlsRewriter.originString(of: altURL) {
+            self.rememberHostFallback(deadURL: effectiveURL, workingOrigin: winOrig, session: session)
+          }
+          self.serveHlsKey(fd: fd, isHead: isHead, targetURL: altURL, session: session, originHint: nil, allowOriginFallback: false)
+          return
+        }
+
+        defer { Darwin.close(fd) }
         if let err = err, !capped {
           self.recordSessionError(session: session, errorText: err.localizedDescription)
           _ = self.writeAll(fd: fd, data: Data("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
           return
         }
-        let status = resp?.statusCode ?? 200
         if status >= 400 {
           let header = "HTTP/1.1 \(status) Upstream Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
           _ = self.writeAll(fd: fd, data: Data(header.utf8))
@@ -1314,7 +1446,9 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
   private func serveSanitizedTsSegment(
     fd: Int32,
     targetURL: URL,
-    session: ProxySession
+    session: ProxySession,
+    originHint: String?,
+    allowOriginFallback: Bool
   ) {
     let writeQueue = DispatchQueue(label: "app.novaplay.proxy.tswrite")
     let stateLock = NSLock()
@@ -1325,8 +1459,10 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     var queuedBytes = 0
     var suspended = false
 
-    var req = URLRequest(url: targetURL)
+    let effectiveURL = allowOriginFallback ? mappedTargetURL(targetURL, session: session) : targetURL
+    var req = URLRequest(url: effectiveURL)
     req.httpMethod = "GET"
+    req.timeoutInterval = 8.0
     applyEffectiveHeaders(for: session, into: &req)
     req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
 
@@ -1487,6 +1623,17 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
         }
 
         writeQueue.async {
+          if !wasFlushed,
+             allowOriginFallback,
+             targetURL.absoluteString != session.rootURL.absoluteString,
+             (err != nil || (respSnap?.statusCode ?? 200) >= 400),
+             let altURL = self.fallbackTargetURL(original: targetURL, attempted: effectiveURL, originHint: originHint, session: session) {
+            if let winOrig = IosHlsRewriter.originString(of: altURL) {
+              self.rememberHostFallback(deadURL: effectiveURL, workingOrigin: winOrig, session: session)
+            }
+            self.serveSanitizedTsSegment(fd: fd, targetURL: altURL, session: session, originHint: nil, allowOriginFallback: false)
+            return
+          }
           defer { Darwin.close(fd) }
           if !wasFlushed {
             if err != nil && remainingPrefix.isEmpty && respSnap == nil {
@@ -1515,7 +1662,9 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     session: ProxySession,
     kind: String,
     pathFileName: String,
-    incomingRange: String?
+    incomingRange: String?,
+    originHint: String?,
+    allowOriginFallback: Bool
   ) {
     let writeQueue = DispatchQueue(label: "app.novaplay.proxy.streamwrite")
     let stateLock = NSLock()
@@ -1526,7 +1675,8 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     var suspended = false
     var autoHlsBuffer: Data?
 
-    var req = URLRequest(url: targetURL)
+    let effectiveURL = allowOriginFallback ? mappedTargetURL(targetURL, session: session) : targetURL
+    var req = URLRequest(url: effectiveURL)
     req.httpMethod = isHead ? "HEAD" : "GET"
     applyEffectiveHeaders(for: session, into: &req)
     if let incomingRange = incomingRange, !incomingRange.isEmpty {
@@ -1721,12 +1871,35 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
         }
 
         writeQueue.async {
+          if !wasFlushed,
+             hlsBuf == nil,
+             allowOriginFallback,
+             targetURL.absoluteString != session.rootURL.absoluteString,
+             (err != nil || (respSnap?.statusCode ?? 200) >= 400),
+             let altURL = self.fallbackTargetURL(original: targetURL, attempted: effectiveURL, originHint: originHint, session: session) {
+            if let winOrig = IosHlsRewriter.originString(of: altURL) {
+              self.rememberHostFallback(deadURL: effectiveURL, workingOrigin: winOrig, session: session)
+            }
+            self.serveStreamingResource(
+              fd: fd,
+              isHead: isHead,
+              targetURL: altURL,
+              session: session,
+              kind: kind,
+              pathFileName: pathFileName,
+              incomingRange: incomingRange,
+              originHint: nil,
+              allowOriginFallback: false
+            )
+            return
+          }
           defer { Darwin.close(fd) }
           if let hlsData = hlsBuf {
-            let finalURL = respSnap?.url ?? targetURL
+            let finalURL = respSnap?.url ?? effectiveURL
             let portNow = self.currentBoundPort
             if portNow > 0,
                let text = String(data: hlsData, encoding: .utf8) ?? String(data: hlsData, encoding: .isoLatin1) {
+              self.markRootResult(session: session, targetURL: targetURL, failed: false)
               self.recordSessionContainer(session: session, container: .hls)
               let rewritten = IosHlsRewriter.rewrite(
                 playlist: text,
@@ -1750,9 +1923,13 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
 
           if !wasFlushed {
             if let err = err, respSnap == nil {
+              self.markRootResult(session: session, targetURL: targetURL, failed: true)
               self.recordSessionError(session: session, errorText: err.localizedDescription)
               _ = self.writeAll(fd: fd, data: Data("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
               return
+            }
+            if let code = respSnap?.statusCode {
+              self.markRootResult(session: session, targetURL: targetURL, failed: code >= 400)
             }
             let hdr = buildResponseHeaders(resp: respSnap, firstChunk: nil)
             _ = self.writeAll(fd: fd, data: hdr)
@@ -1929,6 +2106,9 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     session.lastStatusCode = response.statusCode
     session.lastContentType = response.value(forHTTPHeaderField: "Content-Type")
     session.lastFinalHost = response.url?.host
+    if response.statusCode < 400 {
+      session.lastError = nil
+    }
     lock.unlock()
   }
 

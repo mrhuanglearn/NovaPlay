@@ -89,10 +89,11 @@ void main() {
     expect(find.text('detail:a1'), findsOneWidget);
   });
 
-  testWidgets('切换站点 has 单列/双列, globe and gear; 双列 is kept in settings', (tester) async {
+  testWidgets('切换站点 has 定位, 单列/双列, globe and gear; 双列 is kept in settings', (tester) async {
     await pump(tester);
     await openSheet(tester);
     expect(find.text('切换站点'), findsOneWidget);
+    expect(find.byKey(SiteSwitchSheet.locateKey), findsOneWidget);
     expect(find.byKey(SiteSwitchSheet.gridToggleKey), findsOneWidget);
     expect(find.byKey(SiteSwitchSheet.websiteKey), findsOneWidget);
     expect(find.byKey(SiteSwitchSheet.settingsKey), findsOneWidget);
@@ -103,6 +104,59 @@ void main() {
     expect(find.byIcon(Icons.check_circle), findsOneWidget); // the current site
     expect(find.byIcon(Icons.radio_button_unchecked), findsNWidgets(2));
     expect((settings.data as Map)['siteSheetGrid'], isTrue);
+  });
+
+  testWidgets('切换站点 auto-locates the selected site on open and on tapping the locate button', (tester) async {
+    final manySites = [
+      for (var i = 0; i < 30; i++) SpiderSite(key: 's$i', name: '站点-$i', api: '/spider/s$i/3'),
+    ];
+    final container = ProviderContainer(overrides: [
+      settingsStoreProvider.overrideWithValue(settings),
+      subscriptionsProvider.overrideWith((ref) async => const [Subscription(key: 'mock', name: 'catpaw')]),
+      catpawRuntimeProvider.overrideWith((ref) async => SpiderRuntime(
+          subscription: const Subscription(key: 'mock', name: 'catpaw'),
+          api: _FakeApi(),
+          sites: manySites)),
+    ]);
+    addTearDown(container.dispose);
+    await tester.binding.setSurfaceSize(const Size(420, 900));
+    addTearDown(() => tester.binding.setSurfaceSize(null));
+    router = GoRouter(routes: [
+      GoRoute(path: '/', builder: (c, s) => const HomeScreen()),
+      GoRoute(path: '/video/detail', builder: (c, s) => Text('detail:${s.uri.queryParameters['id']}')),
+    ]);
+    await tester.pumpWidget(UncontrolledProviderScope(
+      container: container,
+      child: MaterialApp.router(
+        scaffoldMessengerKey: rootMessengerKey,
+        routerConfig: router,
+        locale: const Locale('zh'),
+        localizationsDelegates: AppLocalizations.localizationsDelegates,
+        supportedLocales: AppLocalizations.supportedLocales,
+        theme: buildAppTheme(Brightness.light),
+      ),
+    ));
+    await tester.pumpAndSettle();
+
+    // Select site #25 (off-screen near the bottom of 30 sites)
+    container.read(selectedHomeSiteProvider.notifier).select('s25');
+    await tester.pumpAndSettle();
+
+    // Opening 切换站点 must immediately scroll 站点-25 into view (and 站点-0 out of view)
+    await openSheet(tester);
+    expect(find.descendant(of: find.byType(SiteSwitchSheet), matching: find.text('站点-25')), findsOneWidget);
+    expect(find.descendant(of: find.byType(SiteSwitchSheet), matching: find.text('站点-0')), findsNothing);
+
+    // Drag down to scroll back to the top where 站点-0 is visible and 站点-25 is off-screen
+    await tester.drag(find.byType(ListView).last, const Offset(0, 1500));
+    await tester.pumpAndSettle();
+    expect(find.descendant(of: find.byType(SiteSwitchSheet), matching: find.text('站点-0')), findsOneWidget);
+    expect(find.descendant(of: find.byType(SiteSwitchSheet), matching: find.text('站点-25')), findsNothing);
+
+    // Tap the locate icon button -> scrolls back to 站点-25
+    await tester.tap(find.byKey(SiteSwitchSheet.locateKey));
+    await tester.pumpAndSettle();
+    expect(find.descendant(of: find.byType(SiteSwitchSheet), matching: find.text('站点-25')), findsOneWidget);
   });
 
   testWidgets('the globe opens the subscription web page', (tester) async {

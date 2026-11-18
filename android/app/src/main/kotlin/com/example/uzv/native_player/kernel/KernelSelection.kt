@@ -22,4 +22,11 @@ object KernelSelection {
 
     fun fallbackNotice(kernel: Kernel, reason: String?): String =
         "${kernel.label} kernel unavailable, using Exo" + if (reason.isNullOrBlank()) "" else " ($reason)"
+
+    /** Runtime fallback order when [from] fails to decode/demux a reachable stream. */
+    fun fallbackOrder(from: Kernel): List<Kernel> = when (from) {
+        Kernel.EXO -> listOf(Kernel.MPV, Kernel.MDK)
+        Kernel.MPV -> listOf(Kernel.EXO, Kernel.MDK)
+        Kernel.MDK -> listOf(Kernel.MPV, Kernel.EXO)
+    }
 }

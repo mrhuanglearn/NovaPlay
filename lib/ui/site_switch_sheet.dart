@@ -30,6 +30,7 @@ class SiteSwitchSheet extends ConsumerStatefulWidget {
   /// The home page's context, for opening the web page once the sheet is closed.
   final BuildContext pageContext;
 
+  static const locateKey = ValueKey('siteSheetLocate');
   static const gridToggleKey = ValueKey('siteSheetGridToggle');
   static const websiteKey = ValueKey('siteSheetWebsite');
   static const settingsKey = ValueKey('siteSheetSettings');
@@ -41,7 +42,33 @@ class SiteSwitchSheet extends ConsumerStatefulWidget {
 }
 
 class _SiteSwitchSheetState extends ConsumerState<SiteSwitchSheet> {
+  final _scroll = ScrollController();
   bool _settings = false;
+  String? _locatedSignature;
+
+  @override
+  void dispose() {
+    _scroll.dispose();
+    super.dispose();
+  }
+
+  void _locateCurrent({required bool animate}) {
+    if (!_scroll.hasClients) return;
+    final sites = ref.read(visibleHomeSitesProvider);
+    final key = ref.read(currentSiteProvider)?.key;
+    final idx = key == null ? -1 : sites.indexWhere((s) => s.key == key);
+    if (idx < 0) return;
+    final grid = (ref.read(sitePrefsProvider).valueOrNull ?? const SitePrefs()).grid;
+    final rowTop = grid ? (idx ~/ 2) * 62.0 : idx * 56.0;
+    final itemH = grid ? 52.0 : 48.0;
+    final pos = _scroll.position;
+    final target = (rowTop - (pos.viewportDimension - itemH) / 2).clamp(0.0, pos.maxScrollExtent);
+    if (animate) {
+      _scroll.animateTo(target, duration: const Duration(milliseconds: 250), curve: Curves.easeOut);
+    } else {
+      _scroll.jumpTo(target);
+    }
+  }
 
   Future<void> _openWebsite() async {
     final rt = ref.read(catpawRuntimeProvider).valueOrNull;
@@ -59,6 +86,19 @@ class _SiteSwitchSheetState extends ConsumerState<SiteSwitchSheet> {
     final prefs = ref.watch(sitePrefsProvider).valueOrNull ?? const SitePrefs();
     final unlocked = ref.watch(sitesUnlockedProvider);
     final hasLocked = ref.watch(homeSitesProvider).any((s) => prefs.isLocked(s.key));
+    final sites = ref.watch(visibleHomeSitesProvider);
+    final current = ref.watch(currentSiteProvider);
+    if (!_settings && current != null && sites.isNotEmpty) {
+      final sig = '${current.key}|${prefs.grid}';
+      if (_locatedSignature != sig) {
+        _locatedSignature = sig;
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && !_settings) _locateCurrent(animate: false);
+        });
+      }
+    } else if (_settings) {
+      _locatedSignature = null;
+    }
     final actions = _settings
         ? [
             if (hasLocked)
@@ -80,6 +120,13 @@ class _SiteSwitchSheetState extends ConsumerState<SiteSwitchSheet> {
             ),
           ]
         : [
+            IconButton(
+              key: SiteSwitchSheet.locateKey,
+              tooltip: l.homeSiteLocate,
+              style: _compact40,
+              icon: Icon(Icons.my_location, size: 21, color: c.label),
+              onPressed: () => _locateCurrent(animate: true),
+            ),
             IconButton(
               key: SiteSwitchSheet.gridToggleKey,
               tooltip: prefs.grid ? l.searchOneColumn : l.searchTwoColumns,
@@ -116,7 +163,7 @@ class _SiteSwitchSheetState extends ConsumerState<SiteSwitchSheet> {
               for (final a in actions) Padding(padding: const EdgeInsets.only(left: 6), child: a),
             ]),
           ),
-          Flexible(child: _settings ? const _SiteSettingsList() : _SiteChoiceList(grid: prefs.grid)),
+          Flexible(child: _settings ? const _SiteSettingsList() : _SiteChoiceList(grid: prefs.grid, controller: _scroll)),
         ]),
       ),
     );
@@ -124,8 +171,9 @@ class _SiteSwitchSheetState extends ConsumerState<SiteSwitchSheet> {
 }
 
 class _SiteChoiceList extends ConsumerWidget {
-  const _SiteChoiceList({required this.grid});
+  const _SiteChoiceList({required this.grid, required this.controller});
   final bool grid;
+  final ScrollController controller;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -138,6 +186,7 @@ class _SiteChoiceList extends ConsumerWidget {
 
     if (grid) {
       return GridView.builder(
+        controller: controller,
         shrinkWrap: true,
         padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
         gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
@@ -148,7 +197,9 @@ class _SiteChoiceList extends ConsumerWidget {
       );
     }
     return ListView.builder(
+      controller: controller,
       shrinkWrap: true,
+      itemExtent: 56,
       padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
       itemCount: sites.length,
       itemBuilder: (_, i) => Padding(

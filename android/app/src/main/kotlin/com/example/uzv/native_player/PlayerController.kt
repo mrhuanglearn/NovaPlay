@@ -2,7 +2,9 @@ package com.example.uzv.native_player
 
 import android.os.Handler
 import android.os.Looper
+import com.example.uzv.native_player.kernel.KernelSelection
 import com.example.uzv.native_player.kernel.PlayerKernel
+import com.example.uzv.native_player.kernel.PlayerStreamProxy
 import com.example.uzv.native_player.kernel.TrackOption
 import com.example.uzv.native_player.ui.DanmakuView
 import com.example.uzv.native_player.ui.PlayerUiText
@@ -14,10 +16,19 @@ import org.json.JSONArray
  */
 class PlayerController(
     private val request: OpenPlayerRequest,
-    val kernel: PlayerKernel,
+    initialKernel: PlayerKernel,
     private val danmakuView: DanmakuView,
+    initialKernelId: String = request.playbackConfig.kernel,
     private val onClose: () -> Unit,
 ) : PlayerKernel.Listener {
+    var kernel: PlayerKernel = initialKernel
+        private set
+    var activeKernelId: String = KernelSelection.parse(initialKernelId).id
+        private set
+    var onAutoSwitchKernel: ((KernelSelection.Kernel) -> PlayerKernel?)? = null
+    private var activeProxyToken: String? = null
+    private var lastLoadStartMs = 0L
+    private val triedKernels = HashSet<KernelSelection.Kernel>()
     private val api get() = NativePlayerHost.flutterApi
     private val main = Handler(Looper.getMainLooper())
     var line = 0
@@ -139,6 +150,7 @@ class PlayerController(
     }
 
     val playbackConfig get() = playback
+    val effectivePlaybackConfig get() = playback.copy(kernel = activeKernelId)
     val hasPrevious get() = episode > 0
     val hasNext get() = episode + 1 < episodeNames().size
     val episodeName get() = episodeNames().getOrNull(episode)
@@ -159,8 +171,9 @@ class PlayerController(
      * which writes player_config.json) and shown. Kernel / hardware decoding are applied by reloading the page instead
      * (see [reloadRequest]).
      */
-    fun updatePlayback(next: PlaybackConfig) {
+    fun updatePlayback(rawNext: PlaybackConfig) {
         val old = playback
+        val next = rawNext.copy(kernel = old.kernel)
         if (next == old) return
         playback = next
         if (old.fitMode != next.fitMode) kernel.fitMode = next.fitMode
@@ -320,8 +333,17 @@ class PlayerController(
                 onSkipIntro?.invoke(fromMs)
             }
         }
-        kernel.load(payload.url!!, payload.audioUrl, payload.headers.orEmpty(), start, payload.subtitles.orEmpty() + extraSubtitles)
+        triedKernels.clear()
+        triedKernels.add(KernelSelection.parse(activeKernelId))
+        loadPayloadIntoKernel(payload, start)
         pendingStartMs = 0
+    }
+
+    private fun loadPayloadIntoKernel(payload: SourcePayload, startMs: Long) {
+        val wrapped = PlayerStreamProxy.wrap(payload.url!!, payload.headers.orEmpty())
+        activeProxyToken = wrapped.token
+        lastLoadStartMs = startMs
+        kernel.load(wrapped.url, payload.audioUrl, wrapped.forwardedHeaders, startMs, payload.subtitles.orEmpty() + extraSubtitles)
     }
 
     /** 加载字幕…: the playing source again, at the same position, with one more subtitle (which becomes the shown one). */
@@ -329,7 +351,7 @@ class PlayerController(
         val payload = lastPayload ?: return false
         extraSubtitles.removeAll { it.url == url }
         extraSubtitles += SubtitleOption(url, name)
-        kernel.load(payload.url!!, payload.audioUrl, payload.headers.orEmpty(), kernel.positionMs, payload.subtitles.orEmpty() + extraSubtitles)
+        loadPayloadIntoKernel(payload, kernel.positionMs)
         main.postDelayed({
             if (closed) return@postDelayed
             val i = kernel.subtitleTracks().indexOfLast { it.label.contains(name) }
@@ -458,8 +480,50 @@ class PlayerController(
 
     /** Kernels raise this only for errors that stop playback (OBSERVED in 1.1.13: c2.K.t opens the error layer). */
     override fun onError(message: String, code: Int?) {
-        api.onErrorReported(ErrorReport(request.sessionId, message, false, code?.toLong())) {}
-        main.post { showError(message) }
+        main.post {
+            if (closed) return@post
+            val upErr = PlayerStreamProxy.upstreamError(activeProxyToken)
+            if (upErr != null) {
+                val friendly = PlayerUiText.t("视频播放失败 ($upErr)", "Playback failed ($upErr)")
+                api.onErrorReported(ErrorReport(request.sessionId, friendly, false, code?.toLong())) {}
+                showError(friendly)
+                return@post
+            }
+            val payload = lastPayload
+            val from = KernelSelection.parse(activeKernelId)
+            if (payload != null && payload.url != null) {
+                for (cand in KernelSelection.fallbackOrder(from)) {
+                    if (!triedKernels.add(cand)) continue
+                    val nextKernel = onAutoSwitchKernel?.invoke(cand) ?: continue
+                    val resumeMs = maxOf(lastLoadStartMs, kernel.positionMs)
+                    val old = kernel
+                    old.listener = null
+                    old.release()
+                    kernel = nextKernel
+                    activeKernelId = cand.id
+                    nextKernel.listener = this
+                    nextKernel.fitMode = playback.fitMode
+                    nextKernel.speed = currentSpeed.toFloat()
+                    applyTrackPreferences()
+                    danmakuView.attach(nextKernel)
+                    error = null
+                    failed = false
+                    state = "buffering"
+                    uiListener?.onToast(
+                        PlayerUiText.t(
+                            "${PlayerUiText.kernelName(from.id)} 无法播放该片源，已自动切换至 ${PlayerUiText.kernelName(cand.id)} 内核",
+                            "${PlayerUiText.kernelName(from.id)} failed; switched to ${PlayerUiText.kernelName(cand.id)}",
+                        ),
+                        long = true,
+                    )
+                    loadPayloadIntoKernel(payload, resumeMs)
+                    uiListener?.onChanged()
+                    return@post
+                }
+            }
+            api.onErrorReported(ErrorReport(request.sessionId, message, false, code?.toLong())) {}
+            showError(message)
+        }
     }
 
     /**

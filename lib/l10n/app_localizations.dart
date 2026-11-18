@@ -1844,6 +1844,12 @@ abstract class AppLocalizations {
   /// **'Web page'**
   String get homeSiteWebsite;
 
+  /// No description provided for @homeSiteLocate.
+  ///
+  /// In en, this message translates to:
+  /// **'Locate current site'**
+  String get homeSiteLocate;
+
   /// No description provided for @homeSiteUnlock.
   ///
   /// In en, this message translates to:

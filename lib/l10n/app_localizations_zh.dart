@@ -938,6 +938,9 @@ class AppLocalizationsZh extends AppLocalizations {
   String get homeSiteWebsite => '网页';
 
   @override
+  String get homeSiteLocate => '定位当前站点';
+
+  @override
   String get homeSiteUnlock => '解锁站点';
 
   @override

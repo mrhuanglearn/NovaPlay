@@ -95,16 +95,24 @@ class NativePlayerActivity : AppCompatActivity() {
             keepScreenOn = true
         }
         rootView = root
-        val kernel = createKernel(request.playbackConfig)
+        val (kernel, activeKernel) = createKernel(request.playbackConfig)
         val danmaku = DanmakuView(this).also { it.attach(kernel) }
         root.addView(kernel.view, FrameLayout.LayoutParams(-1, -1))
         root.addView(danmaku, FrameLayout.LayoutParams(-1, -1))
-        val c = PlayerController(request, kernel, danmaku) { finish() }
+        val c = PlayerController(request, kernel, danmaku, activeKernel.id) { finish() }
         controller = c
         NativePlayerHost.controller = c
         c.applyHeadTail()
+        c.onAutoSwitchKernel = { target ->
+            buildSpecificKernel(target, c.playbackConfig.hwDecode)?.also { nextKernel ->
+                val oldView = c.kernel.view
+                val idx = root.indexOfChild(oldView).coerceAtLeast(0)
+                root.removeView(oldView)
+                root.addView(nextKernel.view, idx, FrameLayout.LayoutParams(-1, -1))
+            }
+        }
 
-        val controls = PlayerControlsView(this, kernel, c, object : PlayerControlsView.Actions {
+        val controls = PlayerControlsView(this, c, object : PlayerControlsView.Actions {
             override fun onQuality(anchor: View) = showQuality(c, anchor)
             override fun onSpeed(anchor: View) = showSpeed(c, anchor)
             override fun onEpisodes() = if (c.isLive) showChannels(c) else showEpisodes(c)
@@ -115,7 +123,7 @@ class NativePlayerActivity : AppCompatActivity() {
             override fun onMore(anchor: View) = showMore(c, anchor)
             override fun onSettings() = showSettings(c)
             override fun onPictureInPicture() = enterPip()
-            override fun onScreenshot() = PlayerScreenshotSaver.captureAndSave(this@NativePlayerActivity, kernel, ::toast)
+            override fun onScreenshot() = PlayerScreenshotSaver.captureAndSave(this@NativePlayerActivity, c.kernel, ::toast)
             override fun onReload() = c.retry()
             override fun onRotate() = rotate()
             override fun onMarkIntro() = c.markIntro()
@@ -126,7 +134,12 @@ class NativePlayerActivity : AppCompatActivity() {
         this.controls = controls
         root.addView(controls, FrameLayout.LayoutParams(-1, -1))
         c.uiListener = object : PlayerController.UiListener {
-            override fun onChanged() = controls.refresh()
+            override fun onChanged() {
+                controls.refresh()
+                if (settingsPanelOpen && controls.panelOpen && lastSettingsKernel != c.activeKernelId) {
+                    showSettings(c, settingsScrollRef?.scrollY ?: 0)
+                }
+            }
             override fun onNotice(text: String) = controls.showNotice(text)
             override fun onToast(text: String, long: Boolean) =
                 Toast.makeText(this@NativePlayerActivity, text, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
@@ -137,7 +150,7 @@ class NativePlayerActivity : AppCompatActivity() {
         c.onSkipIntro = { fromMs -> controls.showSkipBanner(fromMs) }
         setContentView(root)
         hideSystemBars()
-        installGestures(root, controls, c, kernel)
+        installGestures(root, controls, c)
 
         PlaybackNotificationService.start(this, request.title)
         c.start()
@@ -157,7 +170,7 @@ class NativePlayerActivity : AppCompatActivity() {
      * INFERRED: the left half changes the screen brightness (iOS changelog: 滑动调节音量/亮度), the distances (two minutes
      * per screen width; the whole volume range per 300 dp, from one measurement: 146 dp moved it 48 %).
      */
-    private fun installGestures(root: FrameLayout, controls: PlayerControlsView, c: PlayerController, kernel: PlayerKernel) {
+    private fun installGestures(root: FrameLayout, controls: PlayerControlsView, c: PlayerController) {
         val density = resources.displayMetrics.density
         val slop = android.view.ViewConfiguration.get(this).scaledTouchSlop
         val slideStepPx = 50 * density // original: one speed step per 50 dp
@@ -179,7 +192,7 @@ class NativePlayerActivity : AppCompatActivity() {
             }
             override fun onDoubleTap(e: MotionEvent): Boolean {
                 if (controls.locked) return true
-                val wasPlaying = kernel.isPlaying
+                val wasPlaying = c.kernel.isPlaying
                 c.togglePause()
                 controls.flashPlayState(paused = wasPlaying)
                 controls.refresh()
@@ -187,16 +200,17 @@ class NativePlayerActivity : AppCompatActivity() {
                 return true
             }
             override fun onLongPress(e: MotionEvent) {
-                if (controls.locked || mode != 0 || !kernel.isPlaying) return
+                if (controls.locked || mode != 0 || !c.kernel.isPlaying) return
                 val speed = c.playbackConfig.longPressSpeed
                 longPressing = true
                 longPressY = e.y
-                kernel.speed = speed.toFloat()
+                c.kernel.speed = speed.toFloat()
                 controls.showSpeedHint(speed)
                 haptic(c, Haptics.MEDIUM)
             }
         })
         root.setOnTouchListener { _, ev ->
+            val kernel = c.kernel
             when (ev.actionMasked) {
                 MotionEvent.ACTION_DOWN -> { downX = ev.x; downY = ev.y; mode = 0 }
                 MotionEvent.ACTION_MOVE -> if (longPressing) {
@@ -285,27 +299,43 @@ class NativePlayerActivity : AppCompatActivity() {
         else -> ""
     }
 
+    private fun buildSpecificKernel(k: KernelSelection.Kernel, hwDecode: Boolean): PlayerKernel? {
+        if (!kernelAvailable(k)) return null
+        return try {
+            when (k) {
+                KernelSelection.Kernel.MPV -> MpvKernel(this, hwDecode)
+                KernelSelection.Kernel.MDK -> MdkKernel(this, hwDecode)
+                KernelSelection.Kernel.EXO -> ExoKernel(this)
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
     /**
      * PlaybackConfig.kernel 'mpv' / 'mdk' builds that kernel; if its native library (or the glue) cannot be loaded, or the
      * player cannot be created, the page falls back to Exo and says so once. All three share the same controls
      * ([PlayerControlsView]) and panels, so the page looks and works the same whatever the kernel.
      */
-    private fun createKernel(config: PlaybackConfig): PlayerKernel {
+    private fun createKernel(config: PlaybackConfig): Pair<PlayerKernel, KernelSelection.Kernel> {
         val choice = KernelSelection.choose(config.kernel, ::kernelAvailable, ::kernelUnavailableReason)
         try {
             when (choice.kernel) {
-                KernelSelection.Kernel.MPV -> return MpvKernel(this, config.hwDecode)
-                KernelSelection.Kernel.MDK -> return MdkKernel(this, config.hwDecode)
+                KernelSelection.Kernel.MPV -> return MpvKernel(this, config.hwDecode) to KernelSelection.Kernel.MPV
+                KernelSelection.Kernel.MDK -> return MdkKernel(this, config.hwDecode) to KernelSelection.Kernel.MDK
                 KernelSelection.Kernel.EXO -> choice.notice?.let { Toast.makeText(this, it, Toast.LENGTH_LONG).show() }
             }
         } catch (e: Throwable) {
             Toast.makeText(this, KernelSelection.fallbackNotice(choice.kernel, e.message), Toast.LENGTH_LONG).show()
         }
-        return ExoKernel(this)
+        return ExoKernel(this) to KernelSelection.Kernel.EXO
     }
 
     // -- menus and panels (OBSERVED in UZN 1.2.0 on the phone, 2026-11-11) ------------------------------------------------
     private var controls: PlayerControlsView? = null
+    private var settingsPanelOpen = false
+    private var lastSettingsKernel = ""
+    private var settingsScrollRef: android.widget.ScrollView? = null
 
     private fun notice(message: String) { controls?.showNotice(message) }
 
@@ -760,6 +790,7 @@ class NativePlayerActivity : AppCompatActivity() {
     private fun showSettings(c: PlayerController, scrollY: Int = 0) {
         val v = controls ?: return
         val ui = v.ui
+        lastSettingsKernel = c.activeKernelId
         lateinit var scroll: android.widget.ScrollView
         scroll = v.showPanel { list ->
             var card: LinearLayout? = null
@@ -769,21 +800,21 @@ class NativePlayerActivity : AppCompatActivity() {
                     card = ui.card().also { list.addView(it, LinearLayout.LayoutParams(-1, -2)) }
                 }
                 is PlayerSettings.Item.Toggle -> {
-                    val sw = SwitchView(this, ui.accent, item.get(c.playbackConfig)) { on ->
+                    val sw = SwitchView(this, ui.accent, item.get(c.effectivePlaybackConfig)) { on ->
                         haptic(c, Haptics.SELECTION)
-                        if (item.get(c.playbackConfig) != on) applySetting(c, item.set(c.playbackConfig, on))
+                        if (item.get(c.effectivePlaybackConfig) != on) applySetting(c, item.set(c.effectivePlaybackConfig, on))
                     }
                     ui.addRow(card!!, ui.row(item.icon, item.title, item.subtitle, sw).also { r -> r.setOnClickListener { sw.toggle() } })
                 }
                 is PlayerSettings.Item.Option -> {
-                    val sel = item.selected(c.playbackConfig)
+                    val sel = item.selected(c.effectivePlaybackConfig)
                     val row = ui.row(item.icon, item.title, null, if (sel) ui.icon(Ic.CHECK, 16f, ui.accent) else null, item.rotateIcon)
                     row.findViewWithTag<TextView>("icon")?.setTextColor(if (sel) ui.accent else 0xD9FFFFFF.toInt())
                     row.findViewWithTag<TextView>("title")?.let { t -> if (!sel) t.setTextColor(0xD9FFFFFF.toInt()) else t.typeface = android.graphics.Typeface.DEFAULT_BOLD }
                     row.setOnClickListener {
-                        if (item.selected(c.playbackConfig)) return@setOnClickListener
+                        if (item.selected(c.effectivePlaybackConfig)) return@setOnClickListener
                         haptic(c, Haptics.SELECTION)
-                        val next = item.select(c.playbackConfig)
+                        val next = item.select(c.effectivePlaybackConfig)
                         if (item.key.startsWith(PlayerSettings.KERNEL)) {
                             val k = KernelSelection.parse(next.kernel)
                             if (!kernelAvailable(k)) {
@@ -798,10 +829,10 @@ class NativePlayerActivity : AppCompatActivity() {
                     ui.addRow(card!!, row)
                 }
                 is PlayerSettings.Item.Stepper -> {
-                    val value = ui.text(item.value(c.playbackConfig), 13f).apply { gravity = Gravity.CENTER; minWidth = ui.dp(46) }
+                    val value = ui.text(item.value(c.effectivePlaybackConfig), 13f).apply { gravity = Gravity.CENTER; minWidth = ui.dp(46) }
                     fun button(code: Int, change: (PlaybackConfig) -> PlaybackConfig?) = ui.circleButton(code, 26f, 16f, 0x29FFFFFF).also { b ->
                         b.setOnClickListener {
-                            val next = change(c.playbackConfig) ?: return@setOnClickListener
+                            val next = change(c.effectivePlaybackConfig) ?: return@setOnClickListener
                             haptic(c, Haptics.SELECTION)
                             applySetting(c, next)
                             value.text = item.value(next)
@@ -820,11 +851,17 @@ class NativePlayerActivity : AppCompatActivity() {
                 }
             }
         }
+        settingsPanelOpen = true
+        settingsScrollRef = scroll
+        v.onPanelClosed = {
+            settingsPanelOpen = false
+            settingsScrollRef = null
+        }
         if (scrollY > 0) scroll.post { scroll.scrollTo(0, scrollY) }
     }
 
     private fun applySetting(c: PlayerController, next: PlaybackConfig) {
-        val old = c.playbackConfig
+        val old = c.effectivePlaybackConfig
         if (PlayerSettings.needsReload(old, next)) { reloadWith(c, next); return }
         c.updatePlayback(next)
         if (old.isPriorityLandscape != next.isPriorityLandscape) applyOrientation(next)

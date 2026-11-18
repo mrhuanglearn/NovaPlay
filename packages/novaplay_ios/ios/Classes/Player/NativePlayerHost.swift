@@ -140,8 +140,11 @@ final class NativePlayerHost: NativePlayerHostApi {
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
       // Cleanly close any existing session (e.g. a leftover PiP session) before presenting the new one
+      if let prevVC = self.activeViewController, prevVC.presentingViewController != nil {
+        prevVC.dismiss(animated: false)
+      }
       if let prev = self.activeController, !prev.isClosed {
-        prev.close(completed: false, dismissVC: true)
+        prev.close(completed: false, dismissVC: false)
       }
       self.removeParkedVideoViewHost()
       self.pendingForegroundDismissVC = nil
@@ -165,8 +168,10 @@ final class NativePlayerHost: NativePlayerHostApi {
               let isActive = UIApplication.shared.applicationState == .active
               if !isActive {
                 self?.pendingForegroundDismissVC = vc
+                vc.dismiss(animated: false)
+              } else if !vc.isExitingPlayer {
+                vc.exitPlayerSmoothly(completed: true)
               }
-              vc.dismiss(animated: isActive)
             }
           }
         }

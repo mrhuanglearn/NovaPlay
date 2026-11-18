@@ -970,6 +970,9 @@ class AppLocalizationsEn extends AppLocalizations {
   String get homeSiteWebsite => 'Web page';
 
   @override
+  String get homeSiteLocate => 'Locate current site';
+
+  @override
   String get homeSiteUnlock => 'Unlock sites';
 
   @override

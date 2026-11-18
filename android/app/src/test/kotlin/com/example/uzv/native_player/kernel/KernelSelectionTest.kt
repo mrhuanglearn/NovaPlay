@@ -35,4 +35,11 @@ class KernelSelectionTest {
         assertEquals("MDK kernel unavailable, using Exo (libmdk.so is only shipped for arm64-v8a)", m.notice)
         assertEquals("MPV kernel unavailable, using Exo", KernelSelection.fallbackNotice(Kernel.MPV, " "))
     }
+
+    @Test
+    fun runtimeFallbackOrderTriesEveryOtherKernelOnce() {
+        assertEquals(listOf(Kernel.MPV, Kernel.MDK), KernelSelection.fallbackOrder(Kernel.EXO))
+        assertEquals(listOf(Kernel.EXO, Kernel.MDK), KernelSelection.fallbackOrder(Kernel.MPV))
+        assertEquals(listOf(Kernel.MPV, Kernel.EXO), KernelSelection.fallbackOrder(Kernel.MDK))
+    }
 }
