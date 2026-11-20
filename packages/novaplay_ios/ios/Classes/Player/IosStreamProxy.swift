@@ -828,7 +828,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     req.httpMethod = "GET"
     req.timeoutInterval = 5.5
     applyEffectiveHeaders(for: session, into: &req)
-    let rangeValue: String? = useRangeHeader ? "bytes=0-1023" : nil
+    let rangeValue: String? = useRangeHeader ? "bytes=0-8191" : nil
     if let r = rangeValue {
       req.setValue(r, forHTTPHeaderField: "Range")
       req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
@@ -862,12 +862,12 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
           if capturedData.isEmpty && IosHlsRewriter.looksLikeHlsPlaylist(chunk) {
             isLikelyHlsResponse = true
           }
-          let capBytes = isLikelyHlsResponse ? (1024 * 1024) : 1024
+          let capBytes = isLikelyHlsResponse ? (1024 * 1024) : 8192
           let needed = max(0, capBytes - capturedData.count)
           if needed > 0 {
             capturedData.append(chunk.prefix(needed))
           }
-          if !isLikelyHlsResponse && capturedData.count >= 1024 {
+          if !isLikelyHlsResponse && capturedData.count >= 8192 {
             shouldStopNow = true
           } else if isLikelyHlsResponse && capturedData.count >= capBytes {
             shouldStopNow = true
@@ -1003,7 +1003,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
         return .avi
       }
       if bytes.count >= 8, let box = String(bytes: bytes[4..<8], encoding: .ascii) {
-        if ["ftyp", "moof", "mdat", "wide", "free", "skip", "styp", "pnot"].contains(box) {
+        if ["ftyp", "moov", "moof", "mdat", "wide", "free", "skip", "styp", "pnot", "uuid"].contains(box) {
           return .mp4
         }
       }

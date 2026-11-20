@@ -189,10 +189,11 @@ final class NativePlayerHost: NativePlayerHostApi {
         controller.close(completed: false, dismissVC: false)
         return
       }
+      // request the source while the present animation runs instead of after it (~0.3 s earlier first frame)
       presenter.present(playerVC, animated: true) { [weak self] in
-        controller.start()
         self?.syncIdleTimer(forceReassert: true)
       }
+      controller.start()
       self.syncIdleTimer()
     }
   }

@@ -7,6 +7,7 @@ import android.net.Uri
 import android.view.View
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
@@ -90,6 +91,9 @@ class ExoKernel(private val context: Context) : PlayerKernel {
         .setWakeMode(C.WAKE_MODE_NETWORK)
         .build()
     private var currentUrl = ""
+    /** Last load, so an extension-less URL that turned out to be HLS can be opened again as HLS. */
+    private var lastLoadArgs: (() -> Unit)? = null
+    private var forceHls = false
     private val playerView = PlayerView(context).also {
         it.player = player
         it.useController = false
@@ -128,6 +132,15 @@ class ExoKernel(private val context: Context) : PlayerKernel {
             }
 
             override fun onPlayerError(error: PlaybackException) {
+                // Exo picks HLS only from a .m3u8 path; an extension-less playlist lands in the progressive extractor
+                if (error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED && !forceHls) {
+                    val retry = lastLoadArgs
+                    if (retry != null) {
+                        forceHls = true
+                        retry()
+                        return
+                    }
+                }
                 listener?.onError("ExoPlayer 播放失败 [${error.errorCodeName}] ${error.message.orEmpty()}".trim(), error.errorCode)
             }
         })
@@ -176,6 +189,8 @@ class ExoKernel(private val context: Context) : PlayerKernel {
         }
 
     override fun load(url: String, audioUrl: String?, headers: Map<String, String>, startMs: Long, subtitles: List<SubtitleOption>) {
+        if (url != currentUrl) forceHls = false
+        lastLoadArgs = { load(url, audioUrl, headers, startMs, subtitles) }
         // Overrides outlive the media item. Drop them so "auto" really is the state of the new item; the "text off"
         // switch (setTrackTypeDisabled) is kept on purpose: someone who turned subtitles off wants them off next episode too.
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
@@ -205,7 +220,9 @@ class ExoKernel(private val context: Context) : PlayerKernel {
                 .build()
                 .also { first = false }
         }
-        val item = MediaItem.Builder().setUri(url).setSubtitleConfigurations(sidecars).build()
+        val item = MediaItem.Builder().setUri(url).setSubtitleConfigurations(sidecars)
+            .apply { if (forceHls) setMimeType(MimeTypes.APPLICATION_M3U8) }
+            .build()
         val video: MediaSource = factory.createMediaSource(item)
         // DASH sources with a separate audio stream: merge so the video is not silent (changelog 1.1.0).
         val source = if (audioUrl.isNullOrEmpty()) video else MergingMediaSource(video, factory.createMediaSource(MediaItem.fromUri(audioUrl)))

@@ -314,6 +314,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
   private(set) var nominalFps: Double?
   private(set) var state: String = "idle"
   private var isSeeking: Bool = false
+  private var seekSerial: UInt64 = 0
   private var shouldAutoPlay: Bool = true
 
   private var lastBytesTotal: Int64 = -1
@@ -612,7 +613,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     timeObserver = avPlayer.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
       guard let self = self, self.isUsingAvPlayer else { return }
       let sec = CMTimeGetSeconds(time)
-      if sec.isFinite && sec >= 0 {
+      // while a seek is pending currentTime() still reports the old spot; keep the target so the thumb doesn't jump back
+      if sec.isFinite && sec >= 0 && !self.isSeeking {
         self.positionMs = Int64(sec * 1000.0)
       }
       if let item = self.avPlayer.currentItem {
@@ -707,6 +709,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     selectedAudioIdx = -1
     shouldAutoPlay = true
     isSeeking = false
+    seekSerial &+= 1
     didAutoFallbackFromAv = false
     didAutoFallbackToVlc = false
     vlcRetriedDirect = false
@@ -919,10 +922,13 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         ) ?? defaultProxied
         self.activeLoad?.proxiedUrl = resolvedProxyURL
 
-        if probeRes.container.requiresVlc, let fb = self.preferredFallbackBackendAfterAvPlayer() {
+        // AVPlayer needs an extension or a real MIME type; a URL with neither whose bytes we couldn't identify goes
+        // straight to MPV/VLC (FFmpeg probes content) instead of failing in AVPlayer first
+        let unidentified = probeRes.container == .unknown && IosStreamProxy.inferredKind(for: probeRes.finalURL ?? mediaURL) == "auto"
+        if probeRes.container.requiresVlc || unidentified, let fb = self.preferredFallbackBackendAfterAvPlayer() {
           self.didAutoFallbackFromAv = true
           if fb == "vlc" { self.didAutoFallbackToVlc = true }
-          let fmtLabel = probeRes.container.rawValue.uppercased()
+          let fmtLabel = unidentified ? IosPlayerUiText.t("未知", "unknown") : probeRes.container.rawValue.uppercased()
           let fbLabel = fb.uppercased()
           self.switchActiveBackendTemporarily(
             to: fb,
@@ -1542,9 +1548,11 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
           if startMs > 0 {
             let target = CMTime(value: startMs, timescale: 1000)
             self.isSeeking = true
-            it.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+            self.seekSerial &+= 1
+            let serial = self.seekSerial
+            it.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
               DispatchQueue.main.async {
-                guard let self = self, self.isUsingAvPlayer else { return }
+                guard let self = self, self.isUsingAvPlayer, finished, serial == self.seekSerial else { return }
                 self.isSeeking = false
                 if self.shouldAutoPlay {
                   self.play()
@@ -1706,10 +1714,9 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
       avPlayer.defaultRate = speed
       secondaryAudioPlayer?.defaultRate = speed
     }
-    avPlayer.play()
-    if abs(speed - 1.0) > 0.001 {
-      avPlayer.rate = speed
-    }
+    // like ExoPlayer: start as soon as the first frames are there instead of letting AVPlayer
+    // pre-buffer until it predicts no stall (automaticallyWaits… still handles later stalls)
+    avPlayer.playImmediately(atRate: speed)
     if let sec = secondaryAudioPlayer {
       sec.seek(to: avPlayer.currentTime(), toleranceBefore: .zero, toleranceAfter: .zero)
       sec.play()
@@ -1766,9 +1773,12 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     switch activeKernelId {
     case "avplayer":
       let target = CMTime(value: clamped, timescale: 1000)
-      avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] _ in
+      seekSerial &+= 1
+      let serial = seekSerial
+      avPlayer.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero) { [weak self] finished in
         DispatchQueue.main.async {
-          guard let self = self, self.isUsingAvPlayer else { return }
+          // a newer seek cancels this one (finished == false); only the latest seek may end the buffering state
+          guard let self = self, self.isUsingAvPlayer, finished, serial == self.seekSerial else { return }
           self.isSeeking = false
           if let sec = self.secondaryAudioPlayer {
             sec.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
@@ -1799,7 +1809,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         if self.shouldAutoPlay {
           self.vlcPlayer?.play()
           self.vlcPlayer?.rate = self.speed
-          self.updateState("playing")
+          // stay "buffering": VLC's own .playing / time-changed callback flips it once frames actually flow
         } else {
           self.updateState("paused")
         }
