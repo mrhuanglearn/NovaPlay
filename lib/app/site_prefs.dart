@@ -123,9 +123,9 @@ final sitePrefsProvider = AsyncNotifierProvider<SitePrefsNotifier, SitePrefs>(Si
 /// Whether locked sites are shown right now: the same lock as the subscriptions (one 解锁 opens both).
 final sitesUnlockedProvider = Provider<bool>((ref) => ref.watch(subscriptionsUnlockedProvider));
 
-/// The sites listed in 站点设置: every site except the locked ones while the lock is closed.
+/// The sites listed in 站点设置: every browsable site (excluding type 4 push agents) except the locked ones while the lock is closed.
 final settingsSitesProvider = Provider<List<SpiderSite>>((ref) {
-  final sites = ref.watch(homeSitesProvider);
+  final sites = ref.watch(homeSitesProvider).where((s) => s.type != 4).toList();
   final prefs = ref.watch(sitePrefsProvider).valueOrNull ?? const SitePrefs();
   if (ref.watch(sitesUnlockedProvider)) return sites;
   return [

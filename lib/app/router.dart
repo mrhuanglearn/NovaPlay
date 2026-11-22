@@ -85,8 +85,13 @@ final routerProvider = Provider<GoRouter>((ref) {
         builder: (c, s) => DetailScreen(vodId: s.uri.queryParameters['id']!, siteKey: s.uri.queryParameters['site']),
       ),
       GoRoute(
-          path: '/video/sub-category',
-          builder: (c, s) => SubCategoryScreen(typeId: s.uri.queryParameters['type'] ?? '')),
+        path: '/video/sub-category',
+        builder: (c, s) => SubCategoryScreen(
+          typeId: s.uri.queryParameters['type'] ?? '',
+          title: s.uri.queryParameters['name'],
+          siteKey: s.uri.queryParameters['site'],
+        ),
+      ),
       GoRoute(path: '/tracking/manage', builder: (c, s) => const TrackingManageScreen()),
       GoRoute(
         path: '/tmdb/search',

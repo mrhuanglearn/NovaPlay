@@ -82,6 +82,20 @@ Widget vodPoster(VodItem item) => _poster(item);
 
 void _openVod(BuildContext context, VodItem item) {
   AppHaptics.selection();
+  if (item.id.startsWith('uzv-web:')) {
+    context.push(Uri(path: '/website', queryParameters: {'url': item.id.substring('uzv-web:'.length)}).toString());
+    return;
+  }
+  final folderCat = item.folderCategoryId;
+  if (folderCat != null) {
+    final title = (item.cateName ?? item.name).trim();
+    context.push(Uri(path: '/video/sub-category', queryParameters: {
+      'type': folderCat,
+      if (title.isNotEmpty) 'name': title,
+      if (item.siteKey != null) 'site': item.siteKey!,
+    }).toString());
+    return;
+  }
   // OBSERVED (UZN, 2026-11-13): an item of an index site (`indexs: 1`, e.g. 「荐」豆瓣) opens 搜索 with its name; the
   // site has no detail of its own (its `detail` answers `{}`, so UZV showed 未找到 for every poster before).
   if (_indexSiteOf(context, item) != null) {

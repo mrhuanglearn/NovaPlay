@@ -11,7 +11,8 @@ class SpiderSite {
       required this.api,
       this.type = 3,
       this.searchable = true,
-      this.indexs = false});
+      this.indexs = false,
+      this.homeUrl});
 
   factory SpiderSite.fromJson(Map<String, dynamic> j) => SpiderSite(
         key: '${j['key']}',
@@ -20,6 +21,7 @@ class SpiderSite {
         type: int.tryParse('${j['type']}') ?? 3,
         searchable: '${j['searchable'] ?? 1}' != '0',
         indexs: '${j['indexs'] ?? 0}' == '1',
+        homeUrl: j['homeUrl'] as String?,
       );
 
   final String key;
@@ -31,6 +33,9 @@ class SpiderSite {
   /// `indexs: 1`: an index site (OBSERVED: 「荐」豆瓣 of a catpaw subscription). Its posters are recommendations with no
   /// detail of their own; the original opens 搜索 with the title when one is tapped.
   final bool indexs;
+
+  /// Optional webpage URL for `type == 7` webpage entries (e.g. `douer` Apple Music entry).
+  final String? homeUrl;
 }
 
 class HomeData {
@@ -151,29 +156,50 @@ class SpiderApi {
 
   Future<void> init(SpiderSite site) => _post(site, 'init');
 
+  String _webpageUrl(SpiderSite site) =>
+      (site.homeUrl != null && site.homeUrl!.isNotEmpty) ? site.homeUrl! : '$baseUrl${site.api}/web';
+
+  VodItem _webpageCard(SpiderSite site) =>
+      VodItem(id: 'uzv-web:${_webpageUrl(site)}', name: '打开 ${site.name}', remarks: '点击打开网页', siteKey: site.key);
+
   /// OBSERVED request bodies of the original (2026-11-09, logged by a mock subscription): `home` is posted with
   /// `{"filter":true}`; `category` with `{"id","page","filter":<any filter chosen>,"filters":{key:value}}`, where a
   /// chosen value is sent even when it equals the filter's `init`, and 全部 (an empty value) removes the key.
   Future<HomeData> home(SpiderSite site) async {
-    final j = await _post(site, 'home', {'filter': true});
-    final filterMap = (j['filters'] as Map?)?.cast<String, dynamic>();
-    return HomeData(
-      categories: ((j['class'] as List?) ?? const [])
-          .whereType<Map>()
-          .map((e) => VodCategory.fromJson(e.cast<String, dynamic>(), filterMap: filterMap))
-          .toList(),
-      featured: ((j['list'] as List?) ?? const [])
-          .whereType<Map>()
-          .map((e) => VodItem.fromJson(e.cast<String, dynamic>(), siteKey: site.key))
-          .toList(),
-    );
+    try {
+      final j = await _post(site, 'home', {'filter': true});
+      final filterMap = (j['filters'] as Map?)?.cast<String, dynamic>();
+      return HomeData(
+        categories: ((j['class'] as List?) ?? const [])
+            .whereType<Map>()
+            .map((e) => VodCategory.fromJson(e.cast<String, dynamic>(), filterMap: filterMap))
+            .toList(),
+        featured: ((j['list'] as List?) ?? const [])
+            .whereType<Map>()
+            .map((e) => VodItem.fromJson(e.cast<String, dynamic>(), siteKey: site.key))
+            .toList(),
+      );
+    } on DioException catch (e) {
+      if (site.type == 7 && e.response?.statusCode == 404) {
+        return HomeData(categories: [VodCategory(id: 'web', name: site.name)], featured: [_webpageCard(site)]);
+      }
+      rethrow;
+    }
   }
 
   Future<PagedVods> category(SpiderSite site, String typeId,
-          {int page = 1, Map<String, String> filters = const {}}) async =>
-      PagedVods.fromJson(
+      {int page = 1, Map<String, String> filters = const {}}) async {
+    try {
+      return PagedVods.fromJson(
           await _post(site, 'category', {'id': typeId, 'page': page, 'filter': filters.isNotEmpty, 'filters': filters}),
           siteKey: site.key);
+    } on DioException catch (e) {
+      if (site.type == 7 && e.response?.statusCode == 404) {
+        return PagedVods(items: [_webpageCard(site)], page: 1, pageCount: 1);
+      }
+      rethrow;
+    }
+  }
 
   Future<VodDetail?> detail(SpiderSite site, String vodId) async {
     final j = await _post(site, 'detail', {'id': vodId});

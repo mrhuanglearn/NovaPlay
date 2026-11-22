@@ -22,6 +22,7 @@ import 'package:uzv_reimpl/ui/site_switch_sheet.dart';
 const _douban = SpiderSite(key: 'nodejs_douban', name: '「荐」豆瓣', api: '/spider/douban/3', indexs: true);
 const _a = SpiderSite(key: 'a', name: '「盘」玩偶', api: '/spider/a/3');
 const _b = SpiderSite(key: 'b', name: '「盘」木偶', api: '/spider/b/3');
+const _push = SpiderSite(key: 'nodejs_push', name: '「推」推送', api: '/spider/push/4', type: 4);
 
 void main() {
   test('SpiderSite reads indexs from /config', () {
@@ -34,21 +35,28 @@ void main() {
 
   setUp(() => settings = _MemoryStore());
 
-  Future<ProviderContainer> pump(WidgetTester tester) async {
+  Future<ProviderContainer> pump(WidgetTester tester, {List<SpiderSite> sites = const [_douban, _a, _b], _FakeApi? api}) async {
     final container = ProviderContainer(overrides: [
       settingsStoreProvider.overrideWithValue(settings),
       subscriptionsProvider.overrideWith((ref) async => const [Subscription(key: 'mock', name: 'catpaw')]),
       catpawRuntimeProvider.overrideWith((ref) async => SpiderRuntime(
           subscription: const Subscription(key: 'mock', name: 'catpaw'),
-          api: _FakeApi(),
-          sites: const [_douban, _a, _b])),
+          api: api ?? _FakeApi(),
+          sites: sites)),
     ]);
     addTearDown(container.dispose);
     router = GoRouter(routes: [
       GoRoute(path: '/', builder: (c, s) => const HomeScreen()),
       GoRoute(path: '/search', builder: (c, s) => Text('search:${s.uri.queryParameters['q']}')),
       GoRoute(path: '/website', builder: (c, s) => Text('website:${s.uri.queryParameters['url']}')),
-      GoRoute(path: '/video/detail', builder: (c, s) => Text('detail:${s.uri.queryParameters['id']}')),
+      GoRoute(
+        path: '/video/sub-category',
+        builder: (c, s) => Text('subcat:${s.uri.queryParameters['type']}|${s.uri.queryParameters['name']}|${s.uri.queryParameters['site']}'),
+      ),
+      GoRoute(
+        path: '/video/detail',
+        builder: (c, s) => Text('detail:${s.uri.queryParameters['id']}|${s.uri.queryParameters['site']}'),
+      ),
     ]);
     await tester.binding.setSurfaceSize(const Size(420, 900));
     addTearDown(() => tester.binding.setSurfaceSize(null));
@@ -86,7 +94,35 @@ void main() {
     await tester.pumpAndSettle();
     await tester.tap(find.text('a-影片'));
     await tester.pumpAndSettle();
-    expect(find.text('detail:a1'), findsOneWidget);
+    expect(find.text('detail:a1|a'), findsOneWidget);
+  });
+
+  testWidgets('folder item opens sub-category and uzv-web item opens website', (tester) async {
+    await pump(tester, api: _FolderAndWebApi(), sites: const [_a]);
+    await tester.tap(find.text('网盘合集'));
+    await tester.pumpAndSettle();
+    expect(find.text('subcat:folder-7|网盘目录|a'), findsOneWidget);
+    router.pop();
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('打开 Apple Music'));
+    await tester.pumpAndSettle();
+    expect(find.text('website:https://am-4u2.pages.dev/'), findsOneWidget);
+  });
+
+  testWidgets('type 4 push site is hidden from 切换站点 but powers HomeScreen push button', (tester) async {
+    final c = await pump(tester, sites: const [_a, _push]);
+    expect(c.read(visibleHomeSitesProvider).map((s) => s.key), ['a']);
+    await openSheet(tester);
+    expect(find.text('「推」推送'), findsNothing);
+    Navigator.of(tester.element(find.byType(SiteSwitchSheet))).pop();
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byIcon(Icons.link));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.byType(TextField), 'https://pan.quark.cn/s/demo123');
+    await tester.tap(find.text('确定'));
+    await tester.pumpAndSettle();
+    expect(find.text('detail:https://pan.quark.cn/s/demo123|nodejs_push'), findsOneWidget);
   });
 
   testWidgets('切换站点 has 定位, 单列/双列, globe and gear; 双列 is kept in settings', (tester) async {
@@ -236,6 +272,16 @@ class _FakeApi extends SpiderApi {
         site.key == 'nodejs_douban'
             ? VodItem(id: '36847425', name: '可能的爱', siteKey: site.key)
             : VodItem(id: '${site.key}1', name: '${site.key}-影片', siteKey: site.key),
+      ], page: page, pageCount: 1);
+}
+
+class _FolderAndWebApi extends _FakeApi {
+  @override
+  Future<PagedVods> category(SpiderSite site, String typeId,
+          {int page = 1, Map<String, String> filters = const {}}) async =>
+      PagedVods(items: [
+        VodItem(id: 'raw', name: '网盘合集', tag: 'folder', cateId: 'folder-7', cateName: '网盘目录', siteKey: site.key),
+        VodItem(id: 'uzv-web:https://am-4u2.pages.dev/', name: '打开 Apple Music', siteKey: site.key),
       ], page: page, pageCount: 1);
 }
 

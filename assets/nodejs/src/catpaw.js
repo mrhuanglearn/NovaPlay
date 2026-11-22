@@ -123,13 +123,6 @@ async function resolveAvailablePort(requestedPort, reserved = new Set()) {
   });
 }
 
-function loadConfig(configPath) {
-  if (!configPath) return {};
-  try { delete require.cache[require.resolve(configPath)]; } catch { /* not cached */ }
-  const cfg = require(configPath);
-  return cfg && typeof cfg === 'object' && cfg.default ? cfg.default : cfg;
-}
-
 /**
  * @param {{bridge: object, workerEntryPath: string}} deps
  */
@@ -177,6 +170,9 @@ function createCatpawHost({ bridge, workerEntryPath }) {
         case WorkerMsg.result:
           emit(resultEvent({ action: msg.action, name, ok: !!msg.ok, error: msg.error || null }));
           if (msg.action === Action.start && !msg.ok) { dropInstance(name); report(); }
+          break;
+        case WorkerMsg.configLoaded:
+          status(`catpaw ${name}: config 已加载(${msg.keyCount} keys)`);
           break;
         case WorkerMsg.log:
           if (Array.isArray(msg.messages) && msg.messages.length > 0) {
@@ -230,9 +226,7 @@ function createCatpawHost({ bridge, workerEntryPath }) {
   async function start(name, scriptPath, configPath, port, enableNetLog, enableLog, env) {
     const dataDir = dataDirOf(name);
     fs.mkdirSync(dataDir, { recursive: true });
-    const config = loadConfig(configPath);
-    const keyCount = config && typeof config === 'object' ? Object.keys(config).length : 0;
-    status(`catpaw ${name}: config ${configPath ? `已加载(${keyCount} keys)` : '缺失(空 config 启动)'}`);
+    if (!configPath) status(`catpaw ${name}: config 缺失(空 config 启动)`);
     const tempDir = path.join(path.dirname(scriptPath), 'Temp');
     fs.mkdirSync(tempDir, { recursive: true });
     const extraDirs = [];
@@ -257,7 +251,7 @@ function createCatpawHost({ bridge, workerEntryPath }) {
       workerEntryPath,
       name,
       workerData: {
-        name, scriptPath, startArg: config, dataDir, port: resolvedPort, dartPort: dartServerPort, dartToken: dartServerToken,
+        name, scriptPath, configPath, dataDir, port: resolvedPort, dartPort: dartServerPort, dartToken: dartServerToken,
         env: env || {}, allowWriteDirs: [dataDir, tempDir, ...extraDirs], allowReadDirs: [path.dirname(scriptPath), ...extraDirs],
         redirectRoot: tempDir, enableNetLog: !!enableNetLog, enableLog: enableLog !== false,
       },
@@ -386,4 +380,4 @@ function createCatpawHost({ bridge, workerEntryPath }) {
   return { attach, handle, report, instances, idle, terminateAll };
 }
 
-module.exports = { createCatpawHost, loadConfig, resolveAvailablePort, readProcListeningPorts, DEFAULT_CATPAW_PORT };
+module.exports = { createCatpawHost, resolveAvailablePort, readProcListeningPorts, DEFAULT_CATPAW_PORT };

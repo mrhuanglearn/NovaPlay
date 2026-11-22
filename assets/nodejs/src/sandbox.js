@@ -113,11 +113,12 @@ function isInside(dir, target) {
 /**
  * Create a policy object.
  * @param {{allowWriteDirs?: string[], allowReadDirs?: string[], redirectRoot?: string|null, dataDir?: string|null,
- *          onRedirect?: (kind: 'write'|'read', from: string, to: string) => void}} cfg
+ *          installedConfigPath?: string|null, onRedirect?: (kind: 'write'|'read', from: string, to: string) => void}} cfg
  */
 function createPolicy(cfg = {}) {
   const writeDirs = (cfg.allowWriteDirs || []).map(normDir);
   const readDirs = (cfg.allowReadDirs || []).map(normDir);
+  const installedConfig = cfg.installedConfigPath ? normPath(cfg.installedConfigPath) : null;
   const redirectBase = cfg.redirectRoot
     ? path.join(cfg.redirectRoot, '_redirect')
     : cfg.dataDir ? path.join(cfg.dataDir, '_redirect') : null;
@@ -140,6 +141,8 @@ function createPolicy(cfg = {}) {
     const legacyDest = subpath !== target ? path.join(redirectRoot, target) : null;
 
     if (!isWrite && readDirs.some((d) => isInside(d, target))) {
+      // The installer owns this config; a stale runtime copy must not override the installed one.
+      if (target === installedConfig) return input;
       // Read-after-write overlay: if a spider wrote/updated a file inside allowReadDirs (e.g. __dirname/db.json),
       // subsequent reads across restarts must see the persisted file in _redirect rather than missing it in readDirs.
       if (pathExistsOriginal(dest)) return dest;

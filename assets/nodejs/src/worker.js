@@ -4,7 +4,7 @@
  * script expects.
  *
  * Observed contract (see ANALYSIS.md section "Node worker contract"):
- *  - workerData: name, scriptPath, startArg, startMode ('config' | 'ctx'), dataDir, port, dartPort, env,
+ *  - workerData: name, scriptPath, configPath, startArg, startMode ('config' | 'ctx'), dataDir, port, dartPort, env,
  *    allowWriteDirs, allowReadDirs, redirectRoot, enableNetLog, enableLog
  *  - env: NODE_PATH=dataDir, DEV_HTTP_PORT=port (or removed), plus caller supplied variables
  *  - globals: catServerFactory(handler), catDartServerPort(), DB_NAME, _catServers, _catDanmuServers
@@ -15,6 +15,8 @@
 const { parentPort, workerData } = require('worker_threads');
 const http = require('http');
 const https = require('https');
+const path = require('path');
+const Module = require('module');
 const { WorkerMsg, LoaderMsg, SUBSCRIPTION_DANMU_PORT } = require('./protocol');
 const { createPolicy, installFsPolicy } = require('./sandbox');
 const { installJitlessPolyfill } = require('./jitless_polyfill');
@@ -22,6 +24,7 @@ const { installJitlessPolyfill } = require('./jitless_polyfill');
 const {
   name,
   scriptPath,
+  configPath,
   startArg,
   startMode = 'config',
   dataDir,
@@ -105,6 +108,7 @@ const policy = createPolicy({
   allowReadDirs,
   redirectRoot,
   dataDir,
+  installedConfigPath: startMode === 'config' ? configPath : null,
   onRedirect: (kind, from, to) => {
     if (enableLog) post({ type: WorkerMsg.log, message: `[redirect] ${kind} ${from} -> ${to}` });
   },
@@ -348,13 +352,86 @@ async function reloadAll(entries, doneType, emptyError, opts = {}) {
   post({ type: doneType, ok: !firstError, error: firstError });
 }
 
+// Load subscription code only after the worker's file policy is installed.
+let startInput = startMode === 'config' && startArg === undefined ? {} : startArg;
+if (startMode === 'config' && configPath) {
+  try {
+    const config = require(configPath);
+    startInput = config && typeof config === 'object' && config.default ? config.default : config;
+    const keyCount = startInput && typeof startInput === 'object' ? Object.keys(startInput).length : 0;
+    post({ type: WorkerMsg.configLoaded, keyCount });
+  } catch (e) {
+    post({ type: WorkerMsg.result, action: 'start', ok: false, error: 'require config failed: ' + ((e && e.message) || e) });
+    process.exit(1);
+  }
+} else if (startMode === 'ctx' && startArg && typeof startArg === 'object') {
+  startInput = { ...startArg, log: (...a) => console.log(`[${name}]`, ...a) };
+}
+
+// Upgrade legacy remote CatPaw bundles in memory so outdated hosted scripts work with current pan/site layouts.
+function patchLegacyCatpawBundle(src) {
+  if (typeof src !== 'string' || !src.includes('function jbe(') || !src.includes('function Cg(')) return src;
+  let out = src;
+  out = out.replace(
+    '[^\\s"\'<>)]*/gi;function jbe(e){let t=[];for(let n of ue().scanPanShares(e))t.push(n.passcode?`${n.url} \\u63D0\\u53D6\\u7801:${n.passcode}`:n.url);let r=mt(e);r("a[href]").each((n,s)=>{let i=String(r(s).attr("href")??"").trim(),o=r(s).parent().text().trim()||r(s).text().trim();i&&ra.test(i)&&t.push(`${o} ${i}`),ra.lastIndex=0});for(let n of e.match(ra)||[])t.push(n);return Array.from(new Set(t))}',
+    '[^\\s"\'<>\\\\)]*/gi;function jbe(e){e=String(e??"").replace(/\\\\\\//g,"/").replace(/\\\\"/g,\'"\').replace(/\\\\u0026/gi,"&").replace(/&amp;/gi,"&");let t=[];for(let n of ue().scanPanShares(e)){let u=String(n.url??"").trim().replace(/\\|\\|\\d+$/,"");u&&t.push(n.passcode?`${u} \\u63D0\\u53D6\\u7801:${n.passcode}`:u)}let r=mt(e);r("a[href],[data-url],[data-clipboard-text]").each((n,s)=>{let i=String(r(s).attr("data-url")??r(s).attr("data-clipboard-text")??r(s).attr("href")??"").trim().replace(/\\|\\|\\d+$/,""),o=r(s).parent().text().trim()||r(s).text().trim();i&&ra.test(i)&&t.push(o?`${o} ${i}`:i),ra.lastIndex=0});for(let n of e.match(ra)||[]){let u=n.trim().replace(/\\|\\|\\d+$/,"");u&&t.push(u)}return Array.from(new Set(t))}'
+  );
+  out = out.replace(
+    'function Cg(e,t,r){let n=mt(e),s=new Set,i=[];return n("a[href]").each((o,a)=>{let c=String(n(a).attr("href")??"").trim();if(!c||!r.test(c))return;let u=c;try{u=Yc(t,c),new URL(u)}catch{return}let l=ug(t,u);if(s.has(l))return;',
+    'function Cg(e,t,r){let n=mt(e),s=new Set,i=[];if(n("a.block.h-full.flex.flex-col[href]").length>0){n("a.block.h-full.flex.flex-col[href]").each((o,a)=>{let c=String(n(a).attr("href")??"").trim();if(!c)return;let u=c;try{u=Yc(t,c),new URL(u)}catch{return}let l=ug(t,u),f=n(a).find("h3").first().text().replace(/\\s+/g," ").trim();if(!l||!f||!r.test(l)||s.has(l))return;let p=n(a).find("img").first()[0],m=Pr(t,$o(a.attribs,p?.attribs))||fj,g=n(a).find(".tag-container .tag").map((_,x)=>n(x).text().replace(/\\s+/g," ").trim()).get().filter(Boolean).slice(0,2).join(" \\xB7 ");s.add(l),i.push({vod_id:l,vod_name:f,vod_pic:m,vod_remarks:g})});if(i.length>0)return i.slice(0,60)}return n("a[href]").each((o,a)=>{let c=String(n(a).attr("href")??"").trim();if(!c||/^(?:javascript:|#|mailto:|tel:)/i.test(c))return;let u=c;try{u=Yc(t,c),new URL(u)}catch{return}let l=ug(t,u);if((!r.test(c)&&!r.test(l))||s.has(l))return;'
+  );
+  out = out.replace(
+    'let u=c.startsWith("http")?new URL(c).pathname+new URL(c).search:c.startsWith("/")?c:`${e.defaultItemUrlPrefix||"/detail/"}${encodeURIComponent(c)}.html`',
+    'let u=c.startsWith("http")?new URL(c).pathname+new URL(c).search:c.startsWith("/")?c:e.defaultItemUrlPrefix==="/"&&/^\\d+$/.test(c)?`/${c}`:`${e.defaultItemUrlPrefix||"/detail/"}${encodeURIComponent(c)}.html`'
+  );
+  out = out.replace(
+    'g=f("h1, .module-info-heading h1, .stui-content__detail .title, title").first().text().replace(/\\s+/g," ").trim()||c',
+    'g=f(".x-dbjs-title, h1, .module-info-heading h1, .stui-content__detail .title").first().text().replace(/\\s+/g," ").trim()||f("title").first().text().replace(/\\s+/g," ").trim()||c'
+  );
+  out = out.replace(
+    'y=f(".module-item-pic img, .stui-content__thumb img, article img, img").first()[0]',
+    'y=f(".x-dbjs-poster img")[0]||f("#js-poster-img")[0]||f(".module-item-pic img, .stui-content__thumb img")[0]||f("article img")[0]||f("img")[0]'
+  );
+  out = out.replace(
+    'key:"pomo",name:"\\u300C\\u76D8\\u300DPomo",urls:["https://pomo.mom"],classes:[{type_id:"all",type_name:"\\u5168\\u90E8"},{type_id:"huayurm",type_name:"\\u534E\\u8BED\\u70ED\\u95E8"},{type_id:"jiating",type_name:"\\u5BB6\\u5EAD\\u5F71\\u9662"},{type_id:"donghuadadiany",type_name:"\\u52A8\\u753B\\u7535\\u5F71"},{type_id:"dianshiju",type_name:"\\u5267\\u96C6"},{type_id:"paihangbang",type_name:"TOP250"}]',
+    'key:"pomo",name:"\\u300C\\u76D8\\u300DPomo",urls:["https://pomo.mom"],classes:[{type_id:"all",type_name:"\\u6700\\u65B0\\u4E0A\\u7EBF"},{type_id:"huayurm",type_name:"\\u534E\\u8BED\\u70ED\\u95E8"},{type_id:"jiating",type_name:"\\u5BB6\\u5EAD\\u5F71\\u9662"},{type_id:"donghuadadiany",type_name:"\\u52A8\\u753B\\u7535\\u5F71"},{type_id:"lengmenjiapian",type_name:"\\u51B7\\u95E8\\u4F73\\u7247"},{type_id:"paihangbang",type_name:"\\u699C\\u5355\\u4F73\\u4F5C"},{type_id:"bluray",type_name:"\\u84DD\\u5149\\u539F\\u76D8"},{type_id:"dianshiju",type_name:"\\u7CBE\\u5F69\\u5267\\u96C6"}]'
+  );
+  out = out.replace(
+    'classes:[{type_id:"1",type_name:"\\u7535\\u5F71"},{type_id:"2",type_name:"\\u5267\\u96C6"},{type_id:"3",type_name:"\\u65E5\\u97E9\\u5267"},{type_id:"4",type_name:"\\u6B27\\u7F8E\\u5267"},{type_id:"15",type_name:"\\u52A8\\u6F2B"}],categoryPath:(e,t)=>`/type/${encodeURIComponent(e)}-${t}.html`,searchPath:(e,t)=>`/search/-------------.html?wd=${encodeURIComponent(e)}&page=${t}`',
+    'classes:[{type_id:"1",type_name:"\\u7535\\u5F71"},{type_id:"2",type_name:"\\u5267\\u96C6"},{type_id:"3",type_name:"\\u7EFC\\u827A"},{type_id:"4",type_name:"\\u52A8\\u6F2B"},{type_id:"15",type_name:"\\u65E5\\u97E9\\u5267"},{type_id:"16",type_name:"\\u6B27\\u7F8E\\u5267"}],categoryPath:(e,t)=>`/show/${encodeURIComponent(e)}--------${t}---.html`,searchPath:(e,t)=>`/search/${encodeURIComponent(e)}----------${t}---.html`'
+  );
+  out = out.replaceAll('["https://pan1.me","https://123panfx.com"]', '["https://123panfx.com","https://pan1.me"]');
+  return out;
+}
+
 // --- load the script -------------------------------------------------------------------------
 let mod;
+const fsModule = require('fs');
+const resolvedScriptPath = scriptPath ? path.resolve(String(scriptPath)) : '';
+let realScriptPath = resolvedScriptPath;
+try {
+  if (resolvedScriptPath) realScriptPath = fsModule.realpathSync(resolvedScriptPath);
+} catch { /* keep resolvedScriptPath */ }
+const origModuleCompile = Module.prototype._compile;
+Module.prototype._compile = function patchedEntryCompile(content, filename) {
+  let matchesEntry = filename === scriptPath || (resolvedScriptPath && path.resolve(filename) === resolvedScriptPath);
+  if (!matchesEntry && realScriptPath) {
+    try {
+      matchesEntry = fsModule.realpathSync(filename) === realScriptPath;
+    } catch { /* ignore */ }
+  }
+  if (matchesEntry) {
+    content = patchLegacyCatpawBundle(content);
+  }
+  return origModuleCompile.call(this, content, filename);
+};
 try {
   mod = require(scriptPath);
 } catch (e) {
   post({ type: WorkerMsg.result, action: 'start', ok: false, error: 'require bundle failed: ' + ((e && e.message) || e) });
   process.exit(1);
+} finally {
+  Module.prototype._compile = origModuleCompile;
 }
 if (mod && typeof mod === 'object' && mod.default && typeof mod.start !== 'function') mod = mod.default;
 const hasStart = !!mod && typeof mod.start === 'function';
@@ -375,10 +452,6 @@ parentPort.on('message', (msg) => {
     if (typeof msg.token === 'string') currentDartToken = msg.token;
   }
 });
-
-const startInput = startMode === 'ctx' && startArg && typeof startArg === 'object'
-  ? { ...startArg, log: (...a) => console.log(`[${name}]`, ...a) }
-  : startArg;
 
 if (hasStart) {
   Promise.resolve()

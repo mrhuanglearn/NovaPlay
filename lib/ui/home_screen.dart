@@ -70,7 +70,10 @@ class HomeScreen extends ConsumerWidget {
   /// INFERRED: CatVod subscriptions that accept pushed links expose a site with the key `push_agent`.
   void _push(BuildContext context, WidgetRef ref) {
     final l = context.l10n;
-    final push = ref.read(homeSitesProvider).where((s) => s.key == 'push_agent').firstOrNull;
+    final push = ref
+        .read(homeSitesProvider)
+        .where((s) => s.type == 4 || s.key == 'push_agent' || s.key == 'nodejs_push' || s.key == 'push')
+        .firstOrNull;
     if (push == null) return showToast(l.homePushNotSupported);
     final controller = TextEditingController();
     showDialog<void>(

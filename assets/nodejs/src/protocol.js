@@ -57,6 +57,7 @@ const DartAction = Object.freeze({
 const WorkerMsg = Object.freeze({
   port: 'port',
   result: 'result',
+  configLoaded: 'configLoaded',
   log: 'log',
   netlog: 'netlog',
   error: 'error',

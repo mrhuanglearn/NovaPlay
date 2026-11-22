@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
+import 'package:uzv_reimpl/features/catpaw/spider_api.dart';
 import 'package:uzv_reimpl/features/live/m3u_epg.dart';
 import 'package:uzv_reimpl/models/vod.dart';
 import 'package:uzv_reimpl/services/danmu_client.dart';
@@ -95,6 +96,56 @@ void main() {
       ]);
       final out = filterDanmu(src, blackList: ['spoiler', ''], showTop: false, showBottom: false);
       expect(out.map((c) => c.text), ['keep']);
+    });
+  });
+
+  group('VodItem & SpiderSite compat', () {
+    test('VodItem parses vod_tag and cate for folder drill-down and preserves them on copy/toJson', () {
+      final folder = VodItem.fromJson({
+        'vod_id': 'raw-id',
+        'vod_name': '夸克合集',
+        'vod_tag': 'folder',
+        'cate': {'id': 'cat-123', 'name': '合集目录'},
+      }, siteKey: 'woniu');
+      expect(folder.folderCategoryId, 'cat-123');
+      expect(folder.cateName, '合集目录');
+      expect(folder.copyWith(id: 'other').folderCategoryId, 'cat-123');
+      expect(folder.toJson()['vod_tag'], 'folder');
+      expect((folder.toJson()['cate'] as Map)['id'], 'cat-123');
+
+      final tagOnlyFolder = VodItem.fromJson({'vod_id': 'dir-9', 'vod_name': 'Dir', 'vod_tag': 'folder'});
+      expect(tagOnlyFolder.folderCategoryId, 'dir-9');
+
+      final regularVod = VodItem.fromJson({'vod_id': '4200', 'vod_name': '奥德赛'});
+      expect(regularVod.folderCategoryId, isNull);
+    });
+
+    test('SpiderApi falls back to homeUrl card on 404 for type 7 webpage sites', () async {
+      final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => server.close(force: true));
+      server.listen((req) async {
+        req.response
+          ..statusCode = 404
+          ..write('{"error":"not found"}');
+        await req.response.close();
+      });
+
+      final api = SpiderApi(server.port);
+      final site = SpiderSite.fromJson({
+        'key': 'nodejs_webpage_abc',
+        'name': 'Apple Music',
+        'api': '/spider/webpage/7/abc',
+        'type': 7,
+        'homeUrl': 'https://am-4u2.pages.dev/',
+      });
+      expect(site.homeUrl, 'https://am-4u2.pages.dev/');
+
+      final home = await api.home(site);
+      expect(home.categories.single.id, 'web');
+      expect(home.featured.single.id, 'uzv-web:https://am-4u2.pages.dev/');
+
+      final cat = await api.category(site, 'web');
+      expect(cat.items.single.id, 'uzv-web:https://am-4u2.pages.dev/');
     });
   });
 }

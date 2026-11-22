@@ -13,16 +13,26 @@ class VodItem {
     this.remarks,
     this.year,
     this.siteKey,
+    this.tag,
+    this.cateId,
+    this.cateName,
   });
 
-  factory VodItem.fromJson(Map<String, dynamic> j, {String? siteKey}) => VodItem(
-        id: '${j['vod_id'] ?? ''}',
-        name: '${j['vod_name'] ?? ''}',
-        pic: j['vod_pic'] as String?,
-        remarks: j['vod_remarks'] as String?,
-        year: j['vod_year']?.toString(),
-        siteKey: siteKey,
-      );
+  factory VodItem.fromJson(Map<String, dynamic> j, {String? siteKey}) {
+    final cate = j['cate'];
+    final cateMap = cate is Map ? cate : null;
+    return VodItem(
+      id: '${j['vod_id'] ?? ''}',
+      name: '${j['vod_name'] ?? ''}',
+      pic: j['vod_pic'] as String?,
+      remarks: j['vod_remarks'] as String?,
+      year: j['vod_year']?.toString(),
+      siteKey: siteKey,
+      tag: j['vod_tag']?.toString(),
+      cateId: cateMap?['id']?.toString(),
+      cateName: cateMap?['name']?.toString(),
+    );
+  }
 
   final String id;
   final String name;
@@ -30,9 +40,27 @@ class VodItem {
   final String? remarks;
   final String? year;
   final String? siteKey;
+  final String? tag;
+  final String? cateId;
+  final String? cateName;
 
-  VodItem copyWith({String? id}) =>
-      VodItem(id: id ?? this.id, name: name, pic: pic, remarks: remarks, year: year, siteKey: siteKey);
+  String? get folderCategoryId {
+    final cid = cateId?.trim() ?? '';
+    if (cid.isNotEmpty) return cid;
+    if (tag?.trim().toLowerCase() == 'folder' && id.trim().isNotEmpty) return id.trim();
+    return null;
+  }
+
+  VodItem copyWith({String? id}) => VodItem(
+      id: id ?? this.id,
+      name: name,
+      pic: pic,
+      remarks: remarks,
+      year: year,
+      siteKey: siteKey,
+      tag: tag,
+      cateId: cateId,
+      cateName: cateName);
 
   Map<String, dynamic> toJson() => {
         'vod_id': id,
@@ -41,6 +69,9 @@ class VodItem {
         if (remarks != null) 'vod_remarks': remarks,
         if (year != null) 'vod_year': year,
         if (siteKey != null) 'siteKey': siteKey,
+        if (tag != null) 'vod_tag': tag,
+        if (cateId != null || cateName != null)
+          'cate': {if (cateId != null) 'id': cateId, if (cateName != null) 'name': cateName},
       };
 }
 

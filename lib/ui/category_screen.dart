@@ -11,8 +11,10 @@ import 'widgets.dart';
 
 /// `/video/sub-category`: one category with its filter rows (year, area, sort, ...) and paging.
 class SubCategoryScreen extends ConsumerStatefulWidget {
-  const SubCategoryScreen({super.key, required this.typeId});
+  const SubCategoryScreen({super.key, required this.typeId, this.title, this.siteKey});
   final String typeId;
+  final String? title;
+  final String? siteKey;
   @override
   ConsumerState<SubCategoryScreen> createState() => _SubCategoryScreenState();
 }
@@ -35,7 +37,7 @@ class _SubCategoryScreenState extends ConsumerState<SubCategoryScreen> {
     final filters = Map<String, String>.from(_filters);
     setState(() => _loading = true);
     try {
-      final site = ref.read(currentSiteProvider);
+      final site = ref.read(siteByKeyProvider(widget.siteKey));
       if (site == null) {
         if (mounted) setState(() => _loading = false);
         return;
@@ -81,9 +83,13 @@ class _SubCategoryScreenState extends ConsumerState<SubCategoryScreen> {
   @override
   Widget build(BuildContext context) {
     final home = ref.watch(videoFeedProvider).valueOrNull;
-    final category = home?.categories.where((c) => c.id == widget.typeId).firstOrNull;
+    final currentSiteKey = ref.watch(currentSiteProvider)?.key;
+    final category = (widget.siteKey == null || widget.siteKey == currentSiteKey)
+        ? home?.categories.where((c) => c.id == widget.typeId).firstOrNull
+        : null;
+    final title = widget.title?.trim().isNotEmpty == true ? widget.title!.trim() : (category?.name ?? widget.typeId);
     return Scaffold(
-      appBar: AppBar(title: Text(category?.name ?? widget.typeId)),
+      appBar: AppBar(title: Text(title)),
       body: Column(children: [
         if ((category?.filters ?? const <VodFilter>[]).isNotEmpty)
           CategoryFilterBar(filters: category!.filters, chosen: _filters, onChanged: _setFilter),
