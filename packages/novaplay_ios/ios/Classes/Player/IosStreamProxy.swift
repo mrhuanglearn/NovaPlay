@@ -310,7 +310,7 @@ enum IosMpegTsSanitizer {
       if ptr[0] == 0x47 && ptr[188] == 0x47 && (count < 377 || ptr[376] == 0x47) {
         return 0
       }
-      let maxOffset = min(count - 188, 7600)
+      let maxOffset = min(count - 188, 32500)
       guard maxOffset >= 1 else { return nil }
       for off in 1..<maxOffset {
         guard ptr[off] == 0x47 else { continue }
@@ -333,10 +333,24 @@ enum IosMpegTsSanitizer {
     let box = String(data: data.subdata(in: 4..<8), encoding: .ascii) ?? ""
     return box == "ftyp" || box == "styp" || box == "moof" || box == "sidx"
   }
+
+  static func hasCleanLeadingPacket(_ data: Data) -> Bool {
+    if looksLikeFmp4Segment(data) {
+      return true
+    }
+    guard data.count >= 377 else { return false }
+    return data.withUnsafeBytes { rawBuf -> Bool in
+      guard let ptr = rawBuf.bindMemory(to: UInt8.self).baseAddress else { return false }
+      return ptr[0] == 0x47 && ptr[188] == 0x47 && ptr[376] == 0x47
+    }
+  }
 }
 
 enum IosHlsRewriter {
-  private static let uriAttrRegex = try? NSRegularExpression(pattern: #"URI="([^"]+)""#, options: [])
+  private static let uriAttrRegex = try? NSRegularExpression(
+    pattern: #"URI=(?:"([^"]+)"|'([^']+)'|([^,\s]+))"#,
+    options: [.caseInsensitive]
+  )
   private static let methodRegex = try? NSRegularExpression(
     pattern: #"METHOD="?([A-Za-z0-9_-]+)"?"#,
     options: [.caseInsensitive]
@@ -404,14 +418,21 @@ enum IosHlsRewriter {
           }
         }
 
-        if line.contains("URI=\""), let rx = uriAttrRegex {
+        if upper.contains("URI="), let rx = uriAttrRegex {
           let isPlaylistAttr = upper.hasPrefix("#EXT-X-MEDIA:") || upper.hasPrefix("#EXT-X-I-FRAME-STREAM-INF:")
           let isMapAttr = upper.hasPrefix("#EXT-X-MAP:")
           let nsMut = NSMutableString(string: line)
           let matches = rx.matches(in: line, options: [], range: NSRange(location: 0, length: nsMut.length))
           for match in matches.reversed() where match.numberOfRanges >= 2 {
-            let origRef = nsMut.substring(with: match.range(at: 1))
-            guard let resolved = resolveReference(origRef, baseURL: baseURL) else { continue }
+            var extractedRef: String?
+            for grp in 1..<match.numberOfRanges {
+              let r = match.range(at: grp)
+              if r.location != NSNotFound && r.length > 0 {
+                extractedRef = nsMut.substring(with: r)
+                break
+              }
+            }
+            guard let origRef = extractedRef, let resolved = resolveReference(origRef, baseURL: baseURL) else { continue }
             let proxied: String
             if isPlaylistAttr {
               proxied = buildProxyUrlString(port: proxyPort, token: sessionToken, targetURL: resolved, kind: "hls", fileName: "sub.m3u8", rawSeg: false, originHint: baseOrigin)
@@ -1181,7 +1202,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     let isRawSeg = (queryMap["rawseg"] == "1")
     let originHint = queryMap["o"].flatMap { IosUrlSanitizer.base64UrlDecode($0) }
 
-    if kind == "hls" {
+    if kind == "hls" || (kind == "auto" && detectedContainer(for: session) == .hls) {
       serveHlsPlaylist(fd: fd, isHead: isHead, targetURL: targetURL, session: session, originHint: originHint, allowOriginFallback: true)
     } else if kind == "key" {
       serveHlsKey(fd: fd, isHead: isHead, targetURL: targetURL, session: session, originHint: originHint, allowOriginFallback: true)
@@ -1531,7 +1552,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
           }
         } else if !headerFlushed {
           prefixBuf.append(chunk)
-          if prefixBuf.count >= 8192 {
+          if IosMpegTsSanitizer.hasCleanLeadingPacket(prefixBuf) || prefixBuf.count >= 32768 {
             headerFlushed = true
             prefixToFlush = prefixBuf
             prefixBuf.removeAll(keepingCapacity: false)
@@ -1790,9 +1811,10 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
             }
           }
         } else if !headerFlushed {
+          let statusNow = upstreamResp?.statusCode ?? 200
           let canRewriteAutoHls = (kind == "auto") &&
-            (incomingRange == nil || incomingRange == "bytes=0-") &&
-            (upstreamResp?.statusCode ?? 200) < 400 &&
+            statusNow < 400 &&
+            (incomingRange == nil || incomingRange == "bytes=0-" || statusNow == 200) &&
             IosHlsRewriter.looksLikeHlsPlaylist(chunk)
           if canRewriteAutoHls {
             autoHlsBuffer = chunk
@@ -2191,13 +2213,23 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     let isPresignedObjectUrl =
       queryLower.contains("x-amz-signature=") ||
       queryLower.contains("ossaccesskeyid=") ||
-      queryLower.contains("q-signature=")
+      queryLower.contains("x-oss-signature=") ||
+      queryLower.contains("q-signature=") ||
+      queryLower.contains("x-tos-signature=") ||
+      queryLower.contains("kssaccesskeyid=")
+    let sameSite = Self.sharesRegistrableSite(cb.session.rootURL, request.url)
+    if !sameSite {
+      redirected.setValue(nil, forHTTPHeaderField: "Cookie")
+      redirected.setValue(nil, forHTTPHeaderField: "Authorization")
+      redirected.setValue(nil, forHTTPHeaderField: "Origin")
+    }
 
     let mergedHeaders = effectiveHeadersSnapshot(for: cb.session)
     for (k, v) in mergedHeaders {
       let lower = k.lowercased()
       if lower == "host" { continue }
-      if lower == "authorization" && isPresignedObjectUrl { continue }
+      if lower == "authorization" && (isPresignedObjectUrl || !sameSite) { continue }
+      if !sameSite && !["user-agent", "referer", "accept", "accept-language"].contains(lower) { continue }
       redirected.setValue(v, forHTTPHeaderField: k)
     }
     if let origRange = cb.originalRange, !origRange.isEmpty {
@@ -2207,6 +2239,30 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
       redirected.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
     }
     completionHandler(redirected)
+  }
+
+  private static func registrableDomain(of url: URL?) -> String {
+    guard let rawHost = url?.host?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+          !rawHost.isEmpty else { return "" }
+    let parts = rawHost.split(separator: ".").map(String.init)
+    guard parts.count >= 2 else { return rawHost }
+    if parts.allSatisfy({ Int($0) != nil }) || rawHost.contains(":") {
+      return rawHost
+    }
+    let multiPartSuffixes: Set<String> = [
+      "com.cn", "net.cn", "org.cn", "gov.cn", "co.uk", "org.uk", "co.jp", "com.hk", "com.tw", "eu.org"
+    ]
+    let lastTwo = "\(parts[parts.count - 2]).\(parts[parts.count - 1])"
+    if parts.count >= 3 && multiPartSuffixes.contains(lastTwo) {
+      return "\(parts[parts.count - 3]).\(lastTwo)"
+    }
+    return lastTwo
+  }
+
+  private static func sharesRegistrableSite(_ a: URL?, _ b: URL?) -> Bool {
+    let da = registrableDomain(of: a)
+    let db = registrableDomain(of: b)
+    return !da.isEmpty && da == db
   }
 
   func urlSession(

@@ -134,6 +134,26 @@ void main() {
       });
       expect(inline.videoDanmuComments.single.text, 'inline-hit');
     });
+
+    test('pan 代理 vs 原画 preserves upstream Cookie/Referer only on direct 原画 URLs', () {
+      final r = PlayResult.fromJson({
+        'url': ['代理', 'http://127.0.0.1:2333/proxy/wanou/3/stream?u=abc', '原画', 'https://dl.quark.cn/raw.mp4'],
+        'header': {'Cookie': '__pus=ok', 'Referer': 'https://pan.quark.cn', 'User-Agent': 'QuarkUA'},
+      });
+      expect(r.withQuality(0).effectiveHeaders, {'User-Agent': 'QuarkUA'});
+      expect(r.withQuality(0).withQuality(1).effectiveHeaders, {
+        'Cookie': '__pus=ok',
+        'Referer': 'https://pan.quark.cn',
+        'User-Agent': 'QuarkUA',
+      });
+    });
+
+    test('sniffer resource URL matcher catches mid-path and query media manifests while skipping segments', () {
+      expect(SnifferService.looksLikePlayableResourceUrl('https://cdn.example.com/hls/index.m3u8/token123'), isTrue);
+      expect(SnifferService.looksLikePlayableResourceUrl('https://cdn.example.com/play?id=99&type=m3u8'), isTrue);
+      expect(SnifferService.looksLikePlayableResourceUrl('https://cdn.example.com/seg001.ts?sign=1'), isFalse);
+      expect(SnifferService.looksLikePlayableResourceUrl('https://cdn.example.com/player.js'), isFalse);
+    });
   });
 
   group('PlayerSession answers for the native side', () {

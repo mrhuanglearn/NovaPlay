@@ -401,6 +401,14 @@ function patchLegacyCatpawBundle(src) {
     'classes:[{type_id:"1",type_name:"\\u7535\\u5F71"},{type_id:"2",type_name:"\\u5267\\u96C6"},{type_id:"3",type_name:"\\u7EFC\\u827A"},{type_id:"4",type_name:"\\u52A8\\u6F2B"},{type_id:"15",type_name:"\\u65E5\\u97E9\\u5267"},{type_id:"16",type_name:"\\u6B27\\u7F8E\\u5267"}],categoryPath:(e,t)=>`/show/${encodeURIComponent(e)}--------${t}---.html`,searchPath:(e,t)=>`/search/${encodeURIComponent(e)}----------${t}---.html`'
   );
   out = out.replaceAll('["https://pan1.me","https://123panfx.com"]', '["https://123panfx.com","https://pan1.me"]');
+  out = out.replace(
+    'gt=H?["\\u4EE3\\u7406",ie]:ie&&se?.preferProxy?["\\u4EE3\\u7406",ie,"\\u539F\\u753B",G]:ie?["\\u539F\\u753B",G,"\\u4EE3\\u7406",ie]:["\\u539F\\u753B",G]',
+    'gt=ie&&(se?.preferProxy??H)?["\\u4EE3\\u7406",ie,"\\u539F\\u753B",G]:ie?["\\u539F\\u753B",G,"\\u4EE3\\u7406",ie]:["\\u539F\\u753B",G]'
+  );
+  out = out.replace(
+    've={parse:0,url:gt,...H?{}:{header:te},',
+    've={parse:0,url:gt,header:te,'
+  );
   return out;
 }
 

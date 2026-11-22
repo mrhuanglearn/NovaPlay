@@ -77,6 +77,7 @@ typedef struct {
 #define DECL_FN(name, ret, args) ret (*name) args;
     UZV_IOS_MPV_FN_LIST(DECL_FN)
 #undef DECL_FN
+    int (*mpv_command_async)(mpv_handle *ctx, uint64_t reply_userdata, const char **args);
 } UzvIosMpvApi;
 
 struct uzv_mpv_instance {
@@ -110,6 +111,7 @@ static bool try_bind_symbols(void *lib_handle, const char *source_name) {
         snprintf(g_load_detail, sizeof(g_load_detail), "%s missing symbol %s", source_name, missing);
         return false;
     }
+    *(void **)(&candidate.mpv_command_async) = dlsym(lib_handle, "mpv_command_async");
     g_mpv = candidate;
     snprintf(g_load_detail, sizeof(g_load_detail), "Loaded libmpv from %s", source_name);
     return true;
@@ -278,6 +280,41 @@ int uzv_ios_mpv_command5(
 ) {
     if (!inst || !inst->handle || !a0) return -4;
     const char *cmd[6] = {a0, a1, a2, a3, a4, NULL};
+    return g_mpv.mpv_command(inst->handle, cmd);
+}
+
+int uzv_ios_mpv_command_async2(uzv_mpv_instance *inst, uint64_t userdata, const char *a0, const char *a1) {
+    if (!inst || !inst->handle || !a0) return -4;
+    const char *cmd[3] = {a0, a1, NULL};
+    if (g_mpv.mpv_command_async) {
+        return g_mpv.mpv_command_async(inst->handle, userdata, cmd);
+    }
+    return g_mpv.mpv_command(inst->handle, cmd);
+}
+
+int uzv_ios_mpv_command_async3(uzv_mpv_instance *inst, uint64_t userdata, const char *a0, const char *a1, const char *a2) {
+    if (!inst || !inst->handle || !a0) return -4;
+    const char *cmd[4] = {a0, a1, a2, NULL};
+    if (g_mpv.mpv_command_async) {
+        return g_mpv.mpv_command_async(inst->handle, userdata, cmd);
+    }
+    return g_mpv.mpv_command(inst->handle, cmd);
+}
+
+int uzv_ios_mpv_command_async5(
+    uzv_mpv_instance *inst,
+    uint64_t userdata,
+    const char *a0,
+    const char *a1,
+    const char *a2,
+    const char *a3,
+    const char *a4
+) {
+    if (!inst || !inst->handle || !a0) return -4;
+    const char *cmd[6] = {a0, a1, a2, a3, a4, NULL};
+    if (g_mpv.mpv_command_async) {
+        return g_mpv.mpv_command_async(inst->handle, userdata, cmd);
+    }
     return g_mpv.mpv_command(inst->handle, cmd);
 }
 

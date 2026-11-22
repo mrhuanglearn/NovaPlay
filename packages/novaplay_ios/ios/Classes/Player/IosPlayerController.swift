@@ -333,6 +333,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   func selectPlayerKernel(_ targetKernel: String) {
     let targetNorm = IosPlayerUiText.normalizeIosKernel(targetKernel)
     let prevActive = kernel.activeKernelId
+    let savedPositionMs = max(pendingStartMs, kernel.positionMs)
     var next = playbackConfig
     next.kernel = targetNorm
     if targetNorm == "mpv" {
@@ -341,18 +342,31 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     playbackConfig = next
     kernel.autoPictureInPicture = next.autoPictureInPicture
     kernel.selectKernelBackend(targetNorm, notifyFallback: true)
-    if prevActive != kernel.activeKernelId, let payload = lastPayload, let mediaUrl = payload.url {
+    if prevActive != kernel.activeKernelId {
       errorMessage = nil
       failed = false
-      let resumeMs = kernel.positionMs
-      let subs = (payload.subtitles ?? []) + extraSubtitles
-      kernel.load(
-        url: mediaUrl,
-        audioUrl: payload.audioUrl,
-        headers: payload.headers ?? [:],
-        startMs: resumeMs,
-        subtitles: subs
-      )
+      state = "buffering"
+      if let payload = lastPayload,
+         let mediaUrl = payload.url,
+         !mediaUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        let subs = (payload.subtitles ?? []) + extraSubtitles
+        kernel.load(
+          url: mediaUrl,
+          audioUrl: payload.audioUrl,
+          headers: payload.headers ?? [:],
+          startMs: savedPositionMs,
+          subtitles: subs
+        )
+        let shortName = IosPlayerUiText.kernelShortName(kernel.activeKernelId)
+        uiDelegate?.controllerDidShowNotice(
+          IosPlayerUiText.t("已切换至 \(shortName) 内核", "Switched to \(shortName)")
+        )
+      } else {
+        pendingStartMs = savedPositionMs
+        reportPreferences()
+        requestEpisode(lineIndex: line, episodeIndex: episode, refreshDanmaku: false)
+        return
+      }
     }
     reportPreferences()
     uiDelegate?.controllerDidChangeState()
@@ -372,6 +386,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     }
     playbackConfig = next
     let prevActiveKernel = kernel.activeKernelId
+    let savedPositionMs = max(pendingStartMs, kernel.positionMs)
     let kernelChanged = (oldNormKernel != nextNormKernel)
     let hwChanged = (old.hwDecode != next.hwDecode) && (prevActiveKernel == "vlc" || nextNormKernel == "vlc")
 
@@ -394,14 +409,19 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     if old.audioLang != next.audioLang {
       kernel.applyAudioPreference(lang: next.audioLang)
     }
-    if (activeKernelSwitched || hwChanged), let payload = lastPayload, let mediaUrl = payload.url {
-      let resumeMs = kernel.positionMs
+    if (activeKernelSwitched || hwChanged),
+       let payload = lastPayload,
+       let mediaUrl = payload.url,
+       !mediaUrl.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+      errorMessage = nil
+      failed = false
+      state = "buffering"
       let subs = (payload.subtitles ?? []) + extraSubtitles
       kernel.load(
         url: mediaUrl,
         audioUrl: payload.audioUrl,
         headers: payload.headers ?? [:],
-        startMs: resumeMs,
+        startMs: savedPositionMs,
         subtitles: subs
       )
     }
@@ -438,8 +458,12 @@ final class IosPlayerController: IosPlayerKernelDelegate {
 
   func selectQuality(_ index: Int) {
     guard index >= 0 && index < qualityNames.count && index != quality else { return }
+    let nextName = qualityNames[index]
     quality = index
-    pendingStartMs = kernel.positionMs
+    pendingStartMs = max(pendingStartMs, kernel.positionMs)
+    uiDelegate?.controllerDidShowNotice(
+      IosPlayerUiText.t("正在切换至 \(nextName)", "Switching to \(nextName)")
+    )
     requestEpisode(lineIndex: line, episodeIndex: episode, refreshDanmaku: false)
   }
 

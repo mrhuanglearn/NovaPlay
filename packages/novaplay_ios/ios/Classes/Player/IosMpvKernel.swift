@@ -207,7 +207,9 @@ final class IosMpvEngine {
     _ = uzv_ios_mpv_set_option_string(inst, "ytdl", "no")
     _ = uzv_ios_mpv_set_option_string(inst, "terminal", "no")
     _ = uzv_ios_mpv_set_option_string(inst, "tls-verify", "no")
-    _ = uzv_ios_mpv_set_option_string(inst, "network-timeout", "8")
+    _ = uzv_ios_mpv_set_option_string(inst, "network-timeout", "10")
+    _ = uzv_ios_mpv_set_option_string(inst, "demuxer-lavf-o", "allowed_extensions=ALL")
+    _ = uzv_ios_mpv_set_option_string(inst, "stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_delay_max=4")
     _ = uzv_ios_mpv_set_option_string(inst, "cache", "yes")
     _ = uzv_ios_mpv_set_option_string(inst, "demuxer-max-bytes", "64MiB")
     _ = uzv_ios_mpv_set_option_string(inst, "demuxer-max-back-bytes", "32MiB")
@@ -412,7 +414,7 @@ final class IosMpvEngine {
     applyFitMode()
 
     let startOpt = String(format: "start=%.3f", Double(max(0, startMs)) / 1000.0)
-    var loadRc = uzv_ios_mpv_command5(inst, "loadfile", url, "replace", "-1", startOpt)
+    var loadRc = uzv_ios_mpv_command_async5(inst, 0, "loadfile", url, "replace", "-1", startOpt)
     if loadRc == -4 {
       loadRc = uzv_ios_mpv_command4(inst, "loadfile", url, "replace", startOpt)
     }
@@ -485,7 +487,7 @@ final class IosMpvEngine {
     positionMs = clamped
     isSeeking = true
     let secStr = String(format: "%.3f", Double(clamped) / 1000.0)
-    _ = uzv_ios_mpv_command3(inst, "seek", secStr, "absolute")
+    _ = uzv_ios_mpv_command_async3(inst, 0, "seek", secStr, "absolute")
     publishStateIfNeeded()
   }
 
@@ -657,6 +659,8 @@ final class IosMpvEngine {
     case 8: // FILE_LOADED
       fileLoaded = true
       loadingFile = false
+      isSeeking = false
+      pausedForCache = uzv_ios_mpv_get_property_flag(inst, "paused-for-cache", false)
       if let extAudio = pendingExternalAudioUrl {
         pendingExternalAudioUrl = nil
         _ = uzv_ios_mpv_command3(inst, "audio-add", extAudio, "select")
@@ -667,6 +671,8 @@ final class IosMpvEngine {
       if UIApplication.shared.applicationState == .background {
         userPaused = true
         _ = uzv_ios_mpv_set_property_flag(inst, "pause", true)
+      } else {
+        userPaused = uzv_ios_mpv_get_property_flag(inst, "pause", userPaused)
       }
       refreshVideoMetadata(inst: inst)
       mpvUsbLog.notice("[NovaPlay][MPV] FILE_LOADED codec=\(self.videoCodecName ?? "unknown", privacy: .public) size=\(Int(self.videoSize.width), privacy: .public)x\(Int(self.videoSize.height), privacy: .public)")
@@ -675,12 +681,18 @@ final class IosMpvEngine {
     case 7: // END_FILE
       guard !awaitingStartFile else { return }
       fileLoaded = false
+      isSeeking = false
       if ev.end_reason == 0 { // EOF
         reachedEof = true
         loadingFile = false
         publishStateIfNeeded()
+      } else if ev.end_reason == 2 || ev.end_reason == 3 { // STOP / QUIT
+        loadingFile = false
+        pausedForCache = false
+        publishStateIfNeeded()
       } else if ev.end_reason == 4 { // ERROR
         loadingFile = false
+        pausedForCache = false
         let errStr = String(cString: uzv_ios_mpv_error_string(ev.end_error))
         let logs = (copyStringAndFree(uzv_ios_mpv_copy_recent_logs(inst)) ?? "")
           .components(separatedBy: .newlines)
@@ -701,13 +713,19 @@ final class IosMpvEngine {
       publishStateIfNeeded()
     case 21: // PLAYBACK_RESTART
       isSeeking = false
+      pausedForCache = uzv_ios_mpv_get_property_flag(inst, "paused-for-cache", false)
       publishStateIfNeeded()
     case 22: // PROPERTY_CHANGE
       switch ev.reply_userdata {
       case Self.obsTimePos:
         let sec = uzv_ios_mpv_get_property_double(inst, "time-pos", -1)
         if sec >= 0 {
-          positionMs = Int64((sec * 1000.0).rounded())
+          let nextPos = Int64((sec * 1000.0).rounded())
+          if isSeeking && nextPos != positionMs {
+            isSeeking = false
+            publishStateIfNeeded()
+          }
+          positionMs = nextPos
           delegate?.mpvEngineDidUpdateMetrics()
         }
       case Self.obsDuration:
@@ -797,8 +815,10 @@ final class IosMpvEngine {
     fileLoaded = false
     loadingFile = false
     reachedEof = false
+    isSeeking = false
+    pausedForCache = false
     if let inst = instance {
-      _ = uzv_ios_mpv_command2(inst, "stop", nil)
+      _ = uzv_ios_mpv_command_async2(inst, 0, "stop", nil)
     }
     lastPublishedState = "idle"
   }

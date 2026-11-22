@@ -6,7 +6,8 @@
   if (window.__uzvSniffer) return;
   window.__uzvSniffer = true;
 
-  var MEDIA_RE = /\.(m3u8|mp4|mkv|flv|mpd|webm|mov|ts)(\?|#|$)/i;
+  var MEDIA_RE = /(?:\.(m3u8|mp4|mkv|flv|mpd|webm|mov)(?:[?&#/]|$)|[?&](?:type|format|ext)=(m3u8|mp4|flv|mpd)(?:[&#]|$))/i;
+  var NON_MEDIA_EXT_RE = /\.(ts|js|mjs|css|html?|json|xml|jpe?g|png|gif|webp|svg|ico|woff2?|ttf)(\?|#|$)/i;
   var MEDIA_TYPE_RE = /^(video\/|audio\/|application\/(vnd\.apple\.mpegurl|x-mpegurl|dash\+xml))/i;
   var seen = {};
   var queue = [];
@@ -17,8 +18,8 @@
   }
 
   function kindOf(url, type) {
-    if (/\.m3u8(\?|#|$)/i.test(url) || /mpegurl/i.test(type || '')) return 'hls';
-    if (/\.mpd(\?|#|$)/i.test(url) || /dash\+xml/i.test(type || '')) return 'dash';
+    if (/m3u8/i.test(url) || /mpegurl/i.test(type || '')) return 'hls';
+    if (/\.mpd([?&#/]|$)/i.test(url) || /dash\+xml/i.test(type || '')) return 'dash';
     return 'file';
   }
 
@@ -33,12 +34,12 @@
     }
   }
 
-  function consider(url, source, type, size) {
-    if (!url || /^(blob|data|javascript):/i.test(url)) return;
+  function consider(url, source, type, size, isVideoTag) {
+    if (!url || /^(blob|data|javascript|about):/i.test(url)) return;
     var abs = absolute(url);
-    if (!abs || seen[abs]) return;
-    if (!MEDIA_RE.test(abs) && !MEDIA_TYPE_RE.test(type || '')) return;
-    if (/\.ts(\?|#|$)/i.test(abs)) return; // individual HLS segments are not interesting
+    if (!abs || abs === location.href || seen[abs]) return;
+    if (NON_MEDIA_EXT_RE.test(abs)) return;
+    if (!isVideoTag && !MEDIA_RE.test(abs) && !MEDIA_TYPE_RE.test(type || '')) return;
     seen[abs] = true;
     emit({ url: abs, source: source, kind: kindOf(abs, type), contentType: type || '', size: size || 0,
       page: location.href, title: document.title, referer: location.href, userAgent: navigator.userAgent });
@@ -74,7 +75,9 @@
     var nodes = document.querySelectorAll('video,audio,source');
     for (var i = 0; i < nodes.length; i++) {
       var n = nodes[i];
-      consider(n.currentSrc || n.src || n.getAttribute('src'), 'element', n.type || '', 0);
+      var tag = (n.tagName || '').toLowerCase();
+      var isVid = tag === 'video' || (tag === 'source' && n.parentElement && n.parentElement.tagName.toLowerCase() === 'video');
+      consider(n.currentSrc || n.src || n.getAttribute('src'), 'element', n.type || '', 0, isVid);
     }
     var entries = (performance.getEntriesByType && performance.getEntriesByType('resource')) || [];
     for (var j = 0; j < entries.length; j++) consider(entries[j].name, 'resource-timing', '', entries[j].transferSize || 0);

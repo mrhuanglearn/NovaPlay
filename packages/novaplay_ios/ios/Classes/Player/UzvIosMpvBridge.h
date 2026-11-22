@@ -53,6 +53,19 @@ int uzv_ios_mpv_command5(
     const char *a4
 );
 
+/// Executes a non-blocking asynchronous mpv command when `mpv_command_async` is available (falls back to `mpv_command`).
+int uzv_ios_mpv_command_async2(uzv_mpv_instance *inst, uint64_t userdata, const char *a0, const char *a1);
+int uzv_ios_mpv_command_async3(uzv_mpv_instance *inst, uint64_t userdata, const char *a0, const char *a1, const char *a2);
+int uzv_ios_mpv_command_async5(
+    uzv_mpv_instance *inst,
+    uint64_t userdata,
+    const char *a0,
+    const char *a1,
+    const char *a2,
+    const char *a3,
+    const char *a4
+);
+
 /// Property setters & getters. `uzv_ios_mpv_get_property_string_copy` returns a malloc'd C string (caller frees via `uzv_ios_mpv_free_cstr`).
 int uzv_ios_mpv_set_property_string(uzv_mpv_instance *inst, const char *name, const char *value);
 int uzv_ios_mpv_set_property_flag(uzv_mpv_instance *inst, const char *name, bool value);

@@ -374,6 +374,23 @@ class PlayResult {
   final String? videoDanmuUrl;
   final List<DanmuComment> videoDanmuComments;
 
+  /// Headers applicable to the currently selected [url]: omits upstream-only credentials when [url] already points to
+  /// a local loopback `/proxy/` endpoint (which carries its own sealed upstream headers), while keeping full [headers]
+  /// for `原画` direct CDN URLs.
+  Map<String, String> get effectiveHeaders {
+    final u = Uri.tryParse(url.trim());
+    final host = u?.host.toLowerCase() ?? '';
+    final isLocalProxy =
+        u != null && (host == '127.0.0.1' || host == 'localhost' || host == '::1') && u.path.startsWith('/proxy/');
+    if (!isLocalProxy || headers.isEmpty) return headers;
+    return {
+      for (final e in headers.entries)
+        if (!const {'cookie', 'referer', 'referrer', 'origin', 'authorization', 'accept-encoding'}
+            .contains(e.key.toLowerCase()))
+          e.key: e.value,
+    };
+  }
+
   /// The same result with [url] taken from quality [index] (clamped; unchanged when there are no qualities).
   PlayResult withQuality(int index) {
     if (qualities.isEmpty) return this;

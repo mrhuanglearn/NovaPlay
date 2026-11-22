@@ -158,14 +158,14 @@ class PlayerSession implements NativePlayerFlutterApi {
       }
       _episodeDanmuUrl = result.videoDanmuUrl;
       _episodeDanmuComments = result.videoDanmuComments;
-      _episodeHeaders = result.headers;
+      _episodeHeaders = result.effectiveHeaders;
       if (!gate.isCompleted) gate.complete();
       await host.provideSource(SourcePayload(
         requestId: request.requestId,
         success: true,
         url: result.url,
         audioUrl: result.audioUrl,
-        headers: result.headers,
+        headers: result.effectiveHeaders,
         qualities: [
           for (var i = 0; i < result.qualities.length; i++)
             QualityOption(qualityIndex: i, qualityName: result.qualities[i].name)

@@ -53,10 +53,16 @@ final class IosPlayerOverlayHost {
   // MARK: - Menus
 
   func closeMenu() {
-    guard !menuHost.isHidden else { return }
+    let wasOpen = !menuHost.isHidden || !menuHost.subviews.isEmpty
     menuHost.subviews.forEach { $0.removeFromSuperview() }
     menuHost.isHidden = true
-    onDidCloseMenu()
+    if wasOpen {
+      onDidCloseMenu()
+    }
+  }
+
+  @objc private func handleMenuBackdropTap() {
+    closeMenu()
   }
 
   func showMenuCard(anchor: UIView, above: Bool, card: UIView) {
@@ -65,8 +71,10 @@ final class IosPlayerOverlayHost {
     menuHost.subviews.forEach { $0.removeFromSuperview() }
 
     let backdrop = PlayerTappableView()
-    backdrop.backgroundColor = .clear
+    backdrop.backgroundColor = UIColor(white: 0, alpha: 0.02)
     backdrop.onTap = { [weak self] in self?.closeMenu() }
+    let tap = UITapGestureRecognizer(target: self, action: #selector(handleMenuBackdropTap))
+    backdrop.addGestureRecognizer(tap)
     menuHost.addSubview(backdrop)
     NSLayoutConstraint.activate([
       backdrop.leadingAnchor.constraint(equalTo: menuHost.leadingAnchor),
@@ -327,13 +335,35 @@ final class IosPlayerOverlayHost {
   // MARK: - Slide-in Panels
 
   func closePanel() {
-    guard !panelHost.isHidden else { return }
     closeMenu()
+    panelHost.endEditing(true)
+    let wasOpen = !panelHost.isHidden || !panelHost.subviews.isEmpty
     panelHost.subviews.forEach { $0.removeFromSuperview() }
     panelHost.isHidden = true
     let cb = onPanelClosed
     onPanelClosed = nil
-    cb?()
+    if wasOpen {
+      cb?()
+    }
+  }
+
+  @objc private func handlePanelBackdropTap() {
+    closePanel()
+  }
+
+  @objc private func handlePanelDismissPan(_ gr: UIPanGestureRecognizer) {
+    guard gr.state == .ended else { return }
+    let t = gr.translation(in: panelHost)
+    let v = gr.velocity(in: panelHost)
+    if isLandscape {
+      if (t.x > 36 && t.x > abs(t.y)) || (v.x > 420 && v.x > abs(v.y)) {
+        closePanel()
+      }
+    } else {
+      if (t.y > 36 && t.y > abs(t.x)) || (v.y > 420 && v.y > abs(v.x)) {
+        closePanel()
+      }
+    }
   }
 
   @discardableResult
@@ -377,8 +407,12 @@ final class IosPlayerOverlayHost {
     panelHost.subviews.forEach { $0.removeFromSuperview() }
 
     let backdrop = PlayerTappableView()
-    backdrop.backgroundColor = .clear
+    backdrop.backgroundColor = UIColor(white: 0, alpha: 0.16)
     backdrop.onTap = { [weak self] in self?.closePanel() }
+    let backdropTap = UITapGestureRecognizer(target: self, action: #selector(handlePanelBackdropTap))
+    backdrop.addGestureRecognizer(backdropTap)
+    let backdropPan = UIPanGestureRecognizer(target: self, action: #selector(handlePanelDismissPan(_:)))
+    backdrop.addGestureRecognizer(backdropPan)
     panelHost.addSubview(backdrop)
     NSLayoutConstraint.activate([
       backdrop.leadingAnchor.constraint(equalTo: panelHost.leadingAnchor),
@@ -403,6 +437,9 @@ final class IosPlayerOverlayHost {
     content.translatesAutoresizingMaskIntoConstraints = false
     if let header = header {
       header.translatesAutoresizingMaskIntoConstraints = false
+      let headerPan = UIPanGestureRecognizer(target: self, action: #selector(handlePanelDismissPan(_:)))
+      headerPan.cancelsTouchesInView = false
+      header.addGestureRecognizer(headerPan)
       sheet.addSubview(header)
       sheet.addSubview(content)
       NSLayoutConstraint.activate([
@@ -504,6 +541,19 @@ final class IosPlayerPanels {
     }
     controller.danmakuCountListener = { [weak self] count in
       self?.refreshDanmakuLiveCount(count)
+    }
+  }
+
+  private func makeClosePanelButton() -> PlayerCircleButton {
+    ui.circleButton(
+      IosPlayerIcon.CLOSE,
+      size: 30,
+      iconSize: 16,
+      fill: IosPlayerUi.argb(0x29FF_FFFF),
+      stroke: nil
+    ) { [weak self] in
+      self?.onHaptic()
+      self?.host.closePanel()
     }
   }
 
@@ -642,6 +692,7 @@ final class IosPlayerPanels {
         self.showEpisodes(shownLine: shownLine)
       }
     }
+    actionsRow.addArrangedSubview(makeClosePanelButton())
     headerStack.addArrangedSubview(actionsRow)
 
     if lines.count > 1 {
@@ -957,14 +1008,19 @@ final class IosPlayerPanels {
       size: 12,
       color: IosPlayerUi.textDim
     )
+    let rightRow = UIStackView(arrangedSubviews: [countLbl, makeClosePanelButton()])
+    rightRow.translatesAutoresizingMaskIntoConstraints = false
+    rightRow.axis = .horizontal
+    rightRow.alignment = .center
+    rightRow.spacing = 10
     header.addSubview(titleLbl)
-    header.addSubview(countLbl)
+    header.addSubview(rightRow)
     NSLayoutConstraint.activate([
       titleLbl.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 16),
       titleLbl.topAnchor.constraint(equalTo: header.topAnchor, constant: 14),
       titleLbl.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -10),
-      countLbl.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -16),
-      countLbl.centerYAnchor.constraint(equalTo: titleLbl.centerYAnchor)
+      rightRow.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -14),
+      rightRow.centerYAnchor.constraint(equalTo: titleLbl.centerYAnchor)
     ])
 
     var activeGroupView: UIView?
@@ -1136,20 +1192,24 @@ final class IosPlayerPanels {
 
     let header = UIView()
     let titleLbl = ui.text(IosPlayerUiText.t("节目单", "EPG"), size: 15, bold: true)
+    let rightRow = UIStackView()
+    rightRow.translatesAutoresizingMaskIntoConstraints = false
+    rightRow.axis = .horizontal
+    rightRow.alignment = .center
+    rightRow.spacing = 10
+    if !programmes.isEmpty {
+      rightRow.addArrangedSubview(ui.valueBadge(IosPlayerUiText.t("\(programmes.count) 档", "\(programmes.count)")))
+    }
+    rightRow.addArrangedSubview(makeClosePanelButton())
     header.addSubview(titleLbl)
+    header.addSubview(rightRow)
     NSLayoutConstraint.activate([
       titleLbl.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 16),
       titleLbl.topAnchor.constraint(equalTo: header.topAnchor, constant: 14),
-      titleLbl.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -10)
+      titleLbl.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -10),
+      rightRow.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -14),
+      rightRow.centerYAnchor.constraint(equalTo: titleLbl.centerYAnchor)
     ])
-    if !programmes.isEmpty {
-      let badge = ui.valueBadge(IosPlayerUiText.t("\(programmes.count) 档", "\(programmes.count)"))
-      header.addSubview(badge)
-      NSLayoutConstraint.activate([
-        badge.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -16),
-        badge.centerYAnchor.constraint(equalTo: titleLbl.centerYAnchor)
-      ])
-    }
 
     var liveRow: UIView?
     let scroll = host.showPanel(header: header) { list in
@@ -1329,10 +1389,7 @@ final class IosPlayerPanels {
 
     hRow.addArrangedSubview(UIView())
     hRow.addArrangedSubview(badge)
-
-    host.onPanelClosed = { [weak self] in
-      self?.controller.reportPreferences()
-    }
+    hRow.addArrangedSubview(makeClosePanelButton())
 
     let scroll = host.showPanel(header: header) { [weak self] list in
       guard let self = self else { return }
@@ -1347,6 +1404,9 @@ final class IosPlayerPanels {
           self.buildDanmakuStyleTab(into: list)
         }
       }
+    }
+    host.onPanelClosed = { [weak self] in
+      self?.controller.reportPreferences()
     }
     if scrollY > 0 {
       DispatchQueue.main.async {
@@ -1895,21 +1955,38 @@ final class IosPlayerPanels {
   // MARK: - 4. 播放设置 (1:1 Android `PlayerSettings.kt` + iOS Triple Kernels)
 
   private var isSettingsPanelShowing: Bool = false
+  private var isRebuildingSettings: Bool = false
   private weak var settingsScrollView: UIScrollView?
   private var renderedSettingsKernelId: String?
 
   func refreshSettingsIfNeeded() {
-    guard isSettingsPanelShowing, host.isPanelOpen else { return }
+    guard isSettingsPanelShowing, !isRebuildingSettings, host.isPanelOpen else { return }
     let activeKernel = IosPlayerUiText.normalizeIosKernel(controller.kernel.activeKernelId)
     guard activeKernel != renderedSettingsKernelId else { return }
     showSettings(scrollY: settingsScrollView?.contentOffset.y ?? 0)
   }
 
   func showSettings(scrollY: CGFloat = 0) {
+    isRebuildingSettings = true
+    defer { isRebuildingSettings = false }
     var scrollRef: UIScrollView?
     let activeKernel = IosPlayerUiText.normalizeIosKernel(controller.kernel.activeKernelId)
     renderedSettingsKernelId = activeKernel
-    let scroll = host.showPanel { [weak self] list in
+
+    let header = UIView()
+    let headerTitle = ui.text(IosPlayerUiText.t("播放设置", "Playback settings"), size: 15, bold: true)
+    let closeBtn = makeClosePanelButton()
+    header.addSubview(headerTitle)
+    header.addSubview(closeBtn)
+    NSLayoutConstraint.activate([
+      headerTitle.leadingAnchor.constraint(equalTo: header.leadingAnchor, constant: 16),
+      headerTitle.topAnchor.constraint(equalTo: header.topAnchor, constant: 14),
+      headerTitle.bottomAnchor.constraint(equalTo: header.bottomAnchor, constant: -8),
+      closeBtn.trailingAnchor.constraint(equalTo: header.trailingAnchor, constant: -14),
+      closeBtn.centerYAnchor.constraint(equalTo: headerTitle.centerYAnchor)
+    ])
+
+    let scroll = host.showPanel(header: header) { [weak self] list in
       guard let self = self else { return }
 
       func addToggle(
@@ -1954,6 +2031,30 @@ final class IosPlayerPanels {
           row.titleLabel.font = UIFont.systemFont(ofSize: 14.5, weight: .semibold)
         }
         self.ui.addRow(card, row)
+      }
+
+      // Group 0: 播放模式 (`代理` / `原画`) or 清晰度 when multiple stream variants exist
+      let qNames = self.controller.qualityNames
+      if qNames.count > 1 {
+        let isPanMode = qNames.contains(where: { $0.contains("代理") || $0.contains("原画") })
+        let qHeader = isPanMode
+          ? IosPlayerUiText.t("播放模式", "Playback mode")
+          : IosPlayerUiText.t("清晰度 / 线路模式", "Quality / Mode")
+        list.addArrangedSubview(self.ui.sectionLabel(qHeader))
+        let qCard = self.ui.card()
+        for (qIdx, qTitle) in qNames.enumerated() {
+          addOption(
+            card: qCard,
+            icon: IosPlayerIcon.BOLT,
+            title: qTitle,
+            selected: qIdx == self.controller.quality
+          ) { [weak self] in
+            guard let self = self else { return }
+            self.host.closePanel()
+            self.controller.selectQuality(qIdx)
+          }
+        }
+        list.addArrangedSubview(qCard)
       }
 
       // Group 1: 解码
@@ -2024,11 +2125,8 @@ final class IosPlayerPanels {
             )
             return
           }
-          let y = scrollRef?.contentOffset.y ?? 0
+          self.host.closePanel()
           self.controller.selectPlayerKernel(kId)
-          if self.host.isPanelOpen {
-            self.showSettings(scrollY: y)
-          }
         }
       }
       list.addArrangedSubview(kernelCard)

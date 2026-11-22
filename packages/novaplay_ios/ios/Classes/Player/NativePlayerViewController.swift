@@ -699,6 +699,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     let btnRow = UIStackView(arrangedSubviews: [
       makeErrorBtn(IosPlayerUiText.t("取消", "Cancel"), emphasized: false) { [weak self] in
         self?.controller.dismissError()
+        self?.showControls()
       },
       makeErrorBtn(IosPlayerUiText.t("复制错误信息", "Copy error"), emphasized: false) { [weak self] in
         guard let self = self else { return }
@@ -982,7 +983,14 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
       ])
       actionsStack.addArrangedSubview(airPlayWrap)
 
-      addTopCircle(IosPlayerIcon.SETTINGS) { [weak self] _ in self?.panels.showSettings() }
+      addTopCircle(IosPlayerIcon.SETTINGS) { [weak self] _ in
+        guard let self = self else { return }
+        if self.overlayHost.isPanelOpen {
+          self.overlayHost.closePanel()
+        } else {
+          self.panels.showSettings()
+        }
+      }
 
       // Clock + Battery stack (`16pt` left margin)
       let clk = ui.text("00:00", size: 12.5, mono: true)
@@ -1020,7 +1028,14 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
       batteryPercentLabel = nil
       addTopCircle(IosPlayerIcon.MORE) { [weak self] anchor in self?.showPortraitMoreMenu(anchor: anchor) }
       addTopCircle(IosPlayerIcon.ROTATE) { [weak self] _ in self?.cycleOrientationStep() }
-      addTopCircle(IosPlayerIcon.SETTINGS) { [weak self] _ in self?.panels.showSettings() }
+      addTopCircle(IosPlayerIcon.SETTINGS) { [weak self] _ in
+        guard let self = self else { return }
+        if self.overlayHost.isPanelOpen {
+          self.overlayHost.closePanel()
+        } else {
+          self.panels.showSettings()
+        }
+      }
       row.addArrangedSubview(actionsStack)
     }
 
@@ -1810,14 +1825,10 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     if !errorLayer.isHidden {
       return false
     }
-    if overlayHost.isMenuOpen {
-      return gestureRecognizer is UITapGestureRecognizer && (gestureRecognizer as? UITapGestureRecognizer)?.numberOfTapsRequired == 1
-    }
-    if overlayHost.isPanelOpen {
-      if let hit = touch.view, hit.isDescendant(of: overlayHost.panelHost) {
-        // Let backdrop tap inside `panelHost` work via its own `PlayerTappableView`, block video gestures
-        return false
-      }
+    if overlayHost.isMenuOpen || overlayHost.isPanelOpen {
+      // `menuHost` and `panelHost` cover the full screen with their own tap/pan backdrops and controls;
+      // block `view`-level singleTap/doubleTap/pan/longPress so they never cancel or delay overlay touches.
+      return false
     }
     if let hit = touch.view, hit.isDescendant(of: controller.kernel.videoView) {
       return true
