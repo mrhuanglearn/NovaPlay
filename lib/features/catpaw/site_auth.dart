@@ -115,7 +115,8 @@ String? _usableOrigin(String? rawUrl, {String? ignoreHost}) {
   return '${uri.scheme}://${uri.authority}/';
 }
 
-/// Returns a [SiteVerifyChallenge] when [error] indicates an upstream 403 / anti-bot challenge for [site].
+/// Returns a [SiteVerifyChallenge] when [site] has `browserVerify` enabled in CatPaw `/config` AND [error] indicates
+/// an upstream 403 / anti-bot challenge. When `site.browserVerify` is false, always returns `null`.
 SiteVerifyChallenge? detectSiteVerifyChallenge(
   Object error,
   SpiderSite? site, {
@@ -123,7 +124,7 @@ SiteVerifyChallenge? detectSiteVerifyChallenge(
   int? statusCode,
   Object? responseData,
 }) {
-  if (site == null) return null;
+  if (site == null || !site.browserVerify) return null;
   final key = site.key.trim().toLowerCase();
   final bareKey = key.replaceFirst(RegExp(r'^nodejs_'), '');
   final hubHost = Uri.tryParse(subscriptionHubUrl ?? '')?.host;
@@ -148,11 +149,11 @@ SiteVerifyChallenge? detectSiteVerifyChallenge(
   }
   final combinedMsg = [...bodyMessages, '$error'].join('\n');
 
-  final knownUrl = _knownVerifyUrls[key] ?? _knownVerifyUrls[bareKey];
+  final configuredSiteUrl = _usableOrigin(site.verifyUrl, ignoreHost: hubHost) ?? _knownVerifyUrls[key] ?? _knownVerifyUrls[bareKey];
   final isChallenge = statusCode == 403 ||
       explicitChallengeCode ||
       _challengeSignalRe.hasMatch(combinedMsg) ||
-      (knownUrl != null && (statusCode == 502 || statusCode == 503 || _gatewayFailRe.hasMatch(combinedMsg)));
+      (configuredSiteUrl != null && (statusCode == 502 || statusCode == 503 || _gatewayFailRe.hasMatch(combinedMsg)));
   if (!isChallenge) return null;
 
   String? resolved = _usableOrigin(explicitVerifyUrl, ignoreHost: hubHost);
@@ -165,7 +166,7 @@ SiteVerifyChallenge? detectSiteVerifyChallenge(
       if (resolved != null) break;
     }
   }
-  resolved ??= knownUrl ?? _usableOrigin(site.homeUrl, ignoreHost: hubHost);
+  resolved ??= configuredSiteUrl ?? _usableOrigin(site.homeUrl, ignoreHost: hubHost);
   if (resolved == null) return null;
 
   return SiteVerifyChallenge(siteKey: site.key, siteName: site.name, verifyUrl: resolved);

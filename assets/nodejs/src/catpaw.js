@@ -335,7 +335,14 @@ function createCatpawHost({ bridge, workerEntryPath }) {
         return;
       }
       if (action === Action.setSiteAuth) {
-        if (cmd.sites && typeof cmd.sites === 'object') {
+        if (cmd.replace === true && cmd.sites && typeof cmd.sites === 'object') {
+          const next = {};
+          for (const [k, v] of Object.entries(cmd.sites)) {
+            const key = String(k || '').trim().toLowerCase();
+            if (key && v) next[key] = { siteKey: key, ...v };
+          }
+          siteAuthMap = next;
+        } else if (cmd.sites && typeof cmd.sites === 'object') {
           const next = { ...siteAuthMap };
           for (const [k, v] of Object.entries(cmd.sites)) {
             const key = String(k || '').trim().toLowerCase();

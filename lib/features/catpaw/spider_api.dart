@@ -5,14 +5,20 @@ import '../../models/vod.dart';
 
 /// One video source exposed by a running catpaw instance.
 class SpiderSite {
-  const SpiderSite(
-      {required this.key,
-      required this.name,
-      required this.api,
-      this.type = 3,
-      this.searchable = true,
-      this.indexs = false,
-      this.homeUrl});
+  const SpiderSite({
+    required this.key,
+    required this.name,
+    required this.api,
+    this.type = 3,
+    this.searchable = true,
+    this.indexs = false,
+    this.browserVerify = false,
+    this.verifyUrl,
+    this.homeUrl,
+  });
+
+  static bool _parseBool(Object? v) =>
+      v == true || v == 1 || '$v' == '1' || '$v'.trim().toLowerCase() == 'true';
 
   factory SpiderSite.fromJson(Map<String, dynamic> j) => SpiderSite(
         key: '${j['key']}',
@@ -21,6 +27,8 @@ class SpiderSite {
         type: int.tryParse('${j['type']}') ?? 3,
         searchable: '${j['searchable'] ?? 1}' != '0',
         indexs: '${j['indexs'] ?? 0}' == '1',
+        browserVerify: _parseBool(j['browserVerify']),
+        verifyUrl: j['verifyUrl'] as String?,
         homeUrl: j['homeUrl'] as String?,
       );
 
@@ -33,6 +41,13 @@ class SpiderSite {
   /// `indexs: 1`: an index site (OBSERVED: 「荐」豆瓣 of a catpaw subscription). Its posters are recommendations with no
   /// detail of their own; the original opens 搜索 with the title when one is tapped.
   final bool indexs;
+
+  /// `browserVerify: 1 | true`: controlled by CatPaw service `/config`. When false, the client must NOT run the 403
+  /// browser verification flow for this site.
+  final bool browserVerify;
+
+  /// Optional upstream verification URL supplied by CatPaw `/config` when [browserVerify] is enabled.
+  final String? verifyUrl;
 
   /// Optional webpage URL for `type == 7` webpage entries (e.g. `douer` Apple Music entry).
   final String? homeUrl;

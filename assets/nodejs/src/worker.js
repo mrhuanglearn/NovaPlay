@@ -65,16 +65,16 @@ function resolveOutboundSiteOverride(u) {
       const s1 = segs.length >= 2 ? segs[1].toLowerCase() : '';
       let matchedKey = '';
       let prefixLen = 0;
-      if (!RESERVED_HUB_SEGS.has(s0) && (currentSiteAuth[s0] || s0 === 'libvio')) {
+      if (!RESERVED_HUB_SEGS.has(s0) && currentSiteAuth[s0]) {
         matchedKey = s0;
         prefixLen = 1 + segs[0].length;
-      } else if (s1 && !RESERVED_HUB_SEGS.has(s0) && !RESERVED_HUB_SEGS.has(s1) && (currentSiteAuth[s1] || s1 === 'libvio')) {
+      } else if (s1 && !RESERVED_HUB_SEGS.has(s0) && !RESERVED_HUB_SEGS.has(s1) && currentSiteAuth[s1]) {
         matchedKey = s1;
         prefixLen = 2 + segs[0].length + segs[1].length;
       }
       if (matchedKey) {
         const auth = currentSiteAuth[matchedKey];
-        const origin = (auth && auth.origin ? String(auth.origin) : (matchedKey === 'libvio' ? 'https://libvio.host' : '')).replace(/\/+$/, '');
+        const origin = (auth && auth.origin ? String(auth.origin) : '').replace(/\/+$/, '');
         if (origin && u.origin.toLowerCase() !== origin.toLowerCase()) {
           const restPath = u.pathname.slice(prefixLen) || '/';
           return {

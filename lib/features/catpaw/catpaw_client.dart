@@ -76,8 +76,8 @@ class CatpawClient {
   Future<void> setDartPort(int port, {String? token}) =>
       _send({'action': Actions.setDartPort, 'port': port, if (token != null) 'token': token});
 
-  Future<void> setSiteAuth(Map<String, Map<String, Object?>> sites) =>
-      _send({'action': Actions.setSiteAuth, 'sites': sites});
+  Future<void> setSiteAuth(Map<String, Map<String, Object?>> sites, {bool replace = false}) =>
+      _send({'action': Actions.setSiteAuth, 'sites': sites, if (replace) 'replace': true});
 
   /// Starts [name] and completes with its port once the script's HTTP server is listening.
   Future<int> startAndWait({

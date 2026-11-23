@@ -66,14 +66,31 @@ final historyRepositoryProvider = Provider((ref) => HistoryRepository());
 final favoriteRepositoryProvider = Provider((ref) => FavoriteRepository());
 final siteAuthRepositoryProvider = Provider((ref) => SiteAuthRepository());
 
-Future<void> _pushStoredSiteAuthToHost(Ref ref, CatpawClient catpaw) async {
+Future<void> _syncBrowserVerifySitesToHost(Ref ref, CatpawClient catpaw, List<SpiderSite> sites) async {
   try {
     final saved = await ref.read(siteAuthRepositoryProvider).all();
-    if (saved.isNotEmpty) {
-      await catpaw.setSiteAuth({for (final e in saved.entries) e.key: e.value.toJson()});
+    final active = <String, Map<String, Object?>>{};
+    for (final site in sites) {
+      if (!site.browserVerify) continue;
+      final key = site.key.trim().toLowerCase();
+      final bareKey = key.replaceFirst(RegExp(r'^nodejs_'), '');
+      final stored = saved[key] ?? saved[bareKey];
+      final origin = (stored?.origin.isNotEmpty == true ? stored!.origin : (site.verifyUrl ?? '')).trim();
+      final payload = SiteAuthEntry(
+        siteKey: key,
+        origin: origin,
+        cookie: stored?.cookie ?? '',
+        userAgent: stored?.userAgent ?? '',
+        updatedAt: stored?.updatedAt ?? 0,
+      ).toJson();
+      active[key] = payload;
+      if (bareKey.isNotEmpty && bareKey != key) {
+        active[bareKey] = {...payload, 'siteKey': bareKey};
+      }
     }
+    await catpaw.setSiteAuth(active, replace: true);
   } catch (e) {
-    debugPrint('sync stored site auth failed: $e');
+    debugPrint('sync browserVerify site auth failed: $e');
   }
 }
 
@@ -82,7 +99,13 @@ Future<void> applyVerifiedSiteAuth(WidgetRef ref, SiteAuthEntry entry) async {
   await ref.read(siteAuthRepositoryProvider).save(entry);
   final catpaw = ref.read(catpawClientProvider);
   if (catpaw.attached) {
-    await catpaw.setSiteAuth({entry.siteKey.trim().toLowerCase(): entry.toJson()});
+    final key = entry.siteKey.trim().toLowerCase();
+    final bareKey = key.replaceFirst(RegExp(r'^nodejs_'), '');
+    final json = entry.toJson();
+    await catpaw.setSiteAuth({
+      key: json,
+      if (bareKey.isNotEmpty && bareKey != key) bareKey: {...json, 'siteKey': bareKey},
+    });
   }
   try {
     final subs = await ref.read(subscriptionsProvider.future);
@@ -302,16 +325,20 @@ final catpawSupervisorProvider = Provider<CatpawSupervisor>((ref) {
       await catpaw.attach();
       final cb = ref.read(dartCallbackServerProvider);
       await catpaw.setDartPort(await cb.ensureRunning(), token: cb.token);
-      await _pushStoredSiteAuthToHost(ref, catpaw);
       final profileFilePath = await ref.read(subscriptionProfileServiceProvider).prepareProfilePath(sub.key);
       ref.read(_catpawRuntimeStateProvider).lastRunningSubKey = sub.key;
-      return catpaw.startAndWait(
+      final nextPort = await catpaw.startAndWait(
         name: sub.key,
         scriptPath: installed.scriptPath,
         configPath: installed.configPath,
         force: true,
         env: profileFilePath == null ? null : {'profile_path': profileFilePath},
       );
+      final currentSites = ref.read(catpawRuntimeProvider).valueOrNull?.sites;
+      if (currentSites != null) {
+        await _syncBrowserVerifySitesToHost(ref, catpaw, currentSites);
+      }
+      return nextPort;
     },
     log: (msg) {
       debugPrint(msg);
@@ -375,7 +402,6 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
   // Scripts reach the app through this loopback server; the port must be announced before the script starts.
   final cb = ref.watch(dartCallbackServerProvider);
   await catpaw.setDartPort(await cb.ensureRunning(), token: cb.token);
-  await _pushStoredSiteAuthToHost(ref, catpaw);
   final installer = ref.watch(subscriptionInstallerProvider);
   var installed = await installer.installedScript(sub); // reuse: no network needed on later launches
   var freshlyInstalled = false;
@@ -414,7 +440,9 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
     receiveTimeout: ref.read(appPreferencesProvider).catpawTimeout,
     onConnectionErrorRecover: () => ref.read(catpawSupervisorProvider).recoverNow(),
   );
-  return SpiderRuntime(subscription: sub, api: api, sites: await api.sites());
+  final sites = await api.sites();
+  await _syncBrowserVerifySitesToHost(ref, catpaw, sites);
+  return SpiderRuntime(subscription: sub, api: api, sites: sites);
 });
 
 String _runtimeInputs(List<Subscription> subs) =>
