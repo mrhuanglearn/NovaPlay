@@ -20,7 +20,9 @@ android {
         targetSdk = 36
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-        ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a") }
+        if (project.findProperty("split-per-abi")?.toString()?.toBoolean() != true) {
+            ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a") }
+        }
         manifestPlaceholders["enableImpeller"] = System.getenv("UZV_ENABLE_IMPELLER")?.takeIf { it.isNotBlank() } ?: "true"
     }
 
