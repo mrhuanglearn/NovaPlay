@@ -1,6 +1,52 @@
 import 'package:dio/dio.dart';
+import 'package:flutter/widgets.dart';
+import 'package:go_router/go_router.dart';
 
+import '../features/catpaw/site_auth.dart';
+import '../features/catpaw/spider_api.dart';
 import '../l10n/l10n.dart';
+
+SiteVerifyChallenge? resolveDioVerifyChallenge(
+  Object error,
+  SpiderSite? site, {
+  String? subscriptionHubUrl,
+}) {
+  if (error is DioException) {
+    if (error.type == DioExceptionType.connectionTimeout ||
+        error.type == DioExceptionType.sendTimeout ||
+        error.type == DioExceptionType.receiveTimeout ||
+        error.type == DioExceptionType.connectionError ||
+        error.type == DioExceptionType.badCertificate) {
+      return null;
+    }
+    return detectSiteVerifyChallenge(
+      error,
+      site,
+      subscriptionHubUrl: subscriptionHubUrl,
+      statusCode: error.response?.statusCode,
+      responseData: error.response?.data,
+    );
+  }
+  return detectSiteVerifyChallenge(error, site, subscriptionHubUrl: subscriptionHubUrl);
+}
+
+Future<bool> openSiteVerifyWebView(BuildContext context, SiteVerifyChallenge challenge) async {
+  final res = await context.push<bool>(
+    Uri(
+      path: '/website',
+      queryParameters: {
+        'url': challenge.verifyUrl,
+        'verifySite': challenge.siteKey,
+        'siteName': challenge.siteName,
+      },
+    ).toString(),
+  );
+  return res == true;
+}
+
+void openSiteSnifferWebView(BuildContext context, SiteVerifyChallenge challenge) {
+  context.push(Uri(path: '/sniffer/web', queryParameters: {'url': challenge.verifyUrl}).toString());
+}
 
 /// The reason shown under 加载失败, worded like the original.
 ///

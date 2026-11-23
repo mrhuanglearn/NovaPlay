@@ -16,6 +16,7 @@ import '../features/catpaw/catpaw_protocol.dart';
 import '../features/catpaw/catpaw_recovery.dart';
 import '../features/catpaw/dart_callback_server.dart';
 import '../features/catpaw/manager_client.dart';
+import '../features/catpaw/site_auth.dart';
 import '../features/catpaw/spider_api.dart';
 import '../features/cleanup/cleanup_service.dart';
 import '../features/danmaku/danmu_service.dart';
@@ -63,6 +64,50 @@ final subscriptionServiceProvider = Provider((ref) => SubscriptionService(
     ));
 final historyRepositoryProvider = Provider((ref) => HistoryRepository());
 final favoriteRepositoryProvider = Provider((ref) => FavoriteRepository());
+final siteAuthRepositoryProvider = Provider((ref) => SiteAuthRepository());
+
+Future<void> _pushStoredSiteAuthToHost(Ref ref, CatpawClient catpaw) async {
+  try {
+    final saved = await ref.read(siteAuthRepositoryProvider).all();
+    if (saved.isNotEmpty) {
+      await catpaw.setSiteAuth({for (final e in saved.entries) e.key: e.value.toJson()});
+    }
+  } catch (e) {
+    debugPrint('sync stored site auth failed: $e');
+  }
+}
+
+/// Persists browser-verified credentials for a site and hot-pushes them to the active local CatPaw worker.
+Future<void> applyVerifiedSiteAuth(WidgetRef ref, SiteAuthEntry entry) async {
+  await ref.read(siteAuthRepositoryProvider).save(entry);
+  final catpaw = ref.read(catpawClientProvider);
+  if (catpaw.attached) {
+    await catpaw.setSiteAuth({entry.siteKey.trim().toLowerCase(): entry.toJson()});
+  }
+  try {
+    final subs = await ref.read(subscriptionsProvider.future);
+    final selected = await ref.read(activeSubscriptionKeyProvider.future);
+    final subKey = subs.where((s) => s.key == selected).firstOrNull?.key ?? (subs.isNotEmpty ? subs.first.key : 'default');
+    await ref.read(subscriptionProfileServiceProvider).saveProfile(subKey, {
+      entry.siteKey: {
+        'cookie': entry.cookie,
+        'userAgent': entry.userAgent,
+        'origin': entry.origin,
+      },
+    });
+  } catch (e) {
+    debugPrint('save verified site auth to profile failed: $e');
+  }
+  final rt = ref.read(catpawRuntimeProvider).valueOrNull;
+  if (rt != null) {
+    unawaited(rt.api.saveSiteAuth(
+      siteKey: entry.siteKey,
+      origin: entry.origin,
+      cookie: entry.cookie,
+      userAgent: entry.userAgent,
+    ));
+  }
+}
 final playerConfigRepositoryProvider = Provider((ref) => PlayerConfigRepository());
 final snifferServiceProvider = Provider((ref) => SnifferService());
 final settingsStoreProvider = Provider((ref) => JsonStore('settings.json'));
@@ -257,6 +302,7 @@ final catpawSupervisorProvider = Provider<CatpawSupervisor>((ref) {
       await catpaw.attach();
       final cb = ref.read(dartCallbackServerProvider);
       await catpaw.setDartPort(await cb.ensureRunning(), token: cb.token);
+      await _pushStoredSiteAuthToHost(ref, catpaw);
       final profileFilePath = await ref.read(subscriptionProfileServiceProvider).prepareProfilePath(sub.key);
       ref.read(_catpawRuntimeStateProvider).lastRunningSubKey = sub.key;
       return catpaw.startAndWait(
@@ -329,6 +375,7 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
   // Scripts reach the app through this loopback server; the port must be announced before the script starts.
   final cb = ref.watch(dartCallbackServerProvider);
   await catpaw.setDartPort(await cb.ensureRunning(), token: cb.token);
+  await _pushStoredSiteAuthToHost(ref, catpaw);
   final installer = ref.watch(subscriptionInstallerProvider);
   var installed = await installer.installedScript(sub); // reuse: no network needed on later launches
   var freshlyInstalled = false;

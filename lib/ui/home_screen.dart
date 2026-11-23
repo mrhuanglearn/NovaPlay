@@ -265,6 +265,10 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
   String? _loadedFor;
   SpiderSite? _site;
   String? _typeId;
+  String? _autoVerifyTriggeredSite;
+
+  static bool get _inWidgetTest =>
+      WidgetsBinding.instance.runtimeType.toString().contains('TestWidgetsFlutterBinding');
 
   /// Bumped whenever the list starts over (site, category or a filter changed, 重新加载), so answers to requests of
   /// an older list are dropped.
@@ -284,6 +288,7 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
   void _ensureLoaded(String? subKey, SpiderSite site, String? typeId) {
     final key = '${subKey ?? ''}|${site.key}|$typeId';
     if (key == _loadedFor) return;
+    if (_site?.key != site.key) _autoVerifyTriggeredSite = null;
     _loadedFor = key;
     _site = site;
     _typeId = typeId;
@@ -318,13 +323,26 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
       });
     } catch (e) {
       if (!mounted || generation != _generation) return;
+      final firstPage = _items.isEmpty;
       setState(() {
         _loading = false;
-        if (_items.isEmpty) _error = e;
+        if (firstPage) _error = e;
       });
-      if (_items.isNotEmpty) {
+      if (!firstPage) {
         // A later page failed: keep what is shown; scrolling to the end again retries.
         showToast(describeLoadError(e, context.l10n));
+        return;
+      }
+      final sub = ref.read(catpawRuntimeProvider).valueOrNull?.subscription;
+      final subUrl = sub?.indexJsUrl ?? sub?.cloudUrl;
+      final challenge = resolveDioVerifyChallenge(e, site, subscriptionHubUrl: subUrl);
+      if (challenge != null && _autoVerifyTriggeredSite != site.key && !_inWidgetTest) {
+        _autoVerifyTriggeredSite = site.key;
+        WidgetsBinding.instance.addPostFrameCallback((_) async {
+          if (!mounted || _site?.key != site.key) return;
+          final ok = await openSiteVerifyWebView(context, challenge);
+          if (ok && mounted && _site?.key == site.key) _reload();
+        });
       }
     }
   }
@@ -389,14 +407,22 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
     ref.watch(selectedTypeIdProvider);
     final prefs = ref.watch(homePrefsProvider).valueOrNull ?? const HomePrefs();
     final site = ref.watch(currentSiteProvider);
-    final subKey = ref.watch(catpawRuntimeProvider).valueOrNull?.subscription.key;
+    final sub = ref.watch(catpawRuntimeProvider).valueOrNull?.subscription;
+    final subKey = sub?.key;
+    final subUrl = sub?.indexJsUrl ?? sub?.cloudUrl;
     final feed = ref.watch(videoFeedProvider);
     final bottom = tabBottomInset(context);
     return feed.when(
       skipLoadingOnRefresh: false,
       skipLoadingOnReload: false,
       loading: () => const Center(child: CircularProgressIndicator()),
-      error: (e, _) => ErrorState(error: e, bottomInset: bottom, onRetry: () => ref.invalidate(videoFeedProvider)),
+      error: (e, _) => ErrorState(
+        error: e,
+        site: site,
+        subscriptionUrl: subUrl,
+        bottomInset: bottom,
+        onRetry: () => ref.invalidate(videoFeedProvider),
+      ),
       data: (home) {
         if (home == null || site == null) return const SizedBox.shrink();
         final blocked = prefs.blockedFor(site.key);
@@ -415,10 +441,13 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
               : VodGrid(items: home.featured, bottomInset: bottom);
         } else if (_items.isEmpty && _error != null) {
           list = filters == null
-              ? ErrorState(error: _error!, bottomInset: bottom, onRetry: _reload)
+              ? ErrorState(error: _error!, site: site, subscriptionUrl: subUrl, bottomInset: bottom, onRetry: _reload)
               : ListView(children: [
                   filters,
-                  SizedBox(height: 380, child: ErrorState(error: _error!, onRetry: _reload)),
+                  SizedBox(
+                    height: 410,
+                    child: ErrorState(error: _error!, site: site, subscriptionUrl: subUrl, onRetry: _reload),
+                  ),
                 ]);
         } else if (_items.isEmpty && !_done) {
           list = VodSkeletonGrid(header: filters, bottomInset: bottom);

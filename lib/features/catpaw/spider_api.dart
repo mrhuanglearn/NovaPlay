@@ -213,4 +213,23 @@ class SpiderApi {
 
   Future<PlayResult> play(SpiderSite site, String flag, String id) async =>
       PlayResult.fromJson(await _post(site, 'play', {'flag': flag, 'id': id}));
+
+  /// Best-effort sync of browser-verified site credentials into CatPaw's local DB (`/website/api/site-auth`).
+  Future<void> saveSiteAuth({
+    required String siteKey,
+    required String origin,
+    required String cookie,
+    required String userAgent,
+  }) async {
+    try {
+      await _dio.post<Object?>('/website/api/site-auth', data: {
+        'siteKey': siteKey,
+        'origin': origin,
+        'cookie': cookie,
+        'userAgent': userAgent,
+      });
+    } catch (_) {
+      // Older bundles only rely on node_host setSiteAuth injection.
+    }
+  }
 }

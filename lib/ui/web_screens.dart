@@ -1,14 +1,17 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:go_router/go_router.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../app/providers.dart';
 import '../app/theme.dart';
 import '../app/ui_hooks.dart';
+import '../features/catpaw/site_auth.dart';
 import '../features/player/playback_source.dart';
 import '../features/sniffer/sniffer_service.dart';
 import '../l10n/l10n.dart';
@@ -17,12 +20,20 @@ import 'widgets.dart';
 final _mediaUrl = RegExp(r'\.(m3u8|mp4|mpd|flv)(\?|$)', caseSensitive: false);
 
 /// In-app browser. With [sniff] on (`/sniffer/web`) it collects the media streams the page requests and lets the user
-/// play them; without it (`/website`, opened by a script's `openInternalWebview`) it is a plain page with the
-/// original's title bar (see `_plainBar`).
+/// play them; without it (`/website`, opened by a script's `openInternalWebview` or 403 site verification) it is a
+/// plain page with the original's title bar (see `_plainBar`).
 class WebScreen extends ConsumerStatefulWidget {
-  const WebScreen({super.key, this.initialUrl = '', this.sniff = false});
+  const WebScreen({
+    super.key,
+    this.initialUrl = '',
+    this.sniff = false,
+    this.verifySiteKey,
+    this.verifySiteName,
+  });
   final String initialUrl;
   final bool sniff;
+  final String? verifySiteKey;
+  final String? verifySiteName;
   @override
   ConsumerState<WebScreen> createState() => _WebScreenState();
 }
@@ -31,20 +42,98 @@ class _WebScreenState extends ConsumerState<WebScreen> {
   late final _url = TextEditingController(text: widget.initialUrl);
   InAppWebViewController? _web;
   StreamSubscription<SniffedResource>? _sub;
+  Timer? _verifyTimer;
+  bool _completingVerify = false;
   final _found = <SniffedResource>[];
   String _current = '';
+
+  bool get _isVerifyMode => (widget.verifySiteKey ?? '').trim().isNotEmpty;
 
   @override
   void initState() {
     super.initState();
     _current = widget.initialUrl;
+    if (_isVerifyMode) {
+      // Keep the WebView's native mobile User-Agent so TLS, navigator.platform, and Cookie match subsequent requests.
+      _agentKey = 'default';
+      _verifyTimer = Timer.periodic(
+        const Duration(milliseconds: 900),
+        (_) => _probeAndCompleteVerify(manual: false),
+      );
+    }
   }
 
   @override
   void dispose() {
+    _verifyTimer?.cancel();
     _sub?.cancel();
     _url.dispose();
     super.dispose();
+  }
+
+  Future<void> _probeAndCompleteVerify({required bool manual}) async {
+    final controller = _web;
+    final siteKey = widget.verifySiteKey?.trim() ?? '';
+    if (_completingVerify || controller == null || siteKey.isEmpty || !mounted) return;
+    try {
+      final rawEval = await controller.evaluateJavascript(source: r'''
+        (function() {
+          var html = document.documentElement ? document.documentElement.innerHTML : '';
+          var sample = ((document.title || '') + '\n' + html.slice(0, 12000));
+          var isChallenge = /__cdn_pow|cf-turnstile|_cf_chl_opt|acw_sc__v2|Just a moment|Checking your browser|^403\b|403 Forbidden|访问验证|安全验证|人机验证|正在进行安全检查/i.test(sample);
+          var vodCount = document.querySelectorAll('a[href*="/detail/"], a[href*="/vod"], a[href*="/video/"], a[href*="/play/"], .stui-vodlist__box, .module-item, .myui-vodlist__box, .fed-list-item').length;
+          return JSON.stringify({
+            readyComplete: document.readyState === 'complete',
+            isChallenge: isChallenge,
+            vodCount: vodCount,
+            ua: navigator.userAgent || ''
+          });
+        })()
+      ''');
+      Map<String, dynamic> probe = const {};
+      if (rawEval is String && rawEval.isNotEmpty) {
+        final decoded = jsonDecode(rawEval);
+        if (decoded is Map) probe = decoded.cast<String, dynamic>();
+      } else if (rawEval is Map) {
+        probe = rawEval.cast<String, dynamic>();
+      }
+      if (!manual) {
+        final readyComplete = probe['readyComplete'] == true;
+        final isChallenge = probe['isChallenge'] == true;
+        final vodCount = (probe['vodCount'] as num?)?.toInt() ?? 0;
+        if (!readyComplete || isChallenge || vodCount < 3) return;
+      }
+      _completingVerify = true;
+      _verifyTimer?.cancel();
+      final currentWebUri = await controller.getUrl() ?? WebUri(_current);
+      final parsed = Uri.tryParse(currentWebUri.toString()) ?? Uri.parse(_current);
+      final origin = '${parsed.scheme}://${parsed.authority}';
+      final cookieMgr = CookieManager.instance();
+      final mergedCookies = <String, String>{};
+      for (final target in [WebUri('$origin/'), currentWebUri]) {
+        final list = await cookieMgr.getCookies(url: target);
+        for (final c in list) {
+          if (c.name.isNotEmpty) mergedCookies[c.name] = '${c.value}';
+        }
+      }
+      final cookieHeader = [for (final e in mergedCookies.entries) '${e.key}=${e.value}'].join('; ');
+      final ua = ('${probe['ua'] ?? ''}').trim();
+      await applyVerifiedSiteAuth(
+        ref,
+        SiteAuthEntry(
+          siteKey: siteKey,
+          origin: origin,
+          cookie: cookieHeader,
+          userAgent: ua,
+          updatedAt: DateTime.now().millisecondsSinceEpoch,
+        ),
+      );
+      if (!mounted) return;
+      showSuccessHud(context, '验证完成，正在刷新列表');
+      Navigator.of(context).pop(true);
+    } catch (_) {
+      if (manual) _completingVerify = false;
+    }
   }
 
   void _add(SniffedResource r) {
@@ -183,13 +272,22 @@ class _WebScreenState extends ConsumerState<WebScreen> {
   /// a back arrow, the page's title centred, and a ⋯ menu with 重新加载 and a red 清空网页 Cookie; no address bar.
   PreferredSizeWidget _plainBar(BuildContext context) {
     final l = context.l10n;
+    final verifyName = widget.verifySiteName?.trim();
+    final barTitle = _isVerifyMode
+        ? '验证 · ${verifyName != null && verifyName.isNotEmpty ? verifyName : (Uri.tryParse(_current)?.host ?? '')}'
+        : (_title?.trim().isNotEmpty == true ? _title!.trim() : (Uri.tryParse(_current)?.host ?? ''));
     return AppBar(
-      centerTitle: true,
-      title: Text(_title?.trim().isNotEmpty == true ? _title!.trim() : (Uri.tryParse(_current)?.host ?? ''),
+      centerTitle: !_isVerifyMode,
+      title: Text(barTitle,
           maxLines: 1,
           overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w700)),
+          style: const TextStyle(fontSize: 17, fontWeight: FontWeight.w700)),
       actions: [
+        if (_isVerifyMode)
+          TextButton(
+            onPressed: () => _probeAndCompleteVerify(manual: true),
+            child: const Text('完成返回', style: TextStyle(fontWeight: FontWeight.w600)),
+          ),
         PopupMenuButton<String>(
           icon: const Icon(Icons.more_horiz),
           position: PopupMenuPosition.under,
@@ -197,6 +295,10 @@ class _WebScreenState extends ConsumerState<WebScreen> {
             switch (v) {
               case 'reload':
                 await _web?.reload();
+              case 'sniffer':
+                if (context.mounted) {
+                  context.pushReplacement(Uri(path: '/sniffer/web', queryParameters: {'url': _current}).toString());
+                }
               case 'cookies':
                 await CookieManager.instance().deleteAllCookies();
                 showToast(l.webCookiesCleared);
@@ -206,6 +308,11 @@ class _WebScreenState extends ConsumerState<WebScreen> {
             PopupMenuItem(
                 value: 'reload',
                 child: ListTile(dense: true, leading: const Icon(Icons.refresh), title: Text(l.reload))),
+            if (_isVerifyMode)
+              const PopupMenuItem(
+                value: 'sniffer',
+                child: ListTile(dense: true, leading: Icon(Icons.radar), title: Text('嗅探浏览器打开')),
+              ),
             PopupMenuItem(
               value: 'cookies',
               child: ListTile(
@@ -232,12 +339,30 @@ class _WebScreenState extends ConsumerState<WebScreen> {
         appBar: _plainBar(context),
         body: _current.isEmpty
             ? const SizedBox.expand()
-            : InAppWebView(
-                initialUrlRequest: URLRequest(url: WebUri(_current)),
-                initialSettings: settings,
-                onWebViewCreated: (c) => _web = c,
-                onTitleChanged: (c, title) => setState(() => _title = title),
-              ),
+            : Column(children: [
+                if (_isVerifyMode)
+                  Container(
+                    width: double.infinity,
+                    color: c.accent.withValues(alpha: 0.12),
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                    child: Text(
+                      '完成站点安全验证并加载出首页后将自动返回视频列表；也可点右上角「完成返回」',
+                      style: TextStyle(fontSize: 12.5, color: c.label),
+                    ),
+                  ),
+                Expanded(
+                  child: InAppWebView(
+                    initialUrlRequest: URLRequest(url: WebUri(_current)),
+                    initialSettings: settings,
+                    onWebViewCreated: (c) => _web = c,
+                    onTitleChanged: (c, title) => setState(() => _title = title),
+                    onLoadStop: (c, uri) {
+                      if (uri != null) _current = uri.toString();
+                      if (_isVerifyMode) _probeAndCompleteVerify(manual: false);
+                    },
+                  ),
+                ),
+              ]),
       );
     }
     return Scaffold(

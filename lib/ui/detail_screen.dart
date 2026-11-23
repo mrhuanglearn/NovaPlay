@@ -530,7 +530,13 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
                   const Center(child: CircularProgressIndicator()),
                 ],
               ),
-        error: (e, _) => ErrorState(error: e, onRetry: _retry),
+        error: (e, _) => ErrorState(
+          error: e,
+          site: ref.watch(siteByKeyProvider(widget.siteKey)),
+          subscriptionUrl: ref.watch(catpawRuntimeProvider).valueOrNull?.subscription.indexJsUrl ??
+              ref.watch(catpawRuntimeProvider).valueOrNull?.subscription.cloudUrl,
+          onRetry: _retry,
+        ),
         data: (d) {
           if (d == null) return EmptyState(icon: Icons.search_off, title: l.notFound);
           final overview =

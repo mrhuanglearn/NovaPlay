@@ -31,6 +31,7 @@ const {
   port,
   dartPort: initialDartPort,
   dartToken: initialDartToken,
+  siteAuth: initialSiteAuth,
   env,
   allowWriteDirs = [],
   allowReadDirs = [],
@@ -40,6 +41,76 @@ const {
 } = workerData || {};
 let currentDartPort = initialDartPort || 0;
 let currentDartToken = initialDartToken || '';
+let currentSiteAuth = initialSiteAuth && typeof initialSiteAuth === 'object' ? { ...initialSiteAuth } : {};
+
+const RESERVED_HUB_SEGS = new Set([
+  'api', 'proxy', 'spider', 'website', 'admin', 't4', 'check', 'config', 'health',
+  'catalog-sync', 'index.js', 'index.js.md5', 'index.config.js',
+]);
+const CHALLENGE_BODY_RE =
+  /(?:__cdn_pow|cf-turnstile|_cf_chl_opt|acw_sc__v2|<title>\s*(?:Just a moment|403\b|安全验证|访问验证|人机验证))/i;
+const VOD_DOM_HINT_RE = /(?:\/detail\/|voddetail|module-item|stui-vodlist|myui-vodlist)/i;
+
+function resolveOutboundSiteOverride(u) {
+  if (!u) return null;
+  const targetPort = Number(u.port) || (u.protocol === 'https:' ? 443 : 80);
+  if (isCurrentDartCallbackTarget(u.hostname, targetPort)) return null;
+  const selfPort = Number(process.env.DEV_HTTP_PORT) || 0;
+  if (isLoopback(u.hostname) && selfPort > 0 && targetPort === selfPort) return null;
+
+  if (!isLoopback(u.hostname)) {
+    const segs = u.pathname.split('/').filter(Boolean);
+    if (segs.length >= 1) {
+      const s0 = segs[0].toLowerCase();
+      const s1 = segs.length >= 2 ? segs[1].toLowerCase() : '';
+      let matchedKey = '';
+      let prefixLen = 0;
+      if (!RESERVED_HUB_SEGS.has(s0) && (currentSiteAuth[s0] || s0 === 'libvio')) {
+        matchedKey = s0;
+        prefixLen = 1 + segs[0].length;
+      } else if (s1 && !RESERVED_HUB_SEGS.has(s0) && !RESERVED_HUB_SEGS.has(s1) && (currentSiteAuth[s1] || s1 === 'libvio')) {
+        matchedKey = s1;
+        prefixLen = 2 + segs[0].length + segs[1].length;
+      }
+      if (matchedKey) {
+        const auth = currentSiteAuth[matchedKey];
+        const origin = (auth && auth.origin ? String(auth.origin) : (matchedKey === 'libvio' ? 'https://libvio.host' : '')).replace(/\/+$/, '');
+        if (origin && u.origin.toLowerCase() !== origin.toLowerCase()) {
+          const restPath = u.pathname.slice(prefixLen) || '/';
+          return {
+            targetUrl: `${origin}${restPath.startsWith('/') ? restPath : '/' + restPath}${u.search}`,
+            origin,
+            cookie: auth && auth.cookie ? String(auth.cookie) : '',
+            userAgent: auth && auth.userAgent ? String(auth.userAgent) : '',
+          };
+        }
+      }
+    }
+  }
+  const reqHost = u.hostname.toLowerCase();
+  const reqOrigin = u.origin.toLowerCase();
+  for (const [key, auth] of Object.entries(currentSiteAuth)) {
+    if (!auth || typeof auth !== 'object') continue;
+    const rawOrigin = String(auth.origin || '').trim().replace(/\/+$/, '');
+    let authHost = '';
+    try { if (rawOrigin) authHost = new URL(rawOrigin).hostname.toLowerCase(); } catch { /* ignore */ }
+      const sameSite = isLoopback(reqHost)
+      ? Boolean(rawOrigin && reqOrigin === rawOrigin.toLowerCase())
+      : Boolean(
+          (authHost && (reqHost === authHost || reqHost.endsWith('.' + authHost) || authHost.endsWith('.' + reqHost))) ||
+          ((key === 'libvio' || key === 'nodejs_libvio') && /^(?:www\.)?libvio/i.test(reqHost))
+        );
+    if (sameSite) {
+      return {
+        targetUrl: null,
+        origin: rawOrigin || `${u.protocol}//${u.host}`,
+        cookie: auth.cookie ? String(auth.cookie) : '',
+        userAgent: auth.userAgent ? String(auth.userAgent) : '',
+      };
+    }
+  }
+  return null;
+}
 
 const LOG_BATCH_MAX = 32;
 const LOG_BATCH_MS = 20;
@@ -173,50 +244,89 @@ function isCurrentDartCallbackTarget(host, targetPort) {
   return currentDartPort > 0 && currentDartToken && isLoopback(host) && Number(targetPort) === currentDartPort;
 }
 
-const baseHttpRequest = http.request;
-http.request = function callbackAuthedRequest(...args) {
-  const req = baseHttpRequest.apply(this, args);
-  try {
-    const first = args[0];
-    let host = '';
-    let targetPort = 0;
-    if (typeof first === 'string' || first instanceof URL) {
-      const u = first instanceof URL ? first : new URL(first, 'http://127.0.0.1');
-      host = u.hostname;
-      targetPort = Number(u.port) || 80;
-    } else if (first && typeof first === 'object') {
-      host = first.hostname || (first.host || '').split(':')[0] || '127.0.0.1';
-      targetPort = Number(first.port || (first.host && first.host.includes(':') ? first.host.split(':')[1] : 80));
-    }
-    if (isCurrentDartCallbackTarget(host, targetPort) && !req.getHeader('x-uzv-token')) {
-      req.setHeader('x-uzv-token', currentDartToken);
-    }
-  } catch { /* ignore malformed options */ }
-  return req;
-};
-http.get = function callbackAuthedGet(...args) {
-  const req = http.request.apply(this, args);
-  req.end();
-  return req;
-};
+function installRequestAuthHook(mod, proto) {
+  const baseReq = mod.request;
+  mod.request = function authedRequest(...args) {
+    const req = baseReq.apply(this, args);
+    try {
+      const first = args[0];
+      let u = null;
+      if (typeof first === 'string' || first instanceof URL) {
+        u = first instanceof URL ? first : new URL(first, `${proto}://127.0.0.1`);
+      } else if (first && typeof first === 'object') {
+        const hostHeader = first.host || `${first.hostname || '127.0.0.1'}${first.port ? ':' + first.port : ''}`;
+        u = new URL(first.path || '/', `${proto}://${hostHeader}`);
+      }
+      if (u) {
+        const defaultPort = proto === 'https' ? 443 : 80;
+        const targetPort = Number(u.port) || defaultPort;
+        if (proto === 'http' && isCurrentDartCallbackTarget(u.hostname, targetPort) && !req.getHeader('x-uzv-token')) {
+          req.setHeader('x-uzv-token', currentDartToken);
+        } else {
+          const ov = resolveOutboundSiteOverride(u);
+          if (ov) {
+            if (ov.cookie) req.setHeader('Cookie', ov.cookie);
+            if (ov.userAgent) req.setHeader('User-Agent', ov.userAgent);
+          }
+        }
+      }
+    } catch { /* ignore malformed options */ }
+    return req;
+  };
+  mod.get = function authedGet(...args) {
+    const req = mod.request.apply(this, args);
+    req.end();
+    return req;
+  };
+}
+installRequestAuthHook(http, 'http');
+installRequestAuthHook(https, 'https');
 
 installJitlessPolyfill({ http, https });
 
 if (typeof globalThis.fetch === 'function') {
   const baseFetch = globalThis.fetch.bind(globalThis);
-  globalThis.fetch = function callbackAuthedFetch(input, init) {
+  globalThis.fetch = async function callbackAuthedFetch(input, init) {
+    let targetInput = input;
+    let targetInit = init;
+    let parsedUrl = null;
     try {
       const rawUrl = typeof input === 'string' ? input : (input instanceof URL ? input.toString() : (input && input.url));
       if (rawUrl) {
-        const u = new URL(rawUrl);
-        if (isCurrentDartCallbackTarget(u.hostname, Number(u.port) || 80)) {
+        parsedUrl = new URL(rawUrl);
+        if (isCurrentDartCallbackTarget(parsedUrl.hostname, Number(parsedUrl.port) || 80)) {
           const headers = new Headers((init && init.headers) || (input && input.headers) || undefined);
           if (!headers.has('x-uzv-token')) headers.set('x-uzv-token', currentDartToken);
           return baseFetch(input, { ...(init || {}), headers });
         }
+        const ov = resolveOutboundSiteOverride(parsedUrl);
+        if (ov) {
+          const headers = new Headers((init && init.headers) || (input && input.headers) || undefined);
+          if (ov.cookie) headers.set('cookie', ov.cookie);
+          if (ov.userAgent) headers.set('user-agent', ov.userAgent);
+          if (ov.targetUrl) {
+            headers.set('referer', ov.origin + '/');
+            targetInput = ov.targetUrl;
+          }
+          targetInit = { ...(init || {}), headers };
+        }
       }
     } catch { /* fall through */ }
-    return baseFetch(input, init);
+    const res = await baseFetch(targetInput, targetInit);
+    try {
+      if (parsedUrl && !isLoopback(parsedUrl.hostname) && res && res.status === 200) {
+        const ct = String(res.headers.get('content-type') || '').toLowerCase();
+        const cl = Number(res.headers.get('content-length') || 0);
+        if (ct.includes('text/html') && (cl === 0 || cl < 262144)) {
+          const text = await res.text();
+          if (text.length < 262144 && CHALLENGE_BODY_RE.test(text.slice(0, 32768)) && !VOD_DOM_HINT_RE.test(text)) {
+            return new Response(text, { status: 403, statusText: 'Browser Verification Required', headers: res.headers });
+          }
+          return new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers });
+        }
+      }
+    } catch { /* return res if body already consumed or unsupported */ }
+    return res;
   };
 }
 
@@ -255,7 +365,20 @@ http.createServer = function createServer(...args) {
 const LISTEN_RETRY_LIMIT = 50;
 
 globalThis.catServerFactory = (handler) => {
-  const server = http.createServer(handler);
+  const wrappedHandler = (inReq, outRes) => {
+    try {
+      if (inReq && typeof inReq.url === 'string' && inReq.url.startsWith('/proxy/img?') && inReq.url.includes('hp=1')) {
+        const q = new URL(inReq.url, 'http://127.0.0.1');
+        const target = q.searchParams.get('u');
+        if (target && resolveOutboundSiteOverride(new URL(target))) {
+          q.searchParams.delete('hp');
+          inReq.url = q.pathname + q.search;
+        }
+      }
+    } catch { /* ignore malformed proxy url */ }
+    return handler(inReq, outRes);
+  };
+  const server = http.createServer(wrappedHandler);
   let addr = null;
   let retries = 0;
   let allowFallback = true;
@@ -410,6 +533,10 @@ function patchLegacyCatpawBundle(src) {
     've={parse:0,url:gt,...H?{}:{header:te},',
     've={parse:0,url:gt,header:te,'
   );
+  out = out.replace(
+    'Checking your browser)/i',
+    'Checking your browser|__cdn_pow|acw_sc__v2)/i'
+  );
   return out;
 }
 
@@ -459,6 +586,8 @@ parentPort.on('message', (msg) => {
   } else if (msg.type === LoaderMsg.setDartPort) {
     currentDartPort = Number(msg.port) || 0;
     if (typeof msg.token === 'string') currentDartToken = msg.token;
+  } else if (msg.type === LoaderMsg.setSiteAuth) {
+    currentSiteAuth = msg.siteAuth && typeof msg.siteAuth === 'object' ? { ...msg.siteAuth } : {};
   }
 });
 

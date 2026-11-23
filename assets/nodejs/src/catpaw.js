@@ -133,6 +133,8 @@ function createCatpawHost({ bridge, workerEntryPath }) {
   const instances = {};
   let dartServerPort = 0;
   let dartServerToken = '';
+  /** @type {Record<string, {siteKey: string, origin?: string, cookie?: string, userAgent?: string, updatedAt?: number}>} */
+  let siteAuthMap = {};
   let chain = Promise.resolve();
 
   const status = (text) => bridge.channel(Channel.status).send(text);
@@ -252,6 +254,7 @@ function createCatpawHost({ bridge, workerEntryPath }) {
       name,
       workerData: {
         name, scriptPath, configPath, dataDir, port: resolvedPort, dartPort: dartServerPort, dartToken: dartServerToken,
+        siteAuth: siteAuthMap,
         env: env || {}, allowWriteDirs: [dataDir, tempDir, ...extraDirs], allowReadDirs: [path.dirname(scriptPath), ...extraDirs],
         redirectRoot: tempDir, enableNetLog: !!enableNetLog, enableLog: enableLog !== false,
       },
@@ -328,6 +331,35 @@ function createCatpawHost({ bridge, workerEntryPath }) {
         if (typeof cmd.token === 'string') dartServerToken = cmd.token;
         for (const inst of Object.values(instances)) {
           try { inst.worker.postMessage({ type: LoaderMsg.setDartPort, port: dartServerPort, token: dartServerToken }); } catch { /* gone */ }
+        }
+        return;
+      }
+      if (action === Action.setSiteAuth) {
+        if (cmd.sites && typeof cmd.sites === 'object') {
+          const next = { ...siteAuthMap };
+          for (const [k, v] of Object.entries(cmd.sites)) {
+            const key = String(k || '').trim().toLowerCase();
+            if (!key) continue;
+            if (!v) delete next[key];
+            else next[key] = { siteKey: key, ...v };
+          }
+          siteAuthMap = next;
+        } else if (typeof cmd.siteKey === 'string' && cmd.siteKey.trim()) {
+          const key = cmd.siteKey.trim().toLowerCase();
+          if (cmd.clear) {
+            delete siteAuthMap[key];
+          } else {
+            siteAuthMap[key] = {
+              siteKey: key,
+              origin: typeof cmd.origin === 'string' ? cmd.origin : undefined,
+              cookie: typeof cmd.cookie === 'string' ? cmd.cookie : undefined,
+              userAgent: typeof cmd.userAgent === 'string' ? cmd.userAgent : undefined,
+              updatedAt: cmd.updatedAt || Date.now(),
+            };
+          }
+        }
+        for (const inst of Object.values(instances)) {
+          try { inst.worker.postMessage({ type: LoaderMsg.setSiteAuth, siteAuth: siteAuthMap }); } catch { /* gone */ }
         }
         return;
       }

@@ -385,33 +385,88 @@ class EmptyState extends StatelessWidget {
 /// OBSERVED (a mock site failing with HTTP 500): a pink error icon (#FFB4AB in the dark theme) with a faint glow,
 /// 加载失败, the reason in grey (see [describeLoadError]) and an outlined 重新加载 button with accent text.
 class ErrorState extends StatelessWidget {
-  const ErrorState({super.key, required this.error, this.title, this.onRetry, this.bottomInset = 0});
+  const ErrorState({
+    super.key,
+    required this.error,
+    this.title,
+    this.onRetry,
+    this.bottomInset = 0,
+    this.site,
+    this.subscriptionUrl,
+  });
   final Object error;
   final String? title;
   final VoidCallback? onRetry;
   final double bottomInset;
+  final SpiderSite? site;
+  final String? subscriptionUrl;
 
   @override
-  Widget build(BuildContext context) => EmptyState(
-        icon: Icons.error_outline,
-        color: AppColors.dangerText(context),
-        title: title ?? context.l10n.loadFailed,
-        subtitle: error is String ? error as String : describeLoadError(error, context.l10n),
+  Widget build(BuildContext context) {
+    final challenge = resolveDioVerifyChallenge(error, site, subscriptionHubUrl: subscriptionUrl);
+    if (challenge != null) {
+      final c = AppColors.of(context);
+      return EmptyState(
+        icon: Icons.verified_user_outlined,
+        title: '${challenge.siteName} 需要浏览器安全验证',
+        subtitle: '站点开启了 403 访问验证，在内置浏览器完成验证后将自动返回视频列表',
         bottomInset: bottomInset,
-        action: onRetry == null
-            ? null
-            : OutlinedButton(
-                style: OutlinedButton.styleFrom(
-                  foregroundColor: AppColors.of(context).accent,
-                  shape: const StadiumBorder(),
-                  side: BorderSide(color: AppColors.of(context).secondaryLabel.withValues(alpha: 0.7)),
-                  minimumSize: const Size(104, 39),
-                  textStyle: const TextStyle(fontSize: 14),
-                ),
-                onPressed: onRetry,
-                child: Text(context.l10n.reload),
-              ),
+        actionGap: 20,
+        action: Column(mainAxisSize: MainAxisSize.min, children: [
+          FilledButton.icon(
+            style: FilledButton.styleFrom(
+              minimumSize: const Size(216, 40),
+              shape: const StadiumBorder(),
+              textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+            ),
+            icon: const Icon(Icons.open_in_browser, size: 19),
+            label: const Text('去内置浏览器验证'),
+            onPressed: () async {
+              final ok = await openSiteVerifyWebView(context, challenge);
+              if (ok && context.mounted) onRetry?.call();
+            },
+          ),
+          const SizedBox(height: 10),
+          OutlinedButton.icon(
+            style: OutlinedButton.styleFrom(
+              foregroundColor: c.label,
+              shape: const StadiumBorder(),
+              side: BorderSide(color: c.secondaryLabel.withValues(alpha: 0.6)),
+              minimumSize: const Size(216, 39),
+              textStyle: const TextStyle(fontSize: 13.5),
+            ),
+            icon: const Icon(Icons.radar, size: 18),
+            label: const Text('直接在嗅探浏览器观看'),
+            onPressed: () => openSiteSnifferWebView(context, challenge),
+          ),
+          if (onRetry != null) ...[
+            const SizedBox(height: 4),
+            TextButton(onPressed: onRetry, child: Text(context.l10n.reload)),
+          ],
+        ]),
       );
+    }
+    return EmptyState(
+      icon: Icons.error_outline,
+      color: AppColors.dangerText(context),
+      title: title ?? context.l10n.loadFailed,
+      subtitle: error is String ? error as String : describeLoadError(error, context.l10n),
+      bottomInset: bottomInset,
+      action: onRetry == null
+          ? null
+          : OutlinedButton(
+              style: OutlinedButton.styleFrom(
+                foregroundColor: AppColors.of(context).accent,
+                shape: const StadiumBorder(),
+                side: BorderSide(color: AppColors.of(context).secondaryLabel.withValues(alpha: 0.7)),
+                minimumSize: const Size(104, 39),
+                textStyle: const TextStyle(fontSize: 14),
+              ),
+              onPressed: onRetry,
+              child: Text(context.l10n.reload),
+            ),
+    );
+  }
 }
 
 /// Grey poster placeholders shown while the first page of a category loads (OBSERVED on a slow mock site: poster

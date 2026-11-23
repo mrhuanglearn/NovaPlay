@@ -25,11 +25,23 @@ class _SubCategoryScreenState extends ConsumerState<SubCategoryScreen> {
   int _page = 1;
   bool _loading = false;
   bool _done = false;
+  Object? _error;
 
   @override
   void initState() {
     super.initState();
     WidgetsBinding.instance.addPostFrameCallback((_) => _more());
+  }
+
+  void _reload() {
+    setState(() {
+      _items.clear();
+      _page = 1;
+      _done = false;
+      _loading = false;
+      _error = null;
+    });
+    _more();
   }
 
   Future<void> _more() async {
@@ -51,12 +63,16 @@ class _SubCategoryScreenState extends ConsumerState<SubCategoryScreen> {
           _done = !res.hasMore || res.items.isEmpty;
           _page++;
         }
+        _error = null;
         _loading = false;
       });
     } catch (e) {
       if (mounted) {
-        setState(() => _loading = false);
-        showToast(describeLoadError(e, context.l10n));
+        setState(() {
+          _loading = false;
+          if (_items.isEmpty) _error = e;
+        });
+        if (_items.isNotEmpty) showToast(describeLoadError(e, context.l10n));
       }
     }
   }
@@ -94,9 +110,17 @@ class _SubCategoryScreenState extends ConsumerState<SubCategoryScreen> {
         if ((category?.filters ?? const <VodFilter>[]).isNotEmpty)
           CategoryFilterBar(filters: category!.filters, chosen: _filters, onChanged: _setFilter),
         Expanded(
-          child: _items.isEmpty && !_loading
-              ? EmptyState(icon: Icons.search_off, title: context.l10n.noData, subtitle: context.l10n.nothingHere)
-              : VodGrid(items: _items, onNearEnd: _more),
+          child: _items.isEmpty && _error != null
+              ? ErrorState(
+                  error: _error!,
+                  site: ref.watch(siteByKeyProvider(widget.siteKey)),
+                  subscriptionUrl: ref.watch(catpawRuntimeProvider).valueOrNull?.subscription.indexJsUrl ??
+                      ref.watch(catpawRuntimeProvider).valueOrNull?.subscription.cloudUrl,
+                  onRetry: _reload,
+                )
+              : _items.isEmpty && !_loading
+                  ? EmptyState(icon: Icons.search_off, title: context.l10n.noData, subtitle: context.l10n.nothingHere)
+                  : VodGrid(items: _items, onNearEnd: _more),
         ),
       ]),
     );

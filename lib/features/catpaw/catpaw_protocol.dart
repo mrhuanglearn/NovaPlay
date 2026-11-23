@@ -13,6 +13,7 @@ class Actions {
   static const install = 'install';
   static const uninstall = 'uninstall';
   static const setDartPort = 'setDartPort';
+  static const setSiteAuth = 'setSiteAuth';
   static const reload = 'reload';
   static const reloadDanmu = 'reloadDanmu';
 }

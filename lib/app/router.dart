@@ -118,7 +118,14 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
           path: '/sniffer/web',
           builder: (c, s) => WebScreen(initialUrl: s.uri.queryParameters['url'] ?? '', sniff: true)),
-      GoRoute(path: '/website', builder: (c, s) => WebScreen(initialUrl: s.uri.queryParameters['url'] ?? '')),
+      GoRoute(
+        path: '/website',
+        builder: (c, s) => WebScreen(
+          initialUrl: s.uri.queryParameters['url'] ?? '',
+          verifySiteKey: s.uri.queryParameters['verifySite'],
+          verifySiteName: s.uri.queryParameters['siteName'],
+        ),
+      ),
       GoRoute(path: '/live/settings', builder: (c, s) => const LiveSettingsScreen()),
       GoRoute(path: '/live/sources/edit', builder: (c, s) => LiveSourceEditScreen(id: s.uri.queryParameters['id'])),
       GoRoute(path: '/live/blocked-categories', builder: (c, s) => const BlockedCategoriesScreen()),

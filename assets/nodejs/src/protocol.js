@@ -25,6 +25,7 @@ const Action = Object.freeze({
   install: 'install',
   uninstall: 'uninstall',
   setDartPort: 'setDartPort',
+  setSiteAuth: 'setSiteAuth',
   reload: 'reload',
   reloadDanmu: 'reloadDanmu',
 });
@@ -71,6 +72,7 @@ const LoaderMsg = Object.freeze({
   reload: 'reload',
   reloadDanmu: 'reloadDanmu',
   setDartPort: 'setDartPort',
+  setSiteAuth: 'setSiteAuth',
 });
 
 /** Directory (below the app data dir) that holds per-instance catpaw data. */
