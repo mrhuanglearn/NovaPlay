@@ -57,7 +57,14 @@ void main() {
       'api': '/spider/libvio/3',
       'browserVerify': 0,
     });
-    expect(sOff.browserVerify, isFalse);
+    expect(sOff.browserVerify, isFalse, reason: 'explicit 0/false from CatPaw disables 403 verify even on libvio');
+
+    final sLegacyLibvio = SpiderSite.fromJson({
+      'key': 'nodejs_libvio',
+      'name': '「盘」立播',
+      'api': '/spider/libvio/3',
+    });
+    expect(sLegacyLibvio.browserVerify, isTrue, reason: 'legacy bundles without browserVerify keep built-in libvio default');
 
     final sDefault = SpiderSite.fromJson({
       'key': 'nodejs_pomo',

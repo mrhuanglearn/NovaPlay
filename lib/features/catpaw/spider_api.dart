@@ -17,8 +17,14 @@ class SpiderSite {
     this.homeUrl,
   });
 
-  static bool _parseBool(Object? v) =>
-      v == true || v == 1 || '$v' == '1' || '$v'.trim().toLowerCase() == 'true';
+  static bool _resolveBrowserVerify(Map<String, dynamic> j) {
+    final raw = j['browserVerify'];
+    if (raw != null) {
+      return raw == true || raw == 1 || '$raw' == '1' || '$raw'.trim().toLowerCase() == 'true';
+    }
+    final bareKey = '${j['key'] ?? ''}'.trim().toLowerCase().replaceFirst(RegExp(r'^nodejs_'), '');
+    return bareKey == 'libvio';
+  }
 
   factory SpiderSite.fromJson(Map<String, dynamic> j) => SpiderSite(
         key: '${j['key']}',
@@ -27,7 +33,7 @@ class SpiderSite {
         type: int.tryParse('${j['type']}') ?? 3,
         searchable: '${j['searchable'] ?? 1}' != '0',
         indexs: '${j['indexs'] ?? 0}' == '1',
-        browserVerify: _parseBool(j['browserVerify']),
+        browserVerify: _resolveBrowserVerify(j),
         verifyUrl: j['verifyUrl'] as String?,
         homeUrl: j['homeUrl'] as String?,
       );
