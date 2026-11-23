@@ -74,6 +74,7 @@ class PlayerSession implements NativePlayerFlutterApi {
   List<DanmuComment> _episodeDanmuComments = const [];
   Map<String, String> _episodeHeaders = const {};
   Completer<void>? _episodeResolved;
+  bool _resolvingEpisode = false;
   final Map<int, String> _searchTitles = {};
   final _closed = Completer<PageClosedEvent>();
 
@@ -131,6 +132,7 @@ class PlayerSession implements NativePlayerFlutterApi {
     }
     final gate = Completer<void>();
     _episodeResolved = gate;
+    _resolvingEpisode = true;
     _line = request.lineIndex;
     _episode = request.episodeIndex;
     try {
@@ -159,6 +161,7 @@ class PlayerSession implements NativePlayerFlutterApi {
       _episodeDanmuUrl = result.videoDanmuUrl;
       _episodeDanmuComments = result.videoDanmuComments;
       _episodeHeaders = result.effectiveHeaders;
+      _resolvingEpisode = false;
       if (!gate.isCompleted) gate.complete();
       await host.provideSource(SourcePayload(
         requestId: request.requestId,
@@ -176,6 +179,7 @@ class PlayerSession implements NativePlayerFlutterApi {
         ],
       ));
     } catch (e) {
+      _resolvingEpisode = false;
       if (!gate.isCompleted) gate.complete();
       await host.provideSource(SourcePayload(requestId: request.requestId, success: false, errorMessage: describeError(e)));
     }
@@ -284,6 +288,7 @@ class PlayerSession implements NativePlayerFlutterApi {
 
   @override
   Future<void> onHeartbeat(Heartbeat heartbeat) async {
+    if (_resolvingEpisode) return;
     if (heartbeat.durationSeconds > 0) _lastDuration = heartbeat.durationSeconds;
     final now = DateTime.now();
     if (now.difference(_lastSaved) < const Duration(seconds: 5)) return;

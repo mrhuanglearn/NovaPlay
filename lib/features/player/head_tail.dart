@@ -13,6 +13,28 @@ class HeadTailRepository {
   HeadTailRepository({JsonStore? store}) : _store = store ?? JsonStore('video_head_tail.json');
   final JsonStore _store;
 
+  static const double maxHeadTailSeconds = 600;
+
+  /// Parses `90`, `90.5`, `01:30`, or `0:02:15` into seconds; returns null if invalid or `<= 0`.
+  static double? parseSecondsInput(String raw) {
+    final t = raw.trim().replaceAll('：', ':');
+    if (t.isEmpty) return null;
+    if (t.contains(':')) {
+      final parts = t.split(':');
+      if (parts.length < 2 || parts.length > 3) return null;
+      var total = 0.0;
+      for (final part in parts) {
+        final v = double.tryParse(part.trim());
+        if (v == null || v < 0 || v.isNaN || v.isInfinite) return null;
+        total = total * 60 + v;
+      }
+      return total > 0 ? total : null;
+    }
+    final v = double.tryParse(t);
+    if (v == null || v <= 0 || v.isNaN || v.isInfinite) return null;
+    return v;
+  }
+
   Future<Map<String, dynamic>> _all() async => Map<String, dynamic>.of(await _store.read<Map<String, dynamic>>({}));
 
   static double _seconds(Object? v) => v is num && v > 0 ? v.toDouble() : 0;

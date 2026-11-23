@@ -1,9 +1,11 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:uzv_reimpl/core/json_store.dart';
 import 'package:uzv_reimpl/features/catpaw/spider_api.dart';
 import 'package:uzv_reimpl/features/library/watch_repository.dart';
+import 'package:uzv_reimpl/features/player/head_tail.dart';
 import 'package:uzv_reimpl/features/player/native_player_api.g.dart';
 import 'package:uzv_reimpl/features/player/player_session.dart';
 import 'package:uzv_reimpl/features/player/playback_source.dart';
@@ -139,6 +141,70 @@ void main() {
     expect(e.qualityIndex, 0);
     expect(e.toJson()['quality'], 0);
   });
+
+  test('HeadTailRepository.parseSecondsInput parses plain seconds and mm:ss / hh:mm:ss', () {
+    expect(HeadTailRepository.parseSecondsInput('90'), 90);
+    expect(HeadTailRepository.parseSecondsInput(' 01:30 '), 90);
+    expect(HeadTailRepository.parseSecondsInput('01：45'), 105);
+    expect(HeadTailRepository.parseSecondsInput('1:02:03'), 3723);
+    expect(HeadTailRepository.parseSecondsInput('0'), isNull);
+    expect(HeadTailRepository.parseSecondsInput('-10'), isNull);
+    expect(HeadTailRepository.parseSecondsInput('abc'), isNull);
+    expect(HeadTailRepository.parseSecondsInput('1:2:3:4'), isNull);
+  });
+
+  test('an episode left inside its configured outro starts again from 0 instead of re-skipping immediately', () async {
+    Future<double> resumeAt(double pos, double dur, double outro) async {
+      await history.record(ProgressEntry(
+        item: const VodItem(id: '1', name: '山海纪行', siteKey: 'demo'),
+        lineIndex: 0,
+        episodeIndex: 0,
+        episodeName: '第1集',
+        positionSeconds: pos,
+        durationSeconds: dur,
+        updatedAt: 0,
+      ));
+      return source().resumeSeconds(0, 0, outroSeconds: outro);
+    }
+
+    expect(await resumeAt(2230, 2400, 180), 0, reason: 'saved inside 180s outro resets to 0');
+    expect(await resumeAt(2100, 2400, 180), 2100, reason: 'saved before outro resumes normally');
+    expect(await resumeAt(80, 120, 60), 80, reason: 'short clip <180s ignores outro reset');
+    expect(await resumeAt(1200, 2400, 1200), 1200, reason: 'oversized outro > dur/3 is ignored');
+  });
+
+  test('stale heartbeats arriving while resolving the next episode do not overwrite its history', () async {
+    final gate = Completer<PlayResult>();
+    final slowSource = VodPlaybackSource(
+      site: _site,
+      api: _SlowApi(gate.future),
+      detail: detail,
+      history: history,
+    );
+    final host = _Host();
+    final s = session(host, slowSource);
+    await s.open(playback: _playback(), danmaku: _danmaku(), line: 0, episode: 0);
+
+    // Native requests Episode 2 while Episode 1's old heartbeat arrives at 2390s.
+    final reqFuture = s.onEpisodeRequest(
+        EpisodeRequest(sessionId: s.sessionId, requestId: 2, lineIndex: 0, episodeIndex: 1, qualityIndex: 0));
+    await s.onHeartbeat(Heartbeat(sessionId: s.sessionId, positionSeconds: 2390, durationSeconds: 2400));
+    expect(await history.find('demo', '1'), isNull, reason: 'heartbeat ignored while episode resolve is in flight');
+
+    gate.complete(const PlayResult(url: 'http://v/ep2.mp4'));
+    await reqFuture;
+    await s.onHeartbeat(Heartbeat(sessionId: s.sessionId, positionSeconds: 15, durationSeconds: 2400));
+    final saved = (await history.find('demo', '1'))!;
+    expect((saved.episodeIndex, saved.positionSeconds), (1, 15));
+  });
+}
+
+class _SlowApi extends SpiderApi {
+  _SlowApi(this._next) : super(0);
+  final Future<PlayResult> _next;
+
+  @override
+  Future<PlayResult> play(SpiderSite site, String flag, String id) => _next;
 }
 
 PlaybackConfig _playback() => PlaybackConfig(

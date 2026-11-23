@@ -86,6 +86,7 @@ class SiteVerifyChallenge {
 
 const _knownVerifyUrls = <String, String>{
   'libvio': 'https://libvio.host/',
+  'woniu': 'https://wn4k.com/user/login/',
 };
 
 final _challengeSignalRe = RegExp(
@@ -113,6 +114,14 @@ String? _usableOrigin(String? rawUrl, {String? ignoreHost}) {
   if (_isIgnoredDocOrLoopbackHost(uri.host)) return null;
   if (ignoreHost != null && ignoreHost.isNotEmpty && uri.host.toLowerCase() == ignoreHost.toLowerCase()) return null;
   return '${uri.scheme}://${uri.authority}/';
+}
+
+String? _usableVerifyUrl(String? rawUrl, {String? ignoreHost}) {
+  final origin = _usableOrigin(rawUrl, ignoreHost: ignoreHost);
+  if (origin == null) return null;
+  final uri = Uri.parse(rawUrl!.trim());
+  if ((uri.path.isEmpty || uri.path == '/') && !uri.hasQuery) return origin;
+  return uri.removeFragment().toString();
 }
 
 /// Returns a [SiteVerifyChallenge] when [site] has `browserVerify` enabled in CatPaw `/config` AND [error] indicates
@@ -149,14 +158,14 @@ SiteVerifyChallenge? detectSiteVerifyChallenge(
   }
   final combinedMsg = [...bodyMessages, '$error'].join('\n');
 
-  final configuredSiteUrl = _usableOrigin(site.verifyUrl, ignoreHost: hubHost) ?? _knownVerifyUrls[key] ?? _knownVerifyUrls[bareKey];
+  final configuredSiteUrl = _usableVerifyUrl(site.verifyUrl, ignoreHost: hubHost) ?? _knownVerifyUrls[key] ?? _knownVerifyUrls[bareKey];
   final isChallenge = statusCode == 403 ||
       explicitChallengeCode ||
       _challengeSignalRe.hasMatch(combinedMsg) ||
       (configuredSiteUrl != null && (statusCode == 502 || statusCode == 503 || _gatewayFailRe.hasMatch(combinedMsg)));
   if (!isChallenge) return null;
 
-  String? resolved = _usableOrigin(explicitVerifyUrl, ignoreHost: hubHost);
+  String? resolved = _usableVerifyUrl(explicitVerifyUrl, ignoreHost: hubHost);
   if (resolved == null) {
     for (final src in [...bodyMessages, '$error']) {
       for (final m in _embeddedUrlRe.allMatches(src)) {

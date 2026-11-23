@@ -58,7 +58,7 @@ class MediaServerPlaybackSource extends PlaybackSource {
   }
 
   @override
-  Future<double> resumeSeconds(int lineIndex, int episodeIndex) async =>
+  Future<double> resumeSeconds(int lineIndex, int episodeIndex, {double outroSeconds = 0}) async =>
       (items[episodeIndex].positionTicks ?? 0) / _ticksPerSecond;
 
   @override

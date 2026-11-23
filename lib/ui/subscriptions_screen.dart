@@ -9,6 +9,7 @@ import '../app/theme.dart';
 import '../app/ui_hooks.dart';
 import '../features/subscription/subscription.dart';
 import '../l10n/l10n.dart';
+import 'load_error.dart';
 import 'lock_dialogs.dart';
 import 'widgets.dart';
 
@@ -25,6 +26,16 @@ String relativeTime(AppLocalizations l, int? epochMs, {DateTime? now}) {
   if (d.inHours < 1) return l.timeMinutesAgo(d.inMinutes);
   if (d.inDays < 1) return l.timeHoursAgo(d.inHours);
   return l.timeDaysAgo(d.inDays);
+}
+
+String formatSubscriptionTime(AppLocalizations l, int? epochMs, {DateTime? now}) {
+  if (epochMs == null) return '—';
+  final refNow = now ?? DateTime.now();
+  final dt = DateTime.fromMillisecondsSinceEpoch(epochMs);
+  String two(int n) => n.toString().padLeft(2, '0');
+  final datePart = dt.year == refNow.year ? '${two(dt.month)}-${two(dt.day)}' : '${dt.year}-${two(dt.month)}-${two(dt.day)}';
+  final clockPart = '${two(dt.hour)}:${two(dt.minute)}:${two(dt.second)}';
+  return '$datePart $clockPart · ${relativeTime(l, epochMs, now: refNow)}';
 }
 
 /// [all] after moving the [from]th of the [shown] subscriptions to [to] (an onReorderItem index, which already accounts
@@ -93,22 +104,24 @@ Future<bool> deleteSubscriptionsAndRefresh(
 
 Future<void> _refreshOne(BuildContext context, WidgetRef ref, Subscription s) async {
   final l = context.l10n;
+  final container = ProviderScope.containerOf(context, listen: false);
   try {
     final updated = await ref.read(subscriptionServiceProvider).refresh(
           s,
           confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey),
         );
     ref.invalidate(subscriptionsProvider);
+    final subs = await ref.read(subscriptionsProvider.future);
+    final active = effectiveActiveKey(subs, ref.read(activeSubscriptionKeyProvider).valueOrNull);
     if (updated == null) {
+      if (active == s.key) reloadLiveCatalog(container);
       showToast(l.subscriptionUpToDate(s.name));
     } else {
-      final subs = await ref.read(subscriptionsProvider.future);
-      final active = effectiveActiveKey(subs, ref.read(activeSubscriptionKeyProvider).valueOrNull);
       if (active == s.key) refreshActiveSubscriptionRuntime(ref);
       showToast(l.subscriptionUpdatedOne);
     }
   } catch (e) {
-    showToast(l.subscriptionCheckFailed('$e'));
+    showToast(l.subscriptionCheckFailed(describeLoadError(e, l)));
   }
 }
 
@@ -133,18 +146,22 @@ class _SubscriptionsScreenState extends ConsumerState<SubscriptionsScreen> {
 
   Future<void> _refreshAll(List<Subscription> list) async {
     final l = context.l10n;
+    final container = ProviderScope.containerOf(context, listen: false);
     setState(() => _refreshingAll = true);
     showToast(l.subscriptionChecking);
     final service = ref.read(subscriptionServiceProvider);
     final active = effectiveActiveKey(list, ref.read(activeSubscriptionKeyProvider).valueOrNull);
     var updated = 0;
     Object? failure;
-    for (final s in list.where((s) => s.indexJsUrl != null)) {
+    for (final s in list.where((s) => s.indexJsUrl != null || s.cloudUrl != null)) {
       try {
-        if (await service.refresh(s, confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey)) !=
-            null) {
+        final res =
+            await service.refresh(s, confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey));
+        if (res != null) {
           updated++;
           if (s.key == active) refreshActiveSubscriptionRuntime(ref);
+        } else if (s.key == active) {
+          reloadLiveCatalog(container);
         }
       } catch (e) {
         failure ??= e;
@@ -154,7 +171,7 @@ class _SubscriptionsScreenState extends ConsumerState<SubscriptionsScreen> {
     if (!mounted) return;
     setState(() => _refreshingAll = false);
     if (failure != null) {
-      showToast(l.subscriptionCheckFailed('$failure'));
+      showToast(l.subscriptionCheckFailed(describeLoadError(failure, l)));
     } else {
       showToast(updated == 0 ? l.subscriptionAllUpToDate : l.subscriptionUpdatedCount(updated));
     }
@@ -501,11 +518,13 @@ class _SubscriptionCard extends StatelessWidget {
                     ),
                   ]),
                   const SizedBox(height: 4),
-                  Text(l.subscriptionLastUpdatedAt(relativeTime(l, sub.updatedAt)),
-                      style: TextStyle(fontSize: 10, color: c.secondaryLabel)),
+                  Text(l.subscriptionLastUpdatedAt(formatSubscriptionTime(l, sub.updatedAt)),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(fontSize: 10.5, color: c.secondaryLabel)),
                 ]),
               ),
-              if (sub.indexJsUrl != null)
+              if (sub.indexJsUrl != null || sub.cloudUrl != null)
                 refreshing
                     ? const Padding(
                         padding: EdgeInsets.all(12),

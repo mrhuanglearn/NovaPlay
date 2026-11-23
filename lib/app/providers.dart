@@ -35,6 +35,7 @@ import '../services/danmu_client.dart';
 import '../services/tmdb_client.dart';
 import '../services/webdav_sync.dart';
 import '../ui/load_error.dart';
+import '../ui/poster_image.dart';
 import 'app_preferences.dart';
 import 'extra_providers.dart';
 import 'live_providers.dart';
@@ -357,6 +358,7 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
   final runtimeState = ref.watch(_catpawRuntimeStateProvider);
   final subs = await ref.read(subscriptionsProvider.future);
   if (subs.isEmpty) {
+    PosterImage.localCatpawPort = 0;
     final prevKey = runtimeState.lastRunningSubKey;
     if (prevKey != null) {
       runtimeState.lastRunningSubKey = null;
@@ -373,6 +375,7 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
   final sub = subs.firstWhere((s) => s.key == key, orElse: () => subs.first);
 
   if (sub.cloudUrl != null) {
+    PosterImage.localCatpawPort = 0;
     final prevKey = runtimeState.lastRunningSubKey;
     if (prevKey != null && prevKey != sub.key) {
       runtimeState.lastRunningSubKey = null;
@@ -435,6 +438,7 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
   if (freshlyInstalled) {
     ref.invalidate(subscriptionsProvider); // the subscriptions page shows the new 上次更新 / 内容指纹
   }
+  PosterImage.localCatpawPort = port;
   final api = SpiderApi(
     port,
     receiveTimeout: ref.read(appPreferencesProvider).catpawTimeout,
@@ -448,8 +452,31 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
 String _runtimeInputs(List<Subscription> subs) =>
     [for (final s in subs) '${s.key}|${s.indexJsUrl}|${s.cloudUrl}|${s.local}'].join('\n');
 
-final homeSitesProvider =
-    Provider<List<SpiderSite>>((ref) => ref.watch(catpawRuntimeProvider).valueOrNull?.sites ?? const []);
+class LiveCatalogRevision extends Notifier<int> {
+  @override
+  int build() => 0;
+  void bump() => state++;
+}
+
+final liveCatalogRevisionProvider = NotifierProvider<LiveCatalogRevision, int>(LiveCatalogRevision.new);
+
+final liveSitesProvider = FutureProvider<List<SpiderSite>>((ref) async {
+  final rev = ref.watch(liveCatalogRevisionProvider);
+  final rt = await ref.watch(catpawRuntimeProvider.future);
+  if (rt == null) return const [];
+  if (rev == 0) return rt.sites;
+  return rt.api.sites();
+});
+
+void reloadLiveCatalog(ProviderContainer container) {
+  container.read(liveCatalogRevisionProvider.notifier).bump();
+  container.invalidate(videoFeedProvider);
+}
+
+final homeSitesProvider = Provider<List<SpiderSite>>((ref) {
+  final live = ref.watch(liveSitesProvider);
+  return live.valueOrNull ?? ref.watch(catpawRuntimeProvider).valueOrNull?.sites ?? const [];
+});
 
 /// Key of the site shown on the home page for the running subscription. Null = its first site.
 ///
@@ -527,7 +554,8 @@ typedef CategoryQuery = ({String siteKey, String typeId, int page, Map<String, S
 /// stayed cached so 重试 returned the same error. Pages keep their own state (see the home page) instead.
 final videoCategoryFeedProvider = Provider<Future<PagedVods?> Function(CategoryQuery q)>((ref) => (q) async {
       final rt = await ref.read(catpawRuntimeProvider.future);
-      final site = rt?.sites.where((s) => s.key == q.siteKey).firstOrNull;
+      final site = ref.read(homeSitesProvider).where((s) => s.key == q.siteKey).firstOrNull ??
+          rt?.sites.where((s) => s.key == q.siteKey).firstOrNull;
       if (rt == null || site == null) return null;
       return rt.api.category(site, q.typeId, page: q.page, filters: q.filters);
     });
@@ -634,7 +662,8 @@ final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCal
       return true;
     },
     DartActions.queryTabs: (args) async {
-      final home = ref.read(videoFeedProvider).valueOrNull;
+      final ctx = rootNavigatorKey.currentContext;
+      final home = ctx != null ? ProviderScope.containerOf(ctx, listen: false).read(videoFeedProvider).valueOrNull : null;
       return {
         'selected': ref.read(selectedTypeIdProvider),
         'tabs': [
@@ -674,11 +703,36 @@ final Provider<DartCallbackServer> dartCallbackServerProvider = Provider<DartCal
       return true;
     },
     DartActions.openInternalWebview: (args) async {
-      final url = str(args, ['url']);
-      if (url == null) throw ArgumentError('url missing');
+      final rawUrl = str(args, ['url']);
+      if (rawUrl == null) throw ArgumentError('url missing');
+      var url = PosterImage.normalizeLocalUrl(rawUrl);
+      if (PosterImage.localCatpawPort > 0) {
+        final parsed = Uri.tryParse(url);
+        if (parsed != null &&
+            parsed.scheme == 'http' &&
+            parsed.hasPort &&
+            parsed.port == 9321 &&
+            PosterImage.isPrivateLanIpv4(parsed.host)) {
+          url = parsed.replace(host: '127.0.0.1').toString();
+        }
+      }
       final router = ref.read(routerProvider);
+      final config = router.routerDelegate.currentConfiguration;
+      final topUri = config.isNotEmpty ? config.uri : Uri.parse('/');
       final target = Uri(path: '/website', queryParameters: {'url': url}).toString();
-      if (webviewReplacesTop(router.state.uri, (q) => ref.read(videoDetailProvider(q)).isLoading)) {
+      if (topUri.path == '/website') {
+        if (topUri.queryParameters['url'] != url) unawaited(router.pushReplacement(target));
+        return true;
+      }
+      final isBasesetDetail = topUri.path == '/video/detail' &&
+          ((topUri.queryParameters['site'] ?? '').endsWith('baseset') ||
+              topUri.queryParameters['id'] == 'openInternalWebsite' ||
+              (topUri.queryParameters['id'] ?? '').startsWith('webpage:'));
+      final ctx = rootNavigatorKey.currentContext;
+      final rootContainer = ctx != null ? ProviderScope.containerOf(ctx, listen: false) : null;
+      final replaces = rootContainer != null &&
+          webviewReplacesTop(topUri, (q) => rootContainer.read(videoDetailProvider(q)).isLoading);
+      if (replaces || isBasesetDetail) {
         unawaited(router.pushReplacement(target));
       } else {
         unawaited(router.push(target));

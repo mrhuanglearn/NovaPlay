@@ -29,6 +29,10 @@ class PosterImage extends ImageProvider<PosterImage> {
   @visibleForTesting
   static Directory? debugCacheDir;
 
+  /// Active local CatPaw loopback server port; LAN URLs targeting this port rewrite to `127.0.0.1` so QR/proxy images
+  /// work even when the script only bound `127.0.0.1` or a VPN intercepts LAN traffic.
+  static int localCatpawPort = 0;
+
   static const int _maxCachedFiles = 600;
   static int _writesSincePrune = 0;
   static final Map<String, Future<Uint8List>> _inFlight = {};
@@ -36,12 +40,44 @@ class PosterImage extends ImageProvider<PosterImage> {
   static bool _isLoopbackHost(String host) =>
       host == '127.0.0.1' || host == 'localhost' || host == '::1' || host == '[::1]';
 
+  static bool isPrivateLanIpv4(String host) {
+    final parts = host.split('.');
+    if (parts.length != 4) return false;
+    final a = int.tryParse(parts[0]);
+    final b = int.tryParse(parts[1]);
+    if (a == null || b == null) return false;
+    return a == 10 || (a == 192 && b == 168) || (a == 172 && b >= 16 && b <= 31);
+  }
+
+  static String normalizeLocalUrl(String url, [int? catpawPort]) {
+    final p = catpawPort ?? localCatpawPort;
+    var out = url;
+    final uri = Uri.tryParse(url);
+    if (p > 0 && uri != null && uri.scheme == 'http' && uri.hasPort && uri.port == p && isPrivateLanIpv4(uri.host)) {
+      out = uri.replace(host: '127.0.0.1').toString();
+    }
+    const proxySeg = '/spider/baseset/3/proxy/';
+    final idx = out.indexOf(proxySeg);
+    if (idx >= 0) {
+      final tailStart = idx + proxySeg.length;
+      final qIdx = out.indexOf('?', tailStart);
+      final rawPayload = qIdx >= 0 ? out.substring(tailStart, qIdx) : out.substring(tailStart);
+      if (rawPayload.contains('/')) {
+        final encoded = rawPayload.replaceAll('/', '%2F').replaceAll('+', '%2B');
+        out = out.substring(0, tailStart) + encoded + (qIdx >= 0 ? out.substring(qIdx) : '');
+      }
+    }
+    return out;
+  }
+
   static final HttpClient _client = HttpClient()
     ..userAgent = null
     ..autoUncompress = false
     ..maxConnectionsPerHost = 6
     ..connectionTimeout = const Duration(seconds: 12)
-    ..findProxy = (uri) => _isLoopbackHost(uri.host) ? 'DIRECT' : HttpClient.findProxyFromEnvironment(uri);
+    ..findProxy = (uri) => (_isLoopbackHost(uri.host) || isPrivateLanIpv4(uri.host))
+        ? 'DIRECT'
+        : HttpClient.findProxyFromEnvironment(uri);
 
   static bool get _inFakeAsyncWidgetTest {
     try {
@@ -63,12 +99,19 @@ class PosterImage extends ImageProvider<PosterImage> {
   }
 
   static String _canonicalCacheUrl(String url) {
-    final uri = Uri.tryParse(url);
+    final normalized = normalizeLocalUrl(url);
+    final uri = Uri.tryParse(normalized);
     if (uri != null && _isLoopbackHost(uri.host) && uri.path == '/proxy/img') {
       final target = uri.queryParameters['u'];
       if (target != null && target.isNotEmpty) return target;
     }
-    return url;
+    return normalized;
+  }
+
+  static bool _shouldSkipDiskCache(String url) {
+    if (url.startsWith('data:')) return true;
+    final uri = Uri.tryParse(normalizeLocalUrl(url));
+    return uri != null && _isLoopbackHost(uri.host) && uri.path.contains('/spider/baseset/');
   }
 
   static String _cacheFileName(String cacheKey) => '${md5.convert(utf8.encode(cacheKey))}.img';
@@ -85,7 +128,14 @@ class PosterImage extends ImageProvider<PosterImage> {
   /// Downloads [url] with [headers] set as they are (no `Dart/x.y (dart:io)` user agent is added).
   static Future<Uint8List> fetchBytes(String url, Map<String, String> headers,
       {void Function(int received, int? total)? onBytesReceived}) async {
-    final uri = Uri.parse(url);
+    final effectiveUrl = normalizeLocalUrl(url);
+    if (effectiveUrl.startsWith('data:')) {
+      final data = UriData.parse(effectiveUrl).contentAsBytes();
+      if (data.isEmpty) throw Exception('PosterImage is an empty data URI');
+      onBytesReceived?.call(data.length, data.length);
+      return data;
+    }
+    final uri = Uri.parse(effectiveUrl);
     final req = await _client.getUrl(uri);
     headers.forEach(req.headers.set);
     final res = await req.close().timeout(const Duration(seconds: 25));
@@ -94,7 +144,7 @@ class PosterImage extends ImageProvider<PosterImage> {
       throw NetworkImageLoadException(statusCode: res.statusCode, uri: uri);
     }
     final bytes = await consolidateHttpClientResponseBytes(res, onBytesReceived: onBytesReceived);
-    if (bytes.lengthInBytes == 0) throw Exception('PosterImage is an empty file: $url');
+    if (bytes.lengthInBytes == 0) throw Exception('PosterImage is an empty file: $effectiveUrl');
     return bytes;
   }
 
@@ -102,8 +152,9 @@ class PosterImage extends ImageProvider<PosterImage> {
   /// stores it atomically.
   static Future<Uint8List> loadBytesCached(String url, Map<String, String> headers,
       {void Function(int received, int? total)? onBytesReceived}) async {
+    final skipDisk = _shouldSkipDiskCache(url);
     final cacheKey = _canonicalCacheUrl(url);
-    final cacheDir = await _resolveCacheDir();
+    final cacheDir = skipDisk ? null : await _resolveCacheDir();
     File? cacheFile;
     if (cacheDir != null) {
       cacheFile = File(p.join(cacheDir.path, _cacheFileName(cacheKey)));

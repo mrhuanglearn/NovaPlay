@@ -36,6 +36,10 @@ class DartCallbackServer {
   final String token;
   HttpServer? _server;
 
+  /// Incremented each time a script invokes `openInternalWebview`, so callers awaiting `/detail` know a web page was
+  /// already opened by callback and skip pushing a duplicate fallback route.
+  int openInternalWebviewCount = 0;
+
   int? get port => _server?.port;
 
   /// Binds 127.0.0.1 (random port when [preferredPort] is 0/null) and returns the port. Idempotent.
@@ -107,6 +111,7 @@ class DartCallbackServer {
       }
       final call = resolveCall(req.uri, body, known: handlers.containsKey);
       action = call.action;
+      if (action == 'openInternalWebview') openInternalWebviewCount++;
       log('[DartServer] ${req.method} ${req.uri.path} query=${req.uri.queryParameters.keys.toList()} '
           'body=${describeShape(body ?? (text.isEmpty ? null : 'text(${text.length})'))} -> $action');
       final handler = handlers[action];

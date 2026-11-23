@@ -39,11 +39,18 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   private var loaded: Bool = false
   private(set) var isClosed: Bool = false
 
+  private static let maxHeadTailMs: Int64 = 600_000
+  private static let minAutoOutroDurationMs: Int64 = 180_000
+  private static let minMainContentMs: Int64 = 90_000
+
   private var introEndMs: Int64 = 0
   private var outroBeforeEndMs: Int64 = 0
   private var outroDone: Bool = false
+  private var outroHitTicks: Int = 0
+  private var resolvingSource: Bool = false
+  private var autoSkippedIntroThisEpisode: Bool = false
   private var skipRanges: [(Int64, Int64)] = []
-  private var lastSkippedRangeIndex: Int = -1
+  private var skippedRangeIndices = Set<Int>()
 
   private var extraSubtitles: [SubtitleOption] = []
   private var lastPayload: SourcePayload?
@@ -139,6 +146,10 @@ final class IosPlayerController: IosPlayerKernelDelegate {
 
   private func onHeartbeatTick() {
     guard !isClosed else { return }
+    if resolvingSource {
+      updateNowPlayingInfo()
+      return
+    }
     let hb = Heartbeat(
       sessionId: request.sessionId,
       positionSeconds: Double(kernel.positionMs) / 1000.0,
@@ -154,8 +165,13 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     episode = episodeIndex
     errorMessage = nil
     failed = false
+    resolvingSource = true
     outroDone = false
+    outroHitTicks = 0
+    autoSkippedIntroThisEpisode = false
+    skippedRangeIndices.removeAll()
     state = "buffering"
+    if loaded { kernel.pause() }
     if refreshDanmaku {
       extraSubtitles.removeAll()
       danmakuAnimeTitle = nil
@@ -187,6 +203,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   func onSource(_ payload: SourcePayload) {
     DispatchQueue.main.async { [weak self] in
       guard let self = self, !self.isClosed, payload.requestId == self.requestId else { return }
+      self.resolvingSource = false
       guard payload.success, let url = payload.url, !url.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
         let msg = IosPlayerUiText.sourceFailed(payload.errorMessage)
         self.flutterApi.onErrorReported(
@@ -210,8 +227,9 @@ final class IosPlayerController: IosPlayerKernelDelegate {
       self.lastPayload = payload
 
       var start = self.pendingStartMs
-      if self.introEndMs > 0 && start < self.introEndMs {
+      if start <= 0 && self.introEndMs > 0 && self.introEndMs <= Self.maxHeadTailMs {
         start = self.introEndMs
+        self.autoSkippedIntroThisEpisode = true
         if self.playbackConfig.skipNotice {
           self.uiDelegate?.controllerDidShowNotice(IosPlayerUiText.t("已跳过片头", "Intro skipped"))
         }
@@ -301,9 +319,20 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   }
 
   func seekTo(_ ms: Int64) {
+    let dur = kernel.durationMs
+    let target = dur > 0 ? min(max(0, ms), dur) : max(0, ms)
+    outroHitTicks = 0
+    if dur > 0 && outroBeforeEndMs > 0 && target >= dur - outroBeforeEndMs {
+      outroDone = true
+    }
+    for (idx, range) in skipRanges.enumerated() {
+      if target >= range.0 && target < range.1 {
+        skippedRangeIndices.insert(idx)
+      }
+    }
     state = "buffering"
     uiDelegate?.controllerDidChangeState()
-    kernel.seekTo(ms)
+    kernel.seekTo(target)
   }
 
   func seekBy(seconds: Int) {
@@ -538,7 +567,13 @@ final class IosPlayerController: IosPlayerKernelDelegate {
 
   func markIntro() {
     let pos = kernel.positionMs
-    guard pos > 0 else { return }
+    let dur = kernel.durationMs
+    guard pos > 0 && dur > 0 else { return }
+    let maxAllowed = min(Self.maxHeadTailMs, dur / 3)
+    if pos > maxAllowed {
+      uiDelegate?.controllerDidShowToast(IosPlayerUiText.t("片头位置过长，请在正片前 1/3 内标记", "Intro position too far into episode"), long: false)
+      return
+    }
     introEndMs = pos
     flutterApi.onHeadTailMarked(sessionId: request.sessionId, type: "intro", seconds: Double(pos) / 1000.0) { _ in }
     uiDelegate?.controllerDidShowToast(IosPlayerUiText.introMarked(pos), long: false)
@@ -548,10 +583,17 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     let dur = kernel.durationMs
     let before = dur - kernel.positionMs
     guard dur > 0 && before > 0 else { return }
+    let maxAllowed = min(Self.maxHeadTailMs, dur / 3)
+    if before > maxAllowed {
+      uiDelegate?.controllerDidShowToast(IosPlayerUiText.t("片尾时长过长，请在结束前 1/3 内标记", "Outro too far before end"), long: false)
+      return
+    }
     outroBeforeEndMs = before
-    outroDone = false
+    outroDone = true
+    outroHitTicks = 0
     flutterApi.onHeadTailMarked(sessionId: request.sessionId, type: "outro", seconds: Double(before) / 1000.0) { _ in }
     uiDelegate?.controllerDidShowToast(IosPlayerUiText.outroMarked(before), long: false)
+    if hasNext { _ = nextEpisode() }
   }
 
   func dismissError() {
@@ -593,9 +635,13 @@ final class IosPlayerController: IosPlayerKernelDelegate {
       guard let type = obj["type"] as? String else { continue }
       switch type {
       case "intro":
-        if let endMs = (obj["endMs"] as? NSNumber)?.int64Value { introEndMs = endMs }
+        if let endMs = (obj["endMs"] as? NSNumber)?.int64Value {
+          introEndMs = min(max(0, endMs), Self.maxHeadTailMs)
+        }
       case "outro":
-        if let beforeMs = (obj["beforeEndMs"] as? NSNumber)?.int64Value { outroBeforeEndMs = beforeMs }
+        if let beforeMs = (obj["beforeEndMs"] as? NSNumber)?.int64Value {
+          outroBeforeEndMs = min(max(0, beforeMs), Self.maxHeadTailMs)
+        }
       case "range":
         if let s = (obj["startMs"] as? NSNumber)?.int64Value,
            let e = (obj["endMs"] as? NSNumber)?.int64Value,
@@ -609,26 +655,34 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   }
 
   private func maybeSkipOutro() {
+    guard !resolvingSource else { return }
     let pos = kernel.positionMs
     let dur = kernel.durationMs
     guard dur > 0 && state == "playing" else { return }
     for (idx, range) in skipRanges.enumerated() {
-      if pos >= range.0 && pos < range.1 && lastSkippedRangeIndex != idx {
-        lastSkippedRangeIndex = idx
+      if range.1 <= dur && pos >= range.0 && pos < range.1 && !skippedRangeIndices.contains(idx) {
+        skippedRangeIndices.insert(idx)
         let originPos = pos
         kernel.seekTo(range.1)
         if playbackConfig.skipNotice {
           uiDelegate?.controllerDidSkipRange(fromMs: originPos)
         }
         return
-      } else if pos < range.0 || pos >= range.1 + 2000 {
-        if lastSkippedRangeIndex == idx { lastSkippedRangeIndex = -1 }
       }
     }
-    guard !outroDone && outroBeforeEndMs > 0 else { return }
+    guard !outroDone && outroBeforeEndMs > 0 && outroBeforeEndMs <= Self.maxHeadTailMs else { return }
+    guard dur >= Self.minAutoOutroDurationMs && outroBeforeEndMs <= dur / 3 else { return }
+    let effIntro = (introEndMs > 0 && introEndMs <= dur / 3) ? introEndMs : 0
     let outroAt = dur - outroBeforeEndMs
-    guard outroAt > introEndMs && pos >= outroAt else { return }
+    guard outroAt - effIntro >= Self.minMainContentMs else { return }
+    guard pos >= outroAt && pos <= dur + 5_000 else {
+      outroHitTicks = 0
+      return
+    }
+    outroHitTicks += 1
+    guard outroHitTicks >= 2 else { return }
     outroDone = true
+    outroHitTicks = 0
     guard hasNext else { return }
     if playbackConfig.skipNotice {
       uiDelegate?.controllerDidShowNotice(IosPlayerUiText.t("已跳过片尾", "Outro skipped"))
@@ -639,10 +693,18 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   // MARK: - Kernel Delegate
 
   func kernelDidChangeState(_ nextState: String) {
+    if resolvingSource { return }
     state = nextState
     if nextState == "playing" {
       failed = false
       errorMessage = nil
+      if autoSkippedIntroThisEpisode {
+        let dur = kernel.durationMs
+        if dur > 0 {
+          autoSkippedIntroThisEpisode = false
+          if dur < introEndMs + 60_000 { kernel.seekTo(0) }
+        }
+      }
     }
     danmakuView.paused = (nextState != "playing")
     NativePlayerHost.shared.syncIdleTimer()

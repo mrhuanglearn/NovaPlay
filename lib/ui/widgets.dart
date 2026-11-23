@@ -1,3 +1,5 @@
+import 'dart:ui' as ui;
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -80,11 +82,68 @@ Future<void> openVod(BuildContext context, VodItem item) => _openVod(context, it
 /// The poster of [item], or the film-icon placeholder.
 Widget vodPoster(VodItem item) => _poster(item);
 
+bool _isBasesetItem(VodItem item) {
+  final sk = item.siteKey ?? '';
+  return sk == 'baseset' || sk.endsWith('_baseset') || (item.pic?.contains('/spider/baseset/') ?? false);
+}
+
+String? _extractBasesetFallbackUrl(VodDetail? d, SpiderApi api, String vodId) {
+  if (d != null) {
+    for (final line in d.lines) {
+      if (line.name != '配置入口' && line.name != '内置网页') continue;
+      for (final ep in line.episodes) {
+        final u = Uri.tryParse(ep.url.trim());
+        if (u != null && (u.scheme == 'http' || u.scheme == 'https')) {
+          return PosterImage.normalizeLocalUrl(u.toString(), api.port);
+        }
+      }
+    }
+  }
+  if (vodId == 'openInternalWebsite' || vodId == 'open_website') return '${api.baseUrl}/website';
+  if (vodId == 'builtinDanmuApiQr') return '${api.baseUrl}/danmu';
+  return null;
+}
+
 Future<void> _openVod(BuildContext context, VodItem item) async {
   AppHaptics.selection();
+  ProviderContainer? container;
+  try {
+    container = ProviderScope.containerOf(context, listen: false);
+  } on StateError {
+    container = null;
+  }
+  final localPort = container?.read(catpawRuntimeProvider).valueOrNull?.api.port;
   if (item.id.startsWith('uzv-web:')) {
-    await context.push<void>(Uri(path: '/website', queryParameters: {'url': item.id.substring('uzv-web:'.length)}).toString());
+    final url = PosterImage.normalizeLocalUrl(item.id.substring('uzv-web:'.length), localPort);
+    await context.push<void>(Uri(path: '/website', queryParameters: {'url': url}).toString());
     return;
+  }
+  if (container != null && _isBasesetItem(item)) {
+    final rt = container.read(catpawRuntimeProvider).valueOrNull;
+    final cb = container.read(dartCallbackServerProvider);
+    final site = container.read(homeSitesProvider).where((s) => s.key == item.siteKey).firstOrNull ??
+        container.read(currentSiteProvider);
+    if (rt != null && site != null) {
+      final beforeCount = cb.openInternalWebviewCount;
+      try {
+        final d = await rt.api.detail(site, item.id);
+        if (cb.openInternalWebviewCount == beforeCount && rt.subscription.cloudUrl == null) {
+          await Future<void>.delayed(const Duration(milliseconds: 50));
+        }
+        if (!context.mounted || cb.openInternalWebviewCount != beforeCount) return;
+        final cfg = GoRouter.of(context).routerDelegate.currentConfiguration;
+        final curPath = cfg.isNotEmpty ? cfg.uri.path : '';
+        if (curPath != '/website') {
+          final fallbackUrl = _extractBasesetFallbackUrl(d, rt.api, item.id);
+          if (fallbackUrl != null) {
+            await context.push<void>(Uri(path: '/website', queryParameters: {'url': fallbackUrl}).toString());
+          }
+        }
+      } catch (e) {
+        if (context.mounted) ScaffoldMessenger.maybeOf(context)?.showSnackBar(SnackBar(content: Text('$e')));
+      }
+      return;
+    }
   }
   final folderCat = item.folderCategoryId;
   if (folderCat != null) {
@@ -160,7 +219,158 @@ final _catVodHeaderTag = RegExp(
   return (url: clean, headers: headers);
 }
 
-Widget _poster(VodItem item) => posterFromUrl(item.pic, fallback: const _PosterFallback());
+Widget _poster(VodItem item) {
+  if (_isBasesetItem(item)) {
+    return _BasesetQrPoster(rawUrl: item.pic);
+  }
+  return posterFromUrl(item.pic, fallback: const _PosterFallback());
+}
+
+@visibleForTesting
+Future<Rect?> detectQrBoundsForTest(ui.Image img) => _BasesetQrPosterState._detectQrBounds(img);
+
+class _BasesetQrPoster extends StatefulWidget {
+  const _BasesetQrPoster({required this.rawUrl});
+  final String? rawUrl;
+
+  @override
+  State<_BasesetQrPoster> createState() => _BasesetQrPosterState();
+}
+
+class _BasesetQrPosterState extends State<_BasesetQrPoster> {
+  ImageStream? _stream;
+  ImageStreamListener? _listener;
+  ImageInfo? _info;
+  Rect? _qrBounds;
+  bool _failed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _resolve();
+  }
+
+  @override
+  void didUpdateWidget(covariant _BasesetQrPoster oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.rawUrl != widget.rawUrl) _resolve();
+  }
+
+  void _detach() {
+    if (_stream != null && _listener != null) {
+      _stream!.removeListener(_listener!);
+    }
+    _stream = null;
+    _listener = null;
+  }
+
+  void _resolve() {
+    _detach();
+    _info?.dispose();
+    _info = null;
+    _qrBounds = null;
+    _failed = false;
+    final raw = widget.rawUrl;
+    if (raw == null || raw.trim().isEmpty) {
+      _failed = true;
+      return;
+    }
+    final req = parsePosterRequest(raw);
+    if (req.url.isEmpty) {
+      _failed = true;
+      return;
+    }
+    final stream = PosterImage(req.url, headers: req.headers).resolve(ImageConfiguration.empty);
+    final listener = ImageStreamListener(
+      (info, _) async {
+        final cloned = info.clone();
+        final bounds = await _detectQrBounds(cloned.image);
+        if (!mounted) {
+          cloned.dispose();
+          return;
+        }
+        setState(() {
+          _info?.dispose();
+          _info = cloned;
+          _qrBounds = bounds;
+          _failed = false;
+        });
+      },
+      onError: (_, __) {
+        if (mounted) setState(() => _failed = true);
+      },
+    );
+    _stream = stream;
+    _listener = listener;
+    stream.addListener(listener);
+  }
+
+  static Future<Rect?> _detectQrBounds(ui.Image img) async {
+    final w = img.width;
+    final h = img.height;
+    if (w <= 0 || h <= 0 || w > 1024 || h > 1024) return null;
+    final data = await img.toByteData(format: ui.ImageByteFormat.rawRgba);
+    if (data == null) return null;
+    var minX = w;
+    var minY = h;
+    var maxX = -1;
+    var maxY = -1;
+    for (var y = 0; y < h; y++) {
+      final row = y * w * 4;
+      for (var x = 0; x < w; x++) {
+        final i = row + x * 4;
+        if (data.getUint8(i + 3) > 128 &&
+            (data.getUint8(i) < 200 || data.getUint8(i + 1) < 200 || data.getUint8(i + 2) < 200)) {
+          if (x < minX) minX = x;
+          if (x > maxX) maxX = x;
+          if (y < minY) minY = y;
+          if (y > maxY) maxY = y;
+        }
+      }
+    }
+    if (maxX < minX || maxY < minY) return null;
+    final qrW = (maxX - minX + 1).toDouble();
+    final qrH = (maxY - minY + 1).toDouble();
+    if (qrW < 8 || qrH < 8 || qrW / qrH < 0.8 || qrW / qrH > 1.25) return null;
+    return Rect.fromLTWH(minX.toDouble(), minY.toDouble(), qrW, qrH);
+  }
+
+  @override
+  void dispose() {
+    _detach();
+    _info?.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    if (_failed) return const _PosterFallback();
+    final info = _info;
+    if (info == null) return const ColoredBox(color: Colors.white);
+    return CustomPaint(
+      painter: _QrCardPainter(image: info.image, qrBounds: _qrBounds),
+      child: const SizedBox.expand(),
+    );
+  }
+}
+
+class _QrCardPainter extends CustomPainter {
+  const _QrCardPainter({required this.image, required this.qrBounds});
+  final ui.Image image;
+  final Rect? qrBounds;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    canvas.drawRect(Offset.zero & size, Paint()..color = Colors.white);
+    final src = qrBounds ?? Rect.fromLTWH(0, 0, image.width.toDouble(), image.height.toDouble());
+    final side = (size.shortestSide * 0.84).clamp(16.0, size.shortestSide);
+    final dst = Rect.fromCenter(center: size.center(Offset.zero), width: side, height: side);
+    canvas.drawImageRect(image, src, dst, Paint()..filterQuality = FilterQuality.none);
+  }
+
+  @override
+  bool shouldRepaint(covariant _QrCardPainter old) => old.image != image || old.qrBounds != qrBounds;
+}
 
 /// A poster from a CatVod `vod_pic` value (with its `@Referer=` / anti-hotlink headers), decoded at display size,
 /// or [fallback].

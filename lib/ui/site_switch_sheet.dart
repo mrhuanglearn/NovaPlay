@@ -179,7 +179,16 @@ class _SiteChoiceList extends ConsumerWidget {
   Widget build(BuildContext context, WidgetRef ref) {
     final sites = ref.watch(visibleHomeSitesProvider);
     final current = ref.watch(currentSiteProvider);
+    final page = (context.findAncestorStateOfType<_SiteSwitchSheetState>())?.widget.pageContext;
     void pick(SpiderSite s) {
+      if (s.type == 7) {
+        final rt = ref.read(catpawRuntimeProvider).valueOrNull;
+        Navigator.pop(context);
+        if (rt != null && page != null && page.mounted) {
+          page.push(Uri(path: '/website', queryParameters: {'url': rt.api.webpageUrl(s)}).toString());
+        }
+        return;
+      }
       ref.read(selectedHomeSiteProvider.notifier).select(s.key);
       Navigator.pop(context);
     }

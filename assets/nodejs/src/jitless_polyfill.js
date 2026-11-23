@@ -1703,7 +1703,8 @@ function parseSingleShareUrlFast(rawUrl, contextHint) {
     provider = 'ali';
   } else if (
     bareHost === '123pan.com' || bareHost === '123pan.cn' || bareHost === '123684.com' ||
-    bareHost === '123865.com' || bareHost === '123912.com' || bareHost === '123592.com'
+    bareHost === '123865.com' || bareHost === '123912.com' || bareHost === '123592.com' ||
+    bareHost === '123952.com'
   ) {
     shareId = firstSeg('/s/');
     if (!shareId) return null;
@@ -1740,7 +1741,7 @@ function parseSingleShareUrlFast(rawUrl, contextHint) {
     if (!shareId) return null;
     provider = 'xunlei';
   } else if (host.endsWith('guangyapan.com')) {
-    shareId = firstSeg('/s/');
+    shareId = firstSeg('/s/') || firstSeg('/share/');
     if (!shareId) return null;
     provider = 'guangyapan';
   } else if (host === 'drive.google.com') {
@@ -1797,7 +1798,9 @@ function scanPanSharesFast(text) {
       i++;
     }
     const rawUrl = text.slice(start, i);
-    const context = text.slice(i, Math.min(len, i + 64));
+    const rawCtx = text.slice(i, Math.min(len, i + 96));
+    const stops = [rawCtx.indexOf('\n'), rawCtx.indexOf('\r'), rawCtx.indexOf('http://'), rawCtx.indexOf('https://')].filter((n) => n >= 0);
+    const context = stops.length > 0 ? rawCtx.slice(0, Math.min(...stops)) : rawCtx;
     const item = parseSingleShareUrlFast(rawUrl, context);
     if (item) {
       const existingIdx = out.findIndex((x) => x.provider === item.provider && x.shareId === item.shareId);
@@ -2242,4 +2245,5 @@ module.exports = {
   installJitlessPolyfill,
   createJitlessFetch,
   createWasmNamespace,
+  scanPanSharesFast,
 };

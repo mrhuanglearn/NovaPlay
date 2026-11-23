@@ -63,11 +63,35 @@ class _WebScreenState extends ConsumerState<WebScreen> {
     }
   }
 
+  ProviderContainer? _container;
+
+  bool get _isLocalAdminPage {
+    if (widget.sniff || _isVerifyMode) return false;
+    final u = Uri.tryParse(_current.isEmpty ? widget.initialUrl : _current);
+    if (u == null) return false;
+    return (u.host == '127.0.0.1' || u.host == 'localhost') &&
+        (u.port == 9321 ||
+            u.path.startsWith('/website') ||
+            u.path.startsWith('/danmu') ||
+            u.path.startsWith('/baseset') ||
+            u.path.startsWith('/woniu-auth'));
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _container = ProviderScope.containerOf(context, listen: false);
+  }
+
   @override
   void dispose() {
     _verifyTimer?.cancel();
     _sub?.cancel();
     _url.dispose();
+    if (_isLocalAdminPage && _container != null) {
+      final c = _container!;
+      Future.microtask(() => reloadLiveCatalog(c));
+    }
     super.dispose();
   }
 
@@ -81,10 +105,14 @@ class _WebScreenState extends ConsumerState<WebScreen> {
           var html = document.documentElement ? document.documentElement.innerHTML : '';
           var sample = ((document.title || '') + '\n' + html.slice(0, 12000));
           var isChallenge = /__cdn_pow|cf-turnstile|_cf_chl_opt|acw_sc__v2|Just a moment|Checking your browser|^403\b|403 Forbidden|访问验证|安全验证|人机验证|正在进行安全检查/i.test(sample);
+          var isLoginPage = /\/(?:user|account)\/(?:login|reg|signin)/i.test(location.pathname || '') || !!document.querySelector('#fm input[type="password"], form[action*="login" i] input[type="password"], .auth-form input[type="password"], .pan-lock-box');
+          var hasLoginCookie = /(?:^|;\s*)user_id=(?!0\b)\w+/.test(document.cookie || '');
           var vodCount = document.querySelectorAll('a[href*="/detail/"], a[href*="/vod"], a[href*="/video/"], a[href*="/play/"], .stui-vodlist__box, .module-item, .myui-vodlist__box, .fed-list-item').length;
           return JSON.stringify({
             readyComplete: document.readyState === 'complete',
             isChallenge: isChallenge,
+            isLoginPage: isLoginPage,
+            hasLoginCookie: hasLoginCookie,
             vodCount: vodCount,
             docCookie: document.cookie || '',
             ua: navigator.userAgent || ''
@@ -101,8 +129,10 @@ class _WebScreenState extends ConsumerState<WebScreen> {
       if (!manual) {
         final readyComplete = probe['readyComplete'] == true;
         final isChallenge = probe['isChallenge'] == true;
+        final isLoginPage = probe['isLoginPage'] == true;
+        final hasLoginCookie = probe['hasLoginCookie'] == true;
         final vodCount = (probe['vodCount'] as num?)?.toInt() ?? 0;
-        if (!readyComplete || isChallenge || vodCount < 3) return;
+        if (!readyComplete || isChallenge || isLoginPage || (vodCount < 3 && !hasLoginCookie)) return;
       }
       _completingVerify = true;
       _verifyTimer?.cancel();

@@ -53,8 +53,11 @@ class PlayerController(
     private var introEndMs = 0L
     private var outroBeforeEndMs = 0L
     private var outroDone = false
+    private var outroHitTicks = 0
+    private var resolvingSource = false
+    private var autoSkippedIntroThisEpisode = false
     private val skipRanges = ArrayList<Pair<Long, Long>>()
-    private var lastSkippedRangeIndex = -1
+    private val skippedRangeIndices = HashSet<Int>()
 
     /** Subtitles added with 加载字幕… for the episode that is playing. */
     private val extraSubtitles = ArrayList<SubtitleOption>()
@@ -63,8 +66,10 @@ class PlayerController(
     private val heartbeat = object : Runnable {
         override fun run() {
             if (closed) return
-            api.onHeartbeat(Heartbeat(request.sessionId, kernel.positionMs / 1000.0, kernel.durationMs / 1000.0)) {}
-            maybeSkipOutro()
+            if (!resolvingSource) {
+                api.onHeartbeat(Heartbeat(request.sessionId, kernel.positionMs / 1000.0, kernel.durationMs / 1000.0)) {}
+                maybeSkipOutro()
+            }
             main.postDelayed(this, 1000)
         }
     }
@@ -247,7 +252,13 @@ class PlayerController(
         episode = episodeIndex
         error = null
         failed = false
+        resolvingSource = true
         outroDone = false
+        outroHitTicks = 0
+        autoSkippedIntroThisEpisode = false
+        skippedRangeIndices.clear()
+        state = "buffering"
+        if (loaded) kernel.pause()
         if (refreshDanmaku) extraSubtitles.clear()
         val id = ++requestId
         api.onEpisodeRequest(EpisodeRequest(request.sessionId, id.toLong(), lineIndex.toLong(), episodeIndex.toLong(), quality.toLong())) {}
@@ -307,6 +318,7 @@ class PlayerController(
     // -- answers from Dart ----------------------------------------------------------------------
     fun onSource(payload: SourcePayload) = main.post {
         if (payload.requestId != requestId.toLong()) return@post // stale answer from a previous request
+        resolvingSource = false
         if (!payload.success || payload.url == null) {
             // OBSERVED in 1.1.13 (W0.c.n): a toast with the message, then the error layer, except for a quality that
             // 未匹配 while an earlier source plays: that one keeps playing.
@@ -323,11 +335,12 @@ class PlayerController(
         if (qualityNames.isNotEmpty()) quality = quality.coerceIn(0, qualityNames.size - 1)
         uiListener?.onChanged()
         lastPayload = payload
-        // 跳过片头: an episode that would start inside the marked intro starts where it ends
+        // 跳过片头: only auto-skip when starting from 0, never on resume / quality switch / retry
         var start = pendingStartMs
-        if (introEndMs > 0 && start < introEndMs) {
+        if (start <= 0 && introEndMs in 1..MAX_HEAD_TAIL_MS) {
             val fromMs = start
             start = introEndMs
+            autoSkippedIntroThisEpisode = true
             if (playback.skipNotice) {
                 uiListener?.onNotice(PlayerUiText.t("已跳过片头", "Intro skipped"))
                 onSkipIntro?.invoke(fromMs)
@@ -390,7 +403,16 @@ class PlayerController(
     // -- user actions ---------------------------------------------------------------------------
     fun togglePause() { if (kernel.isPlaying) kernel.pause() else kernel.play() }
     fun seekTo(ms: Long) {
-        val target = ms.coerceIn(0, kernel.durationMs)
+        val dur = kernel.durationMs
+        val target = if (dur > 0) ms.coerceIn(0, dur) else ms.coerceAtLeast(0)
+        outroHitTicks = 0
+        if (dur > 0 && outroBeforeEndMs > 0 && target >= dur - outroBeforeEndMs) {
+            outroDone = true
+        }
+        for (i in skipRanges.indices) {
+            val (s, e) = skipRanges[i]
+            if (target in s until e) skippedRangeIndices.add(i)
+        }
         state = "buffering"
         uiListener?.onChanged()
         kernel.seekTo(target)
@@ -469,8 +491,19 @@ class PlayerController(
     // -- kernel events --------------------------------------------------------------------------
     override fun onState(state: String) {
         main.post {
+            if (resolvingSource) return@post
             this.state = state
-            if (state == "playing") { failed = false; dismissError() } // the kernel got going again
+            if (state == "playing") {
+                failed = false
+                dismissError()
+                if (autoSkippedIntroThisEpisode) {
+                    val dur = kernel.durationMs
+                    if (dur > 0) {
+                        autoSkippedIntroThisEpisode = false
+                        if (dur < introEndMs + 60_000L) kernel.seekTo(0)
+                    }
+                }
+            }
             danmakuView.paused = state != "playing"
             uiListener?.onChanged()
             api.onStateChanged(StateEvent(request.sessionId, state)) {}
@@ -531,27 +564,33 @@ class PlayerController(
      * episode plays on to its end.
      */
     private fun maybeSkipOutro() {
+        if (resolvingSource) return
         val pos = kernel.positionMs
         val dur = kernel.durationMs
         if (dur <= 0 || state != "playing") return
         for (i in skipRanges.indices) {
             val (startMs, endMs) = skipRanges[i]
-            if (pos in startMs until endMs && lastSkippedRangeIndex != i) {
-                lastSkippedRangeIndex = i
+            if (endMs <= dur && pos in startMs until endMs && skippedRangeIndices.add(i)) {
                 kernel.seekTo(endMs)
                 if (playback.skipNotice) {
                     uiListener?.onNotice(PlayerUiText.t("已跳过片段", "Section skipped"))
                     onSkipIntro?.invoke(pos)
                 }
                 return
-            } else if (pos < startMs || pos >= endMs + 2000) {
-                if (lastSkippedRangeIndex == i) lastSkippedRangeIndex = -1
             }
         }
-        if (outroDone || outroBeforeEndMs <= 0) return
+        if (outroDone || outroBeforeEndMs !in 1..MAX_HEAD_TAIL_MS) return
+        if (dur < MIN_AUTO_OUTRO_DURATION_MS || outroBeforeEndMs > dur / 3) return
+        val effIntro = if (introEndMs in 1..(dur / 3)) introEndMs else 0L
         val at = dur - outroBeforeEndMs
-        if (at <= introEndMs || pos < at) return
+        if (at - effIntro < MIN_MAIN_CONTENT_MS) return
+        if (pos < at || pos > dur + 5_000L) {
+            outroHitTicks = 0
+            return
+        }
+        if (++outroHitTicks < 2) return
         outroDone = true
+        outroHitTicks = 0
         if (!hasNext) return
         // 播放器设置 → 跳过提示: a banner when a marked section is skipped
         if (playback.skipNotice) uiListener?.onNotice(PlayerUiText.t("已跳过片尾", "Outro skipped"))
@@ -569,8 +608,8 @@ class PlayerController(
         for (i in 0 until arr.length()) {
             val o = arr.optJSONObject(i) ?: continue
             when (o.optString("type")) {
-                "intro" -> introEndMs = o.optLong("endMs")
-                "outro" -> outroBeforeEndMs = o.optLong("beforeEndMs")
+                "intro" -> introEndMs = o.optLong("endMs").coerceIn(0L, MAX_HEAD_TAIL_MS)
+                "outro" -> outroBeforeEndMs = o.optLong("beforeEndMs").coerceIn(0L, MAX_HEAD_TAIL_MS)
                 "range" -> {
                     val s = o.optLong("startMs")
                     val e = o.optLong("endMs")
@@ -586,7 +625,13 @@ class PlayerController(
     /** 记片头: the intro of this video ends here. */
     fun markIntro() {
         val pos = kernel.positionMs
-        if (pos <= 0) return
+        val dur = kernel.durationMs
+        if (pos <= 0 || dur <= 0) return
+        val maxAllowed = minOf(MAX_HEAD_TAIL_MS, dur / 3)
+        if (pos > maxAllowed) {
+            uiListener?.onToast(PlayerUiText.t("片头位置过长，请在正片前 1/3 内标记", "Intro position too far into episode"))
+            return
+        }
         introEndMs = pos
         api.onHeadTailMarked(request.sessionId, "intro", pos / 1000.0) {}
         uiListener?.onToast(PlayerUiText.introMarked(pos))
@@ -597,10 +642,23 @@ class PlayerController(
         val dur = kernel.durationMs
         val before = dur - kernel.positionMs
         if (dur <= 0 || before <= 0) return
+        val maxAllowed = minOf(MAX_HEAD_TAIL_MS, dur / 3)
+        if (before > maxAllowed) {
+            uiListener?.onToast(PlayerUiText.t("片尾时长过长，请在结束前 1/3 内标记", "Outro too far before end"))
+            return
+        }
         outroBeforeEndMs = before
-        outroDone = false
+        outroDone = true
+        outroHitTicks = 0
         api.onHeadTailMarked(request.sessionId, "outro", before / 1000.0) {}
         uiListener?.onToast(PlayerUiText.outroMarked(before))
+        if (hasNext) nextEpisode()
+    }
+
+    companion object {
+        private const val MAX_HEAD_TAIL_MS = 600_000L
+        private const val MIN_AUTO_OUTRO_DURATION_MS = 180_000L
+        private const val MIN_MAIN_CONTENT_MS = 90_000L
     }
 
     fun close(completed: Boolean = false, finishActivity: Boolean = true) {

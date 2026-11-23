@@ -403,17 +403,19 @@ class _EditSubscriptionScreenState extends ConsumerState<EditSubscriptionScreen>
                       onPressed: _busy ? null : () => _save(s),
                     ),
                   ),
-                  if (s.cloudUrl == null)
-                    SettingsSection(dividers: false, children: [
-                      _InfoRow(
-                          icon: Icons.schedule, label: l.subscriptionLastUpdated, value: relativeTime(l, s.updatedAt)),
+                  SettingsSection(dividers: false, children: [
+                    _InfoRow(
+                        icon: Icons.schedule,
+                        label: l.subscriptionLastUpdated,
+                        value: formatSubscriptionTime(l, s.updatedAt)),
+                    if (s.cloudUrl == null)
                       _InfoRow(
                         icon: Icons.fingerprint,
                         label: l.subscriptionFingerprint,
                         value: (s.installedMd5 ?? '').length >= 8 ? s.installedMd5!.substring(0, 8) : '—',
                         mono: true,
                       ),
-                    ]),
+                  ]),
                   SettingsSection(children: [
                     SettingsTile(
                         icon: Icons.delete_outline,

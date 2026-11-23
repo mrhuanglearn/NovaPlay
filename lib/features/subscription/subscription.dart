@@ -252,14 +252,24 @@ class SubscriptionService {
   /// Downloads [sub] again when the server has a different script. Returns the updated subscription, or null when it
   /// was already up to date (OBSERVED "」已是最新" / "已更新到最新"). Cloud and local subscriptions have nothing to fetch.
   Future<Subscription?> refresh(Subscription sub, {Future<bool> Function()? confirmConfigMismatch}) async {
+    if (sub.cloudUrl != null) {
+      await installer.probeCloud(sub.cloudUrl!);
+      await repository.upsert(sub.copyWith(updatedAt: _now().millisecondsSinceEpoch));
+      return null;
+    }
     if (sub.indexJsUrl == null) return null;
     final installed = await installer.installedScript(sub);
     final remote = await installer.remoteMd5(sub);
-    if (installed != null && remote != null && remote == installed.md5) return null;
+    if (installed != null && remote != null && remote == installed.md5) {
+      final configChanged = await installer.refreshConfig(sub, confirmConfigMismatch: confirmConfigMismatch);
+      final touched = sub.copyWith(updatedAt: _now().millisecondsSinceEpoch);
+      await repository.upsert(touched);
+      return configChanged ? touched : null;
+    }
     final fresh = await installer.install(sub, confirmConfigMismatch: confirmConfigMismatch);
-    if (installed != null && fresh.md5 == installed.md5) return null;
     final updated = sub.copyWith(installedMd5: fresh.md5, updatedAt: _now().millisecondsSinceEpoch);
     await repository.upsert(updated);
+    if (installed != null && fresh.md5 == installed.md5) return null;
     return updated;
   }
 
@@ -440,6 +450,48 @@ class SubscriptionInstaller {
       return await _fetchMd5(ScriptUrls.parse(url).md5, required: false).timeout(const Duration(seconds: 8));
     } catch (_) {
       return null;
+    }
+  }
+
+  /// Verifies a cloud CatPaw endpoint responds to `/config` during manual refresh.
+  Future<void> probeCloud(String cloudUrl) async {
+    final base = Uri.parse(cloudUrl.trim().replaceAll(RegExp(r'/+$'), ''));
+    final cfgUri = base.replace(path: '${base.path}/config');
+    await _bytes(cfgUri);
+  }
+
+  /// Re-downloads `index.config.js` (or [Subscription.configUrl]) when `index.js` MD5 did not change; returns true if
+  /// the config file on disk changed.
+  Future<bool> refreshConfig(Subscription sub, {Future<bool> Function()? confirmConfigMismatch}) async {
+    final url = sub.indexJsUrl;
+    if (url == null || await installedScript(sub) == null) return false;
+    final dir = await _dir(sub);
+    final configFile = File(p.join(dir.path, 'config.js'));
+    final tmpConfigFile = File(p.join(dir.path, 'config.js.tmp'));
+    try {
+      String? stagedPath;
+      if (sub.configUrl != null) {
+        final cfg = (await _dio.get<String>(sub.configUrl!)).data ?? '{}';
+        jsonDecode(cfg);
+        await tmpConfigFile.writeAsString('module.exports = $cfg;', flush: true);
+        stagedPath = tmpConfigFile.path;
+      } else if (ScriptUrls.parse(url).config case final configUri?) {
+        stagedPath = await _downloadConfig(configUri, tmpConfigFile, confirmConfigMismatch);
+      }
+      if (stagedPath == null) return false;
+      final nextBytes = await tmpConfigFile.readAsBytes();
+      if (await configFile.exists()) {
+        final prevBytes = await configFile.readAsBytes();
+        if (md5.convert(prevBytes) == md5.convert(nextBytes)) {
+          await tmpConfigFile.delete();
+          return false;
+        }
+      }
+      await tmpConfigFile.rename(configFile.path);
+      return true;
+    } catch (_) {
+      if (await tmpConfigFile.exists()) await tmpConfigFile.delete();
+      return false;
     }
   }
 

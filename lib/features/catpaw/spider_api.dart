@@ -2,6 +2,7 @@ import 'package:dio/dio.dart';
 
 import '../../core/app_http.dart';
 import '../../models/vod.dart';
+import '../../ui/poster_image.dart';
 
 /// One video source exposed by a running catpaw instance.
 class SpiderSite {
@@ -89,7 +90,9 @@ class SpiderApi {
               baseUrl: (baseUrl ?? 'http://127.0.0.1:$port').replaceAll(RegExp(r'/+$'), ''),
               connectTimeout: const Duration(seconds: 10),
               receiveTimeout: receiveTimeout,
-            );
+            ) {
+    if (_isLocal && port > 0) PosterImage.localCatpawPort = port;
+  }
 
   int _port;
   final bool _isLocal;
@@ -104,6 +107,7 @@ class SpiderApi {
   void updateLocalPort(int nextPort) {
     if (!_isLocal || nextPort <= 0) return;
     _port = nextPort;
+    PosterImage.localCatpawPort = nextPort;
     _dio.options.baseUrl = 'http://127.0.0.1:$nextPort';
   }
 
@@ -177,11 +181,13 @@ class SpiderApi {
 
   Future<void> init(SpiderSite site) => _post(site, 'init');
 
-  String _webpageUrl(SpiderSite site) =>
-      (site.homeUrl != null && site.homeUrl!.isNotEmpty) ? site.homeUrl! : '$baseUrl${site.api}/web';
+  String webpageUrl(SpiderSite site) {
+    final raw = (site.homeUrl != null && site.homeUrl!.isNotEmpty) ? site.homeUrl! : '$baseUrl${site.api}/web';
+    return PosterImage.normalizeLocalUrl(raw, _isLocal ? _port : null);
+  }
 
   VodItem _webpageCard(SpiderSite site) =>
-      VodItem(id: 'uzv-web:${_webpageUrl(site)}', name: '打开 ${site.name}', remarks: '点击打开网页', siteKey: site.key);
+      VodItem(id: 'uzv-web:${webpageUrl(site)}', name: '打开 ${site.name}', remarks: '点击打开网页', siteKey: site.key);
 
   /// OBSERVED request bodies of the original (2026-11-09, logged by a mock subscription): `home` is posted with
   /// `{"filter":true}`; `category` with `{"id","page","filter":<any filter chosen>,"filters":{key:value}}`, where a

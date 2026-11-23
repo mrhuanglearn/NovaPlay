@@ -162,17 +162,39 @@ void main() {
       await expectLater(service.addNetwork(url: '${base()}/sub/index.js.md5'), throwsA(isA<DuplicateSubscriptionException>()));
     });
 
-    test('refresh reports up to date, then downloads a changed script', () async {
+    test('refresh reports up to date, stamps updatedAt, updates config.js changes, and downloads a changed script', () async {
       put('/sub/index.js', script);
+      put('/sub/index.config.js', config);
       final sub = await service.addNetwork(url: '${base()}/sub/index.js.md5');
+      clock = clock.add(const Duration(minutes: 10));
       expect(await service.refresh(sub), isNull);
+      expect((await repo.all()).single.updatedAt, clock.millisecondsSinceEpoch,
+          reason: 'manual refresh updates updatedAt even when index.js.md5 is unchanged');
+
+      // Only index.config.js changes while index.js.md5 stays the same.
+      const configV2 = 'module.exports = { sites: 9 };';
+      put('/sub/index.config.js', configV2);
+      clock = clock.add(const Duration(minutes: 5));
+      final cfgUpdated = await service.refresh(sub);
+      expect(cfgUpdated, isNotNull);
+      expect(cfgUpdated!.updatedAt, clock.millisecondsSinceEpoch);
+      final installed = await SubscriptionInstaller(root: dir).installedScript(sub);
+      expect(File(installed!.configPath!).readAsStringSync(), configV2);
+
+      // Cloud subscription refresh probes /config and stamps updatedAt.
+      files['/config'] = utf8.encode('{"sites":[]}');
+      final cloud = await service.addCloud(url: base());
+      clock = clock.add(const Duration(minutes: 3));
+      expect(await service.refresh(cloud), isNull);
+      expect((await repo.all()).firstWhere((s) => s.key == cloud.key).updatedAt, clock.millisecondsSinceEpoch);
+
       const v2 = 'module.exports = { start() {}, v: 2 };';
       put('/sub/index.js', v2);
       clock = clock.add(const Duration(hours: 1));
       final updated = await service.refresh(sub);
       expect(updated!.installedMd5, md5Of(v2));
       expect(updated.updatedAt, clock.millisecondsSinceEpoch);
-      expect((await repo.all()).single.installedMd5, md5Of(v2));
+      expect((await repo.all()).firstWhere((s) => s.key == sub.key).installedMd5, md5Of(v2));
     });
 
     test('a local zip needs both index.js and index.config.js', () async {

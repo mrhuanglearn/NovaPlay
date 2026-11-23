@@ -13,6 +13,7 @@ import 'app_shell.dart';
 import 'category_filters.dart';
 import 'load_error.dart';
 import 'lock_dialogs.dart';
+import 'poster_image.dart';
 import 'site_switch_sheet.dart';
 import 'widgets.dart';
 
@@ -285,8 +286,8 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
     return cats.isEmpty ? null : cats.first.id;
   }
 
-  void _ensureLoaded(String? subKey, SpiderSite site, String? typeId) {
-    final key = '${subKey ?? ''}|${site.key}|$typeId';
+  void _ensureLoaded(String? subKey, SpiderSite site, String? typeId, int catalogRev) {
+    final key = '${subKey ?? ''}|${site.key}|$typeId|$catalogRev';
     if (key == _loadedFor) return;
     if (_site?.key != site.key) _autoVerifyTriggeredSite = null;
     _loadedFor = key;
@@ -425,10 +426,11 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
       ),
       data: (home) {
         if (home == null || site == null) return const SizedBox.shrink();
+        final catalogRev = ref.watch(liveCatalogRevisionProvider);
         final blocked = prefs.blockedFor(site.key);
         final cats = home.categories.where((x) => !blocked.contains(x.id)).toList();
         final typeId = _effectiveType(home, blocked);
-        _ensureLoaded(subKey, site, typeId);
+        _ensureLoaded(subKey, site, typeId, catalogRev);
         final selected = cats.where((x) => x.id == typeId).firstOrNull;
         final filters = selected != null && selected.filters.isNotEmpty && !prefs.hideFilters
             ? CategoryFilterBar(
@@ -479,7 +481,13 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
                           label: cat.name,
                           selected: cat.id == typeId,
                           onTap: () {
-                            if (cat.id != typeId) ref.read(selectedTypeIdProvider.notifier).select(cat.id);
+                            if (cat.id != typeId) {
+                              ref.read(selectedTypeIdProvider.notifier).select(cat.id);
+                            } else if (cat.name.startsWith('http://') || cat.name.startsWith('https://')) {
+                              final localPort = ref.read(catpawRuntimeProvider).valueOrNull?.api.port;
+                              final url = PosterImage.normalizeLocalUrl(cat.name.trim(), localPort);
+                              context.push(Uri(path: '/website', queryParameters: {'url': url}).toString());
+                            }
                           },
                         ),
                     ]),

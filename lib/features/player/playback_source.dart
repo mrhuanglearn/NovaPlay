@@ -23,7 +23,7 @@ abstract class PlaybackSource {
 
   Future<PlayResult> resolve(int lineIndex, int episodeIndex);
 
-  Future<double> resumeSeconds(int lineIndex, int episodeIndex) async => 0;
+  Future<double> resumeSeconds(int lineIndex, int episodeIndex, {double outroSeconds = 0}) async => 0;
 
   /// The source quality to start with (index into the play result's qualities).
   Future<int> resumeQuality() async => 0;
@@ -70,10 +70,16 @@ class VodPlaybackSource extends PlaybackSource {
   /// An episode left within its last 5 seconds counts as watched and starts again from 0 (INFERRED: starting at the
   /// saved end made the player report 'ended' at once and close).
   @override
-  Future<double> resumeSeconds(int lineIndex, int episodeIndex) async {
+  Future<double> resumeSeconds(int lineIndex, int episodeIndex, {double outroSeconds = 0}) async {
     final e = await history.find(site.key, detail.item.id);
     if (e == null || e.lineIndex != lineIndex || e.episodeIndex != episodeIndex) return 0;
     if (e.durationSeconds > 0 && e.durationSeconds - e.positionSeconds < 5) return 0;
+    if (outroSeconds > 0 &&
+        e.durationSeconds >= 180 &&
+        outroSeconds <= e.durationSeconds / 3 &&
+        e.durationSeconds - e.positionSeconds <= outroSeconds + 5) {
+      return 0;
+    }
     return e.positionSeconds;
   }
 

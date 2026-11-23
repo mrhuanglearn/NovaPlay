@@ -599,7 +599,7 @@ class PlayerControlsView(
                     removeCallbacks(skipTick)
                     skipBanner.visibility = GONE
                     actions.onHaptic()
-                    kernel.seekTo(skipFromMs)
+                    controller.seekTo(skipFromMs)
                     refresh()
                 }
             })

@@ -72,6 +72,34 @@ void main() {
       'api': '/spider/pomo/3',
     });
     expect(sDefault.browserVerify, isFalse);
+
+    final sWoniu = SpiderSite.fromJson({
+      'key': 'nodejs_woniu',
+      'name': '「盘」蜗牛',
+      'api': '/spider/woniu/3',
+    });
+    expect(sWoniu.browserVerify, isFalse, reason: 'woniu uses /woniu-auth login unless browserVerify is explicitly set');
+  });
+
+  test('detectSiteVerifyChallenge preserves /user/login/ path for woniu', () {
+    final sWoniu = SpiderSite.fromJson({
+      'key': 'woniu',
+      'name': '「盘」蜗牛',
+      'api': '/spider/woniu/3',
+      'browserVerify': 1,
+    });
+    final err = DioException.badResponse(
+      statusCode: 403,
+      requestOptions: RequestOptions(path: '/spider/woniu/3/detail'),
+      response: Response(
+        requestOptions: RequestOptions(path: '/spider/woniu/3/detail'),
+        statusCode: 403,
+        data: {'code': 'BROWSER_VERIFY_REQUIRED', 'error': '需要登录', 'verifyUrl': 'https://wn4k.com/user/login/'},
+      ),
+    );
+    final challenge = detectSiteVerifyChallenge(err, sWoniu, statusCode: 403, responseData: err.response?.data);
+    expect(challenge, isNotNull);
+    expect(challenge!.verifyUrl, 'https://wn4k.com/user/login/');
   });
 
   test('SiteAuthRepository persists verified cookie, userAgent, and origin per site', () async {

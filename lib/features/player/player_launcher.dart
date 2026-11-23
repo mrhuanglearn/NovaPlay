@@ -175,14 +175,16 @@ class PlayerLauncher {
     onSession?.call(session);
     await _enableWakelock();
     try {
+      final memKey = source.memoryKey;
+      final ht = memKey == null ? null : await headTail?.getAll(memKey);
       await session.open(
         playback: playback,
         danmaku: danmaku,
         line: line,
         episode: episode,
-        startSeconds: await source.resumeSeconds(line, episode),
+        startSeconds: await source.resumeSeconds(line, episode, outroSeconds: ht?.outro ?? 0),
         quality: await source.resumeQuality(),
-        headTailJson: source.memoryKey == null ? null : await headTail?.sectionsJson(source.memoryKey!),
+        headTailJson: memKey == null ? null : await headTail?.sectionsJson(memKey),
       );
       onOpened?.call();
       return await session.closed;

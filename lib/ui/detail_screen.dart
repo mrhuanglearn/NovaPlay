@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -8,10 +10,13 @@ import '../app/site_prefs.dart';
 import '../app/ui_hooks.dart';
 import '../features/downloads/enqueue.dart';
 import '../features/library/watch_repository.dart';
+import '../features/player/head_tail.dart';
 import '../models/vod.dart';
 import '../services/tmdb_client.dart';
 import '../l10n/l10n.dart';
 import '../app/theme.dart';
+import 'load_error.dart';
+import 'poster_image.dart';
 import 'widgets.dart';
 
 String _stripCatpawTags(String raw) =>
@@ -40,6 +45,11 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
   int _line = 0;
   bool _favorite = false;
   bool _opening = false;
+  bool _redirectedWeb = false;
+  bool _autoVerifyTriggered = false;
+
+  static bool get _inWidgetTest =>
+      WidgetsBinding.instance.runtimeType.toString().contains('TestWidgetsFlutterBinding');
 
   String get _siteKey => ref.read(siteByKeyProvider(widget.siteKey))?.key ?? '';
 
@@ -84,7 +94,33 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
     if (mounted) setState(() => _retrying = false);
   }
 
+  String? _webEntryUrl(VodDetail d, {int? lineIndex, int? episodeIndex}) {
+    final localPort = ref.read(catpawRuntimeProvider).valueOrNull?.api.port;
+    final candidates = (lineIndex != null && episodeIndex != null && lineIndex >= 0 && lineIndex < d.lines.length)
+        ? [d.lines[lineIndex]]
+        : d.lines;
+    for (final line in candidates) {
+      if (line.name != '配置入口' && line.name != '内置网页') continue;
+      final eps = (episodeIndex != null && episodeIndex >= 0 && episodeIndex < line.episodes.length)
+          ? [line.episodes[episodeIndex]]
+          : line.episodes;
+      for (final ep in eps) {
+        final u = Uri.tryParse(ep.url.trim());
+        if (u != null && (u.scheme == 'http' || u.scheme == 'https')) {
+          return PosterImage.normalizeLocalUrl(u.toString(), localPort);
+        }
+      }
+    }
+    return null;
+  }
+
   Future<void> _play(VodDetail detail, int episode) async {
+    final webUrl = _webEntryUrl(detail, lineIndex: _line, episodeIndex: episode);
+    if (webUrl != null) {
+      await context.push<void>(Uri(path: '/website', queryParameters: {'url': webUrl}).toString());
+      if (mounted && webUrl.contains('/woniu-auth')) unawaited(_retry());
+      return;
+    }
     final rt = ref.read(catpawRuntimeProvider).valueOrNull;
     final site = ref.read(siteByKeyProvider(widget.siteKey));
     if (rt == null || site == null || _opening) return;
@@ -156,129 +192,16 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
   Future<void> _openHeadTailSheet() async {
     final repo = ref.read(headTailRepositoryProvider);
     final key = vodKey(_siteKey, widget.vodId);
-    var data = await repo.getAll(key);
+    final initial = await repo.getAll(key);
     if (!mounted) return;
-    var tab = 'intro';
-    final singleCtrl = TextEditingController();
-    final startCtrl = TextEditingController();
-    final endCtrl = TextEditingController();
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
       showDragHandle: true,
       useRootNavigator: true,
       backgroundColor: AppColors.of(context).page,
-      builder: (sheetCtx) => StatefulBuilder(builder: (sheetCtx, setSheet) {
-        final c = AppColors.of(sheetCtx);
-        Future<void> reload() async {
-          final next = await repo.getAll(key);
-          setSheet(() => data = next);
-        }
-
-        final entries = <(String label, Future<void> Function() onDelete)>[
-          if (data.intro > 0)
-            ('片头：0s - ${data.intro.round()}s', () async { await repo.mark(key, 'intro', 0); await reload(); }),
-          if (data.outro > 0)
-            ('片尾：结束前 ${data.outro.round()}s', () async { await repo.mark(key, 'outro', 0); await reload(); }),
-          for (var i = 0; i < data.ranges.length; i++)
-            (
-              '区间：${data.ranges[i].$1.round()}s - ${data.ranges[i].$2.round()}s',
-              () async { await repo.removeRange(key, i); await reload(); },
-            ),
-        ];
-
-        return Padding(
-          padding: EdgeInsets.fromLTRB(20, 0, 20, 24 + MediaQuery.viewInsetsOf(sheetCtx).bottom + MediaQuery.paddingOf(sheetCtx).bottom),
-          child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text('片头片尾', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: c.label)),
-            const SizedBox(height: 14),
-            AppSegmented<String>(
-              segments: const {'intro': (null, '片头'), 'outro': (null, '片尾'), 'range': (null, '区间')},
-              value: tab,
-              onChanged: (v) => setSheet(() => tab = v),
-            ),
-            const SizedBox(height: 14),
-            if (tab != 'range') ...[
-              Text(tab == 'intro' ? '片头结束（秒）' : '片尾时长（距离结束秒数）',
-                  style: TextStyle(fontSize: 13, color: c.secondaryLabel)),
-              const SizedBox(height: 8),
-              TextField(
-                controller: singleCtrl,
-                keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                decoration: const InputDecoration(isDense: true),
-              ),
-            ] else ...[
-              Row(children: [
-                Expanded(
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Text('开始（秒）', style: TextStyle(fontSize: 13, color: c.secondaryLabel)),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: startCtrl,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                      decoration: const InputDecoration(isDense: true),
-                    ),
-                  ]),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                    Text('结束（秒）', style: TextStyle(fontSize: 13, color: c.secondaryLabel)),
-                    const SizedBox(height: 8),
-                    TextField(
-                      controller: endCtrl,
-                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                      decoration: const InputDecoration(isDense: true),
-                    ),
-                  ]),
-                ),
-              ]),
-            ],
-            const SizedBox(height: 16),
-            PrimaryButton(
-              icon: Icons.add,
-              label: '添加',
-              expand: true,
-              onPressed: () async {
-                if (tab == 'range') {
-                  final s = double.tryParse(startCtrl.text.trim()) ?? 0;
-                  final e = double.tryParse(endCtrl.text.trim()) ?? 0;
-                  if (e <= s || s < 0) return;
-                  await repo.addRange(key, s, e);
-                  startCtrl.clear();
-                  endCtrl.clear();
-                } else {
-                  final v = double.tryParse(singleCtrl.text.trim()) ?? 0;
-                  if (v <= 0) return;
-                  await repo.mark(key, tab, v);
-                  singleCtrl.clear();
-                }
-                await reload();
-              },
-            ),
-            const SizedBox(height: 20),
-            if (entries.isEmpty)
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 24),
-                child: Center(child: Text('暂无片头片尾记录', style: TextStyle(fontSize: 13.5, color: c.secondaryLabel))),
-              )
-            else
-              for (final (label, onDelete) in entries)
-                ListTile(
-                  contentPadding: EdgeInsets.zero,
-                  title: Text(label, style: TextStyle(fontSize: 14, color: c.label)),
-                  trailing: IconButton(
-                    icon: Icon(Icons.delete_outline, color: c.secondaryLabel),
-                    onPressed: onDelete,
-                  ),
-                ),
-          ]),
-        );
-      }),
+      builder: (_) => _HeadTailSheet(repo: repo, vodKey: key, initial: initial),
     );
-    singleCtrl.dispose();
-    startCtrl.dispose();
-    endCtrl.dispose();
   }
 
   /// 立即播放 continues where the history left off (same line and episode), else the first episode of the first line.
@@ -445,7 +368,7 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
         );
       }),
     );
-    scroll.dispose();
+    Future<void>.delayed(const Duration(milliseconds: 400), scroll.dispose);
   }
 
   Widget _headerRow(BuildContext context, VodItem item, {String? area, String? fallbackPic}) {
@@ -530,15 +453,43 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
                   const Center(child: CircularProgressIndicator()),
                 ],
               ),
-        error: (e, _) => ErrorState(
-          error: e,
-          site: ref.watch(siteByKeyProvider(widget.siteKey)),
-          subscriptionUrl: ref.watch(catpawRuntimeProvider).valueOrNull?.subscription.indexJsUrl ??
-              ref.watch(catpawRuntimeProvider).valueOrNull?.subscription.cloudUrl,
-          onRetry: _retry,
-        ),
+        error: (e, _) {
+          final site = ref.watch(siteByKeyProvider(widget.siteKey));
+          final sub = ref.watch(catpawRuntimeProvider).valueOrNull?.subscription;
+          final subUrl = sub?.indexJsUrl ?? sub?.cloudUrl;
+          final challenge = resolveDioVerifyChallenge(e, site, subscriptionHubUrl: subUrl);
+          if (challenge != null && !_autoVerifyTriggered && !_inWidgetTest) {
+            _autoVerifyTriggered = true;
+            WidgetsBinding.instance.addPostFrameCallback((_) async {
+              if (!mounted) return;
+              final ok = await openSiteVerifyWebView(context, challenge);
+              if (ok && mounted) unawaited(_retry());
+            });
+          }
+          return ErrorState(
+            error: e,
+            site: site,
+            subscriptionUrl: subUrl,
+            onRetry: _retry,
+          );
+        },
         data: (d) {
           if (d == null) return EmptyState(icon: Icons.search_off, title: l.notFound);
+          final isBasesetCard = _siteKey.endsWith('baseset') ||
+              widget.vodId == 'openInternalWebsite' ||
+              widget.vodId.startsWith('webpage:');
+          final webUrl = isBasesetCard ? _webEntryUrl(d) : null;
+          if (webUrl != null && !_redirectedWeb) {
+            _redirectedWeb = true;
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (!mounted) return;
+              final router = GoRouter.of(context);
+              final cfg = router.routerDelegate.currentConfiguration;
+              final curPath = cfg.isNotEmpty ? cfg.uri.path : '';
+              if (curPath == '/website') return;
+              context.pushReplacement(Uri(path: '/website', queryParameters: {'url': webUrl}).toString());
+            });
+          }
           final overview =
               (d.content ?? '').isNotEmpty ? d.content!.replaceAll(RegExp(r'<[^>]+>'), '').trim() : tmdb?.overview;
           final meta = TextStyle(fontSize: 13, color: c.label.withValues(alpha: 0.9), height: 1.5);
@@ -610,6 +561,159 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
               ]);
         },
       ),
+    );
+  }
+}
+
+class _HeadTailSheet extends StatefulWidget {
+  const _HeadTailSheet({required this.repo, required this.vodKey, required this.initial});
+  final HeadTailRepository repo;
+  final String vodKey;
+  final ({double intro, double outro, List<(double, double)> ranges}) initial;
+
+  @override
+  State<_HeadTailSheet> createState() => _HeadTailSheetState();
+}
+
+class _HeadTailSheetState extends State<_HeadTailSheet> {
+  final _singleCtrl = TextEditingController();
+  final _startCtrl = TextEditingController();
+  final _endCtrl = TextEditingController();
+  late ({double intro, double outro, List<(double, double)> ranges}) _data = widget.initial;
+  String _tab = 'intro';
+
+  @override
+  void dispose() {
+    _singleCtrl.dispose();
+    _startCtrl.dispose();
+    _endCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _reload() async {
+    final next = await widget.repo.getAll(widget.vodKey);
+    if (mounted) setState(() => _data = next);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final c = AppColors.of(context);
+    final entries = <(String label, Future<void> Function() onDelete)>[
+      if (_data.intro > 0)
+        ('片头：0s - ${_data.intro.round()}s', () async { await widget.repo.mark(widget.vodKey, 'intro', 0); await _reload(); }),
+      if (_data.outro > 0)
+        ('片尾：结束前 ${_data.outro.round()}s', () async { await widget.repo.mark(widget.vodKey, 'outro', 0); await _reload(); }),
+      for (var i = 0; i < _data.ranges.length; i++)
+        (
+          '区间：${_data.ranges[i].$1.round()}s - ${_data.ranges[i].$2.round()}s',
+          () async { await widget.repo.removeRange(widget.vodKey, i); await _reload(); },
+        ),
+    ];
+
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+          20, 0, 20, 24 + MediaQuery.viewInsetsOf(context).bottom + MediaQuery.paddingOf(context).bottom),
+      child: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Text('片头片尾', style: TextStyle(fontSize: 17, fontWeight: FontWeight.w700, color: c.label)),
+        const SizedBox(height: 14),
+        AppSegmented<String>(
+          segments: const {'intro': (null, '片头'), 'outro': (null, '片尾'), 'range': (null, '区间')},
+          value: _tab,
+          onChanged: (v) => setState(() => _tab = v),
+        ),
+        const SizedBox(height: 14),
+        if (_tab != 'range') ...[
+          Text(
+              _tab == 'intro'
+                  ? '片头结束（秒或 分:秒，如 90 / 01:30，≤600秒）'
+                  : '片尾时长（距离结束秒数或 分:秒，如 120 / 02:00，≤600秒）',
+              style: TextStyle(fontSize: 13, color: c.secondaryLabel)),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _singleCtrl,
+            keyboardType: TextInputType.datetime,
+            decoration: InputDecoration(
+              isDense: true,
+              hintText: _tab == 'intro' ? '例如 90 或 01:30' : '例如 120 或 02:00（距片尾结束时长）',
+            ),
+          ),
+        ] else ...[
+          Row(children: [
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('开始（秒或 分:秒）', style: TextStyle(fontSize: 13, color: c.secondaryLabel)),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _startCtrl,
+                  keyboardType: TextInputType.datetime,
+                  decoration: const InputDecoration(isDense: true, hintText: '05:00'),
+                ),
+              ]),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+                Text('结束（秒或 分:秒）', style: TextStyle(fontSize: 13, color: c.secondaryLabel)),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: _endCtrl,
+                  keyboardType: TextInputType.datetime,
+                  decoration: const InputDecoration(isDense: true, hintText: '06:00'),
+                ),
+              ]),
+            ),
+          ]),
+        ],
+        const SizedBox(height: 16),
+        PrimaryButton(
+          icon: Icons.add,
+          label: '添加',
+          expand: true,
+          onPressed: () async {
+            if (_tab == 'range') {
+              final s = HeadTailRepository.parseSecondsInput(_startCtrl.text) ??
+                  (_startCtrl.text.trim() == '0' ? 0.0 : -1.0);
+              final e = HeadTailRepository.parseSecondsInput(_endCtrl.text) ?? 0;
+              if (s < 0 || e <= s) {
+                showToast('请输入有效的起止时间（结束时间需大于开始时间）');
+                return;
+              }
+              await widget.repo.addRange(widget.vodKey, s, e);
+              _startCtrl.clear();
+              _endCtrl.clear();
+            } else {
+              final v = HeadTailRepository.parseSecondsInput(_singleCtrl.text);
+              if (v == null) {
+                showToast('请输入有效时长（如 90 或 01:30）');
+                return;
+              }
+              if (v > HeadTailRepository.maxHeadTailSeconds) {
+                showToast('片头/片尾时长不能超过 10 分钟（600 秒），片尾请填距结束的时长而非绝对时间点');
+                return;
+              }
+              await widget.repo.mark(widget.vodKey, _tab, v);
+              _singleCtrl.clear();
+            }
+            await _reload();
+          },
+        ),
+        const SizedBox(height: 20),
+        if (entries.isEmpty)
+          Padding(
+            padding: const EdgeInsets.symmetric(vertical: 24),
+            child: Center(child: Text('暂无片头片尾记录', style: TextStyle(fontSize: 13.5, color: c.secondaryLabel))),
+          )
+        else
+          for (final (label, onDelete) in entries)
+            ListTile(
+              contentPadding: EdgeInsets.zero,
+              title: Text(label, style: TextStyle(fontSize: 14, color: c.label)),
+              trailing: IconButton(
+                icon: Icon(Icons.delete_outline, color: c.secondaryLabel),
+                onPressed: onDelete,
+              ),
+            ),
+      ]),
     );
   }
 }
