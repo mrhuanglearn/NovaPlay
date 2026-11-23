@@ -86,6 +86,7 @@ class _WebScreenState extends ConsumerState<WebScreen> {
             readyComplete: document.readyState === 'complete',
             isChallenge: isChallenge,
             vodCount: vodCount,
+            docCookie: document.cookie || '',
             ua: navigator.userAgent || ''
           });
         })()
@@ -110,6 +111,16 @@ class _WebScreenState extends ConsumerState<WebScreen> {
       final origin = '${parsed.scheme}://${parsed.authority}';
       final cookieMgr = CookieManager.instance();
       final mergedCookies = <String, String>{};
+      final docCookie = ('${probe['docCookie'] ?? ''}').trim();
+      if (docCookie.isNotEmpty) {
+        for (final part in docCookie.split(';')) {
+          final eq = part.indexOf('=');
+          if (eq <= 0) continue;
+          final k = part.substring(0, eq).trim();
+          final v = part.substring(eq + 1).trim();
+          if (k.isNotEmpty) mergedCookies[k] = v;
+        }
+      }
       for (final target in [WebUri('$origin/'), currentWebUri]) {
         final list = await cookieMgr.getCookies(url: target);
         for (final c in list) {
