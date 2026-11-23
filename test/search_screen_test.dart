@@ -84,6 +84,36 @@ void main() {
     expect(failed.error, isA<DioException>());
   });
 
+  test('SearchRun pauses in-flight background site searches and resumes remaining sites cleanly', () async {
+    final api = _PausableApi();
+    final sites = List.generate(6, (i) => SpiderSite(key: 's$i', name: 'Site $i', api: '/spider/s$i/3'));
+    final run = SearchRun(keyword: '九门', sites: sites, api: api, maxConcurrent: 2);
+    await pumpEventQueue();
+    expect(api.inFlight, 2);
+
+    // First site finishes, then user taps its card to open DetailScreen -> pause!
+    api.completeOne('s0');
+    await pumpEventQueue();
+    expect(run.results.map((r) => r.site.key), ['s0']);
+    expect(api.inFlight, 2, reason: 's1 and s2 are now in flight');
+
+    run.setPaused(true);
+    await pumpEventQueue();
+    expect(run.isPaused, isTrue);
+    expect(api.inFlight, 0, reason: 'in-flight searches cancel immediately so /detail gets CatPaw worker');
+    expect(api.cancelledCount, 2);
+    expect(run.done, isFalse);
+
+    // Pop back from DetailScreen -> resume remaining 5 sites without losing s1 or s2!
+    api.autoComplete = true;
+    run.setPaused(false);
+    await pumpEventQueue();
+    expect(run.isPaused, isFalse);
+    expect(run.done, isTrue);
+    expect(run.results.map((r) => r.site.key), unorderedEquals(['s0', 's1', 's2', 's3', 's4', 's5']));
+    run.dispose();
+  });
+
   group('search page', () {
     late _FakeApi api;
     late _MemoryStore settings;
@@ -284,6 +314,38 @@ class _FakeApi extends SpiderApi {
       _ => const <VodItem>[],
     };
     return PagedVods(items: items, page: 1, pageCount: 1);
+  }
+}
+
+class _PausableApi extends SpiderApi {
+  _PausableApi() : super(0);
+
+  bool autoComplete = false;
+  int inFlight = 0;
+  int cancelledCount = 0;
+  final _gates = <String, Completer<void>>{};
+
+  void completeOne(String key) => (_gates[key] ??= Completer<void>()).complete();
+
+  @override
+  Future<PagedVods> search(SpiderSite site, String keyword, {int page = 1, CancelToken? cancelToken}) async {
+    if (autoComplete) {
+      return PagedVods(items: [VodItem(id: site.key, name: 'Hit ${site.key}', siteKey: site.key)], page: 1, pageCount: 1);
+    }
+    inFlight++;
+    final gate = _gates[site.key] = Completer<void>();
+    cancelToken?.whenCancel.then((_) {
+      if (!gate.isCompleted) {
+        cancelledCount++;
+        gate.complete();
+      }
+    });
+    await gate.future;
+    inFlight--;
+    if (cancelToken != null && cancelToken.isCancelled) {
+      throw DioException.requestCancelled(requestOptions: RequestOptions(path: site.api), reason: 'paused');
+    }
+    return PagedVods(items: [VodItem(id: site.key, name: 'Hit ${site.key}', siteKey: site.key)], page: 1, pageCount: 1);
   }
 }
 

@@ -80,4 +80,32 @@ void main() {
     await cleanup.clear({CleanupItem.images});
     expect(await posterDir.exists(), isFalse);
   });
+
+  test('PosterImage reuses disk cache across ephemeral loopback /proxy/img ports and signatures', () async {
+    final tempRoot = await Directory.systemTemp.createTemp('poster_proxy_cache_');
+    addTearDown(() async {
+      PosterImage.debugCacheDir = null;
+      if (await tempRoot.exists()) await tempRoot.delete(recursive: true);
+    });
+    PosterImage.debugCacheDir = Directory('${tempRoot.path}/poster_cache');
+
+    var hits = 0;
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(() => server.close(force: true));
+    server.listen((req) {
+      hits++;
+      req.response
+        ..statusCode = 200
+        ..headers.contentType = ContentType('image', 'png')
+        ..add(_tinyPng)
+        ..close();
+    });
+
+    const target = 'https://img.example.com/poster/42.jpg';
+    final proxied1 = 'http://127.0.0.1:${server.port}/proxy/img?u=${Uri.encodeComponent(target)}&sig=aaa111';
+    final proxied2 = 'http://localhost:${server.port}/proxy/img?u=${Uri.encodeComponent(target)}&sig=bbb222';
+    expect(await PosterImage.loadBytesCached(proxied1, const {}), _tinyPng);
+    expect(await PosterImage.loadBytesCached(proxied2, const {}), _tinyPng);
+    expect(hits, 1, reason: 'canonical u= key avoids re-proxying posters when CatPaw port or sig rotates');
+  });
 }

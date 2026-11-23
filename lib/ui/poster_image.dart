@@ -33,10 +33,15 @@ class PosterImage extends ImageProvider<PosterImage> {
   static int _writesSincePrune = 0;
   static final Map<String, Future<Uint8List>> _inFlight = {};
 
+  static bool _isLoopbackHost(String host) =>
+      host == '127.0.0.1' || host == 'localhost' || host == '::1' || host == '[::1]';
+
   static final HttpClient _client = HttpClient()
     ..userAgent = null
     ..autoUncompress = false
-    ..connectionTimeout = const Duration(seconds: 12);
+    ..maxConnectionsPerHost = 6
+    ..connectionTimeout = const Duration(seconds: 12)
+    ..findProxy = (uri) => _isLoopbackHost(uri.host) ? 'DIRECT' : HttpClient.findProxyFromEnvironment(uri);
 
   static bool get _inFakeAsyncWidgetTest {
     try {
@@ -57,7 +62,16 @@ class PosterImage extends ImageProvider<PosterImage> {
     }
   }
 
-  static String _cacheFileName(String url) => '${md5.convert(utf8.encode(url))}.img';
+  static String _canonicalCacheUrl(String url) {
+    final uri = Uri.tryParse(url);
+    if (uri != null && _isLoopbackHost(uri.host) && uri.path == '/proxy/img') {
+      final target = uri.queryParameters['u'];
+      if (target != null && target.isNotEmpty) return target;
+    }
+    return url;
+  }
+
+  static String _cacheFileName(String cacheKey) => '${md5.convert(utf8.encode(cacheKey))}.img';
 
   /// Deletes the on-disk poster cache (`设置 → 数据清理 → 图片缓存`).
   static Future<void> clearDiskCache({Future<Directory> Function()? tempDir}) async {
@@ -88,10 +102,11 @@ class PosterImage extends ImageProvider<PosterImage> {
   /// stores it atomically.
   static Future<Uint8List> loadBytesCached(String url, Map<String, String> headers,
       {void Function(int received, int? total)? onBytesReceived}) async {
+    final cacheKey = _canonicalCacheUrl(url);
     final cacheDir = await _resolveCacheDir();
     File? cacheFile;
     if (cacheDir != null) {
-      cacheFile = File(p.join(cacheDir.path, _cacheFileName(url)));
+      cacheFile = File(p.join(cacheDir.path, _cacheFileName(cacheKey)));
       try {
         if (await cacheFile.exists()) {
           final bytes = await cacheFile.readAsBytes();
@@ -102,7 +117,7 @@ class PosterImage extends ImageProvider<PosterImage> {
       }
     }
 
-    final existing = _inFlight[url];
+    final existing = _inFlight[cacheKey];
     if (existing != null) return existing;
 
     final task = () async {
@@ -112,11 +127,11 @@ class PosterImage extends ImageProvider<PosterImage> {
       }
       return bytes;
     }();
-    _inFlight[url] = task;
+    _inFlight[cacheKey] = task;
     try {
       return await task;
     } finally {
-      if (identical(_inFlight[url], task)) _inFlight.remove(url);
+      if (identical(_inFlight[cacheKey], task)) _inFlight.remove(cacheKey);
     }
   }
 

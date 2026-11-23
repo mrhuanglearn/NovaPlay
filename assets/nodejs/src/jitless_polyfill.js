@@ -12,6 +12,7 @@
  * When native `WebAssembly` is already present (Android / desktop), `installJitlessPolyfill` is a no-op.
  */
 
+const cryptoModule = require('crypto');
 const httpModule = require('http');
 const httpsModule = require('https');
 const { Readable, Transform } = require('stream');
@@ -1590,8 +1591,612 @@ class WasmInstance {
       else if (ex.kind === 'memory') expObj[ex.name] = memories[ex.index];
       else if (ex.kind === 'global') expObj[ex.name] = globalCells[ex.index];
     }
+    accelerateCatPawExports(expObj);
     this.exports = Object.freeze(expObj);
     void internalOffset;
+  }
+}
+
+// --- Native host fast-paths for CatPaw WASM ABI under iOS --jitless -----------------------------
+
+const TAIL_PUNCT_RE = /[)\]>}"',;!?）】》」』，。；！？、]+$/;
+const PASSCODE_KEYS = ['提取码', '访问码', '密码', 'passcode', 'pwd', 'code'];
+const DIRECT_EXTS = ['.m3u8', '.mp4', '.flv', '.mkv', '.ts', '.mpd', '.webm'];
+const EPISODE_EXTS = [
+  '.mkv', '.mp4', '.avi', '.mov', '.flv', '.ts', '.m2ts', '.webm', '.rmvb',
+  '.srt', '.ass', '.ssa', '.vtt', '.sub', '.lrc',
+];
+const EPISODE_NOISE_TAGS = new Set([
+  '1080P', '2160P', '720P', '4K', 'HDR', 'HDR10', 'DV', 'WEB', 'WEBDL',
+  'BLURAY', 'X264', 'X265', 'H264', 'H265', 'HEVC', '10BIT', 'AAC',
+]);
+const CN_SEASON_MAP = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10 };
+const WAF_PATTERNS_RE =
+  /cf-chl-bypass|just a moment\.\.\.|attention required! \| cloudflare|_cf_chl_opt|sedoparking|hugedomains|afternic|:\/\/(?:www\.)?dan\.com\/|domain is for sale|buy this domain|access denied by geographic restriction|安全狗|宝塔防火墙|域名出售|域名停放|该域名正在出售|网站防火墙|浏览器安全验证|访问被拒绝/i;
+const PAN_STRUCT_RE = /module-item|voddetail|vod-detail|stui-vodlist|myui-vodlist|hl-vod-list|thread-/i;
+
+function queryParamFast(query, names) {
+  if (!query) return '';
+  for (const pair of query.split('&')) {
+    const eq = pair.indexOf('=');
+    if (eq <= 0) continue;
+    const k = pair.slice(0, eq).toLowerCase();
+    const v = pair.slice(eq + 1);
+    if (v && names.includes(k)) return v;
+  }
+  return '';
+}
+
+function findNearbyPasscodeFast(context) {
+  if (!context) return '';
+  const lower = context.toLowerCase();
+  for (const key of PASSCODE_KEYS) {
+    const idx = key.charCodeAt(0) < 0x80 ? lower.indexOf(key) : context.indexOf(key);
+    if (idx === -1) continue;
+    let p = idx + key.length;
+    while (p < context.length) {
+      const ch = context[p];
+      if (ch === ':' || ch === '：' || ch === '=' || ch === ' ' || ch === '\t') p++;
+      else break;
+    }
+    let end = p;
+    while (end < context.length && /[0-9A-Za-z]/.test(context[end])) end++;
+    const code = context.slice(p, end);
+    if (code.length >= 4 && code.length <= 8) return code;
+  }
+  return '';
+}
+
+function parseSingleShareUrlFast(rawUrl, contextHint) {
+  const cleaned = rawUrl.trim().replace(TAIL_PUNCT_RE, '').replace(/&amp;/g, '&');
+  let rest = '';
+  if (cleaned.startsWith('https://')) rest = cleaned.slice(8);
+  else if (cleaned.startsWith('http://')) rest = cleaned.slice(7);
+  else return null;
+
+  const slashPos = rest.indexOf('/');
+  const host = (slashPos === -1 ? rest : rest.slice(0, slashPos)).toLowerCase();
+  const tail = slashPos === -1 ? '' : rest.slice(slashPos);
+
+  const qPos = tail.indexOf('?');
+  const hPos = tail.indexOf('#');
+  let pathHash = '';
+  let query = '';
+  if (qPos !== -1 && (hPos === -1 || qPos < hPos)) {
+    pathHash = tail.slice(0, qPos);
+    query = hPos === -1 ? tail.slice(qPos + 1) : tail.slice(qPos + 1, hPos);
+  } else {
+    pathHash = hPos === -1 ? tail : tail.slice(0, hPos);
+  }
+  const hashPart = hPos === -1 ? '' : tail.slice(hPos + 1);
+
+  let passcode = queryParamFast(query, ['pwd', 'password', 'passcode', 'code']);
+  if (!passcode && contextHint) passcode = findNearbyPasscodeFast(contextHint);
+
+  const firstSeg = (prefix) => {
+    if (!pathHash.startsWith(prefix)) return '';
+    const seg = (pathHash.slice(prefix.length).split('/')[0] || '').trim();
+    return seg;
+  };
+
+  let provider = '';
+  let shareId = '';
+  let folderId = '';
+  const bareHost = host.startsWith('www.') ? host.slice(4) : host;
+
+  if (host === 'pan.quark.cn' || host === 'quark.cn') {
+    shareId = firstSeg('/s/');
+    if (!shareId) return null;
+    const parts = hashPart.split('/list/share/');
+    if (parts.length > 1) folderId = parts[1].split(/[/?-]/)[0] || '';
+    provider = 'quark';
+  } else if (host === 'drive.uc.cn' || host === 'fast.uc.cn') {
+    shareId = firstSeg('/s/');
+    if (!shareId) return null;
+    provider = 'uc';
+  } else if (host.endsWith('alipan.com') || host.endsWith('aliyundrive.com')) {
+    if (!pathHash.startsWith('/s/')) return null;
+    const parts = pathHash.slice(3).split('/').filter(Boolean);
+    if (!parts[0]) return null;
+    shareId = parts[0];
+    if (parts[1] === 'folder') folderId = parts[2] || '';
+    provider = 'ali';
+  } else if (
+    bareHost === '123pan.com' || bareHost === '123pan.cn' || bareHost === '123684.com' ||
+    bareHost === '123865.com' || bareHost === '123912.com' || bareHost === '123592.com'
+  ) {
+    shareId = firstSeg('/s/');
+    if (!shareId) return null;
+    provider = 'pan123';
+  } else if (bareHost === '115.com' || bareHost === '115cdn.com' || bareHost === 'anxia.com') {
+    shareId = firstSeg('/s/');
+    if (!shareId) return null;
+    provider = '115';
+  } else if (host === 'pan.baidu.com' || host === 'yun.baidu.com') {
+    const s = firstSeg('/s/');
+    if (s) shareId = s;
+    else if (pathHash === '/share/init') {
+      const surl = queryParamFast(query, ['surl']);
+      if (!surl) return null;
+      shareId = '1' + surl;
+    } else return null;
+    provider = 'baidu';
+  } else if (host === 'cloud.189.cn' || host === 'h5.cloud.189.cn') {
+    shareId = firstSeg('/t/') || queryParamFast(query, ['code']);
+    if (!shareId) return null;
+    provider = 'tianyi';
+  } else if (host === 'caiyun.139.com' || host === 'yun.139.com') {
+    const s = firstSeg('/w/i/');
+    if (s) shareId = s;
+    else if (pathHash === '/m/i' && query) shareId = query.split('&')[0] || '';
+    else {
+      const hi = hashPart.indexOf('/w/i/');
+      if (hi !== -1) shareId = hashPart.slice(hi + 5).split(/[/?]/)[0] || '';
+    }
+    if (!shareId) return null;
+    provider = 'yidong';
+  } else if (host === 'pan.xunlei.com') {
+    shareId = firstSeg('/s/');
+    if (!shareId) return null;
+    provider = 'xunlei';
+  } else if (host.endsWith('guangyapan.com')) {
+    shareId = firstSeg('/s/');
+    if (!shareId) return null;
+    provider = 'guangyapan';
+  } else if (host === 'drive.google.com') {
+    const folder = firstSeg('/drive/folders/');
+    if (folder) { provider = 'gdrive'; shareId = folder; folderId = folder; }
+    else {
+      const file = firstSeg('/file/d/');
+      if (!file) return null;
+      provider = 'gdrive';
+      shareId = file;
+    }
+  } else {
+    return null;
+  }
+
+  if (shareId.length < 3) return null;
+
+  let canonical = cleaned;
+  if (
+    passcode &&
+    (provider === 'baidu' || provider === 'pan123' || provider === '115' || provider === 'xunlei') &&
+    !canonical.includes('pwd=') &&
+    !canonical.includes('password=')
+  ) {
+    const key = provider === '115' ? 'password' : 'pwd';
+    canonical += (canonical.includes('?') ? '&' : '?') + key + '=' + passcode;
+  }
+
+  return { provider, shareId, folderId, passcode, url: canonical };
+}
+
+function scanPanSharesFast(text) {
+  const out = [];
+  if (!text || text.length < 12) return out;
+  const len = text.length;
+  let i = 0;
+  while (i + 8 < len) {
+    const iHttps = text.indexOf('https://', i);
+    const iHttp = text.indexOf('http://', i);
+    let start = -1;
+    if (iHttps !== -1 && iHttp !== -1) start = iHttps < iHttp ? iHttps : iHttp;
+    else start = iHttps !== -1 ? iHttps : iHttp;
+    if (start === -1) break;
+
+    i = start + (text.charCodeAt(start + 4) === 0x73 ? 8 : 7);
+    while (i < len) {
+      const c = text.charCodeAt(i);
+      if (
+        c <= 0x20 || c >= 0x80 ||
+        c === 0x22 || c === 0x27 || c === 0x3c || c === 0x3e || c === 0x60 || c === 0x5c
+      ) {
+        break;
+      }
+      i++;
+    }
+    const rawUrl = text.slice(start, i);
+    const context = text.slice(i, Math.min(len, i + 64));
+    const item = parseSingleShareUrlFast(rawUrl, context);
+    if (item) {
+      const existingIdx = out.findIndex((x) => x.provider === item.provider && x.shareId === item.shareId);
+      if (existingIdx !== -1) {
+        if (!out[existingIdx].passcode && item.passcode) out[existingIdx] = item;
+      } else {
+        out.push(item);
+      }
+    }
+  }
+  return out;
+}
+
+function classifyProbeFast(body, kind) {
+  const trimmed = String(body || '').trim();
+  if (!trimmed) return { waf: false, structOk: false, shareCount: 0 };
+  const isShortChallenge =
+    trimmed.length < 32768 &&
+    Buffer.byteLength(trimmed, 'utf8') < 32768 &&
+    WAF_PATTERNS_RE.test(trimmed);
+  const shareCount = scanPanSharesFast(trimmed).length;
+  let structOk = false;
+  if (kind === 'cms') {
+    structOk =
+      (trimmed.startsWith('{') || trimmed.startsWith('[')) &&
+      (trimmed.includes('"list"') || trimmed.includes('"class"'));
+  } else {
+    structOk = shareCount > 0 || PAN_STRUCT_RE.test(trimmed);
+  }
+  return { waf: isShortChallenge, structOk: !isShortChallenge && structOk, shareCount };
+}
+
+function stripHtmlFast(input) {
+  let out = '';
+  let inTag = false;
+  let chunkStart = 0;
+  for (let i = 0; i < input.length; i++) {
+    const c = input.charCodeAt(i);
+    if (c === 0x3c /* < */) {
+      if (!inTag && i > chunkStart) out += input.slice(chunkStart, i);
+      inTag = true;
+    } else if (c === 0x3e /* > */) {
+      inTag = false;
+      chunkStart = i + 1;
+    }
+  }
+  if (!inTag && chunkStart < input.length) out += input.slice(chunkStart);
+
+  if (out.includes('&')) {
+    out = out
+      .replace(/&nbsp;/g, ' ')
+      .replace(/&amp;/g, '&')
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'");
+    if (out.includes('&#')) {
+      out = out.replace(/&#([xX][0-9a-fA-F]{1,7}|[0-9]{1,8});/g, (full, codeStr) => {
+        const cp = (codeStr[0] === 'x' || codeStr[0] === 'X')
+          ? Number.parseInt(codeStr.slice(1), 16)
+          : Number.parseInt(codeStr, 10);
+        if (!Number.isFinite(cp) || cp < 0 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return full;
+        return String.fromCodePoint(cp);
+      });
+    }
+  }
+  return out.trim().split(/\s+/).filter(Boolean).join(' ');
+}
+
+function isDirectMediaGroupFast(groupUrls) {
+  for (const rawEp of groupUrls.split('#')) {
+    const ep = rawEp.trim();
+    if (!ep) continue;
+    const dollar = ep.indexOf('$');
+    const link = (dollar === -1 ? ep : ep.slice(dollar + 1)).trim();
+    const pathPart = link.split(/[?#]/, 1)[0].toLowerCase();
+    for (const ext of DIRECT_EXTS) {
+      if (pathPart.endsWith(ext)) return true;
+    }
+  }
+  return false;
+}
+
+function normalizePlayGroupsFast(playFrom, playUrl) {
+  const fromParts = playFrom.split('$$$');
+  const urlParts = playUrl.split('$$$');
+  const cleanFrom = [];
+  const cleanUrl = [];
+
+  for (let idx = 0; idx < urlParts.length; idx++) {
+    const rawGroup = urlParts[idx].split('#');
+    const episodes = [];
+    for (let epIdx = 0; epIdx < rawGroup.length; epIdx++) {
+      const ep = rawGroup[epIdx].trim();
+      if (!ep) continue;
+      const dollar = ep.indexOf('$');
+      if (dollar !== -1) {
+        const label = ep.slice(0, dollar).trim();
+        const link = ep.slice(dollar + 1).trim();
+        if (!link) continue;
+        episodes.push(`${label || `第${epIdx + 1}集`}$${link}`);
+      } else {
+        episodes.push(`第${epIdx + 1}集$${ep}`);
+      }
+    }
+    if (episodes.length === 0) continue;
+    const rawLine = idx < fromParts.length ? fromParts[idx].trim() : '';
+    cleanFrom.push(rawLine || `线路${cleanFrom.length + 1}`);
+    cleanUrl.push(episodes.join('#'));
+  }
+
+  if (cleanUrl.length <= 1) {
+    return `${cleanFrom.join('$$$')}\x1f${cleanUrl.join('$$$')}`;
+  }
+  const directF = [];
+  const directU = [];
+  const otherF = [];
+  const otherU = [];
+  for (let i = 0; i < cleanUrl.length; i++) {
+    if (isDirectMediaGroupFast(cleanUrl[i])) {
+      directF.push(cleanFrom[i]);
+      directU.push(cleanUrl[i]);
+    } else {
+      otherF.push(cleanFrom[i]);
+      otherU.push(cleanUrl[i]);
+    }
+  }
+  if (directU.length === 0 || otherU.length === 0) {
+    return `${cleanFrom.join('$$$')}\x1f${cleanUrl.join('$$$')}`;
+  }
+  return `${directF.concat(otherF).join('$$$')}\x1f${directU.concat(otherU).join('$$$')}`;
+}
+
+function parseEpisodeFast(raw) {
+  const parts = String(raw || '').split(/[/\\]/);
+  const base = (parts[parts.length - 1] || raw || '').trim();
+  let stem = base;
+  const lowerBase = base.toLowerCase();
+  for (const ext of EPISODE_EXTS) {
+    if (lowerBase.endsWith(ext) && base.length > ext.length) {
+      stem = base.slice(0, base.length - ext.length);
+      break;
+    }
+  }
+  const isNoise = (n) =>
+    n === 264 || n === 265 || n === 480 || n === 576 || n === 720 || n === 1080 || n === 1440 || n === 2160 || n === 4320 ||
+    (n >= 1950 && n <= 2099);
+
+  let season = 0;
+  let episode = 0;
+  let cutIdx = -1;
+  const upper = stem.toUpperCase();
+
+  for (let i = 0; i < upper.length; i++) {
+    const ch = upper.charCodeAt(i);
+    if (ch === 0x53 /* S */ && i + 1 < upper.length && upper.charCodeAt(i + 1) >= 0x30 && upper.charCodeAt(i + 1) <= 0x39) {
+      let j = i + 1;
+      while (j < upper.length && upper.charCodeAt(j) >= 0x30 && upper.charCodeAt(j) <= 0x39) j++;
+      const sVal = Number.parseInt(upper.slice(i + 1, j), 10);
+      if (Number.isFinite(sVal) && j < upper.length && upper.charCodeAt(j) === 0x45 /* E */) {
+        let k = j + 1;
+        if (k < upper.length && upper.charCodeAt(k) === 0x50 /* P */) k++;
+        const eStart = k;
+        while (k < upper.length && upper.charCodeAt(k) >= 0x30 && upper.charCodeAt(k) <= 0x39) k++;
+        if (k > eStart) {
+          const eVal = Number.parseInt(upper.slice(eStart, k), 10);
+          if (Number.isFinite(eVal)) { season = sVal; episode = eVal; cutIdx = i; break; }
+        }
+      }
+    }
+    if (ch === 0x45 /* E */) {
+      const prev = i > 0 ? upper.charCodeAt(i - 1) : 0;
+      const prevAlpha = (prev >= 0x41 && prev <= 0x5a) || (prev >= 0x61 && prev <= 0x7a);
+      if (!prevAlpha) {
+        let k = i + 1;
+        if (k < upper.length && upper.charCodeAt(k) === 0x50 /* P */) k++;
+        const eStart = k;
+        while (k < upper.length && upper.charCodeAt(k) >= 0x30 && upper.charCodeAt(k) <= 0x39) k++;
+        const next = k < upper.length ? upper.charCodeAt(k) : 0;
+        const nextAlpha = (next >= 0x41 && next <= 0x5a) || (next >= 0x61 && next <= 0x7a);
+        if (k > eStart && !nextAlpha && k - eStart <= 4) {
+          const eVal = Number.parseInt(upper.slice(eStart, k), 10);
+          if (eVal > 0 && !isNoise(eVal)) { episode = eVal; cutIdx = i; break; }
+        }
+      }
+    }
+  }
+
+  if (season === 0) {
+    let p = 0;
+    while ((p = stem.indexOf('第', p)) !== -1) {
+      const after = stem.slice(p + 1);
+      const ji = after.indexOf('季');
+      if (ji !== -1) {
+        const inner = after.slice(0, ji).trim();
+        const sNum = /^\d+$/.test(inner) ? Number.parseInt(inner, 10) : CN_SEASON_MAP[inner];
+        if (sNum) { season = sNum; break; }
+      }
+      p++;
+    }
+  }
+  if (episode === 0) {
+    let p = 0;
+    while ((p = stem.indexOf('第', p)) !== -1) {
+      const m = /^\s*(\d+)\s*([集话話期])/.exec(stem.slice(p + 1));
+      if (m) {
+        episode = Number.parseInt(m[1], 10);
+        cutIdx = p;
+        break;
+      }
+      p++;
+    }
+  }
+  if (episode === 0) {
+    let p = 0;
+    while ((p = stem.indexOf('[', p)) !== -1) {
+      const end = stem.indexOf(']', p + 1);
+      if (end !== -1) {
+        const inner = stem.slice(p + 1, end).trim();
+        if (inner.length >= 1 && inner.length <= 3 && /^\d+$/.test(inner)) {
+          const v = Number.parseInt(inner, 10);
+          if (v > 0 && !isNoise(v)) { episode = v; if (p > 0) cutIdx = p; break; }
+        }
+      }
+      p++;
+    }
+  }
+
+  let rawTitle = cutIdx > 0 ? stem.slice(0, cutIdx) : stem;
+  while (rawTitle.startsWith('[')) {
+    const close = rawTitle.indexOf(']');
+    if (close === -1) break;
+    rawTitle = rawTitle.slice(close + 1).trimStart();
+  }
+  const cleanedTitle = rawTitle
+    .replace(/[._-]/g, ' ')
+    .split(/\s+/)
+    .filter((tok) => tok && !EPISODE_NOISE_TAGS.has(tok.toUpperCase()))
+    .join(' ');
+
+  return {
+    title: cleanedTitle || stem,
+    season,
+    episode: episode === 0 ? 1 : episode,
+  };
+}
+
+function stemCleanChars(name) {
+  const lower = String(name || '').trim().replace(/[A-Z]/g, (c) => c.toLowerCase());
+  const dot = lower.lastIndexOf('.');
+  const trimmed = dot !== -1 && lower.length - dot - 1 <= 5 ? lower.slice(0, dot) : lower;
+  return Array.from(trimmed).slice(0, 128);
+}
+
+function matchSubtitleScoreFast(videoName, subName) {
+  const a = stemCleanChars(videoName);
+  const b = stemCleanChars(subName);
+  const m = a.length;
+  const n = b.length;
+  if (m === 0 || n === 0) return 0;
+  let prev = new Int32Array(n + 1);
+  let curr = new Int32Array(n + 1);
+  for (let i = 0; i < m; i++) {
+    const chA = a[i];
+    for (let j = 0; j < n; j++) {
+      if (chA === b[j]) curr[j + 1] = prev[j] + 1;
+      else curr[j + 1] = prev[j + 1] >= curr[j] ? prev[j + 1] : curr[j];
+    }
+    const tmp = prev;
+    prev = curr;
+    curr = tmp;
+    curr.fill(0);
+  }
+  return Math.trunc((prev[n] * 20000) / (m + n));
+}
+
+function accelerateCatPawExports(expObj) {
+  const mem = expObj.memory;
+  const rawAlloc = expObj.alloc;
+  const rawDealloc = expObj.dealloc;
+  const rawResultPtr = expObj.result_ptr;
+  const rawResultLen = expObj.result_len;
+  if (
+    !(mem instanceof WasmMemory) ||
+    typeof rawAlloc !== 'function' ||
+    typeof rawDealloc !== 'function' ||
+    typeof rawResultPtr !== 'function' ||
+    typeof rawResultLen !== 'function'
+  ) {
+    return;
+  }
+
+  let hostPtr = 0;
+  let hostCap = 0;
+  let hostLen = 0;
+  let useHostResult = false;
+
+  const setHostResult = (strOrBuf) => {
+    const buf = Buffer.isBuffer(strOrBuf) ? strOrBuf : Buffer.from(String(strOrBuf), 'utf8');
+    hostLen = buf.length;
+    if (hostLen > 0) {
+      if (hostLen > hostCap) {
+        if (hostCap > 0) rawDealloc(hostPtr, hostCap);
+        hostCap = Math.max(4096, hostLen * 2);
+        hostPtr = rawAlloc(hostCap) >>> 0;
+      }
+      new Uint8Array(mem.buffer, hostPtr, hostLen).set(buf);
+    }
+    useHostResult = true;
+  };
+
+  const readUtf8 = (ptr, len) => {
+    const l = len >>> 0;
+    if (l === 0) return '';
+    return Buffer.from(mem.buffer, ptr >>> 0, l).toString('utf8');
+  };
+
+  const interceptedNames = new Set([
+    'alloc', 'dealloc', 'result_ptr', 'result_len',
+    'wasm_hmac_sha256_hex', 'wasm_constant_time_eq',
+    'wasm_strip_html', 'wasm_normalize_play_groups',
+    'wasm_match_subtitle_score', 'wasm_call',
+  ]);
+  for (const [k, fn] of Object.entries(expObj)) {
+    if (typeof fn === 'function' && !interceptedNames.has(k)) {
+      expObj[k] = (...args) => {
+        useHostResult = false;
+        return fn(...args);
+      };
+    }
+  }
+
+  expObj.result_ptr = () => (useHostResult ? hostPtr : rawResultPtr());
+  expObj.result_len = () => (useHostResult ? hostLen : rawResultLen());
+
+  if (typeof expObj.wasm_hmac_sha256_hex === 'function') {
+    expObj.wasm_hmac_sha256_hex = (secPtr, secLen, msgPtr, msgLen) => {
+      const sec = Buffer.from(mem.buffer, secPtr >>> 0, secLen >>> 0);
+      const msg = Buffer.from(mem.buffer, msgPtr >>> 0, msgLen >>> 0);
+      setHostResult(cryptoModule.createHmac('sha256', sec).update(msg).digest('hex'));
+      return 0;
+    };
+  }
+
+  if (typeof expObj.wasm_constant_time_eq === 'function') {
+    expObj.wasm_constant_time_eq = (aPtr, aLen, bPtr, bLen) => {
+      const al = aLen >>> 0;
+      const bl = bLen >>> 0;
+      const a = Buffer.from(mem.buffer, aPtr >>> 0, al);
+      const b = Buffer.from(mem.buffer, bPtr >>> 0, bl);
+      if (al !== bl) {
+        if (al > 0) cryptoModule.timingSafeEqual(a, a);
+        return 0;
+      }
+      return al === 0 || cryptoModule.timingSafeEqual(a, b) ? 1 : 0;
+    };
+  }
+
+  if (typeof expObj.wasm_strip_html === 'function') {
+    expObj.wasm_strip_html = (ptr, len) => {
+      setHostResult(stripHtmlFast(readUtf8(ptr, len)));
+      return 0;
+    };
+  }
+
+  if (typeof expObj.wasm_normalize_play_groups === 'function') {
+    expObj.wasm_normalize_play_groups = (fromPtr, fromLen, urlPtr, urlLen) => {
+      setHostResult(normalizePlayGroupsFast(readUtf8(fromPtr, fromLen), readUtf8(urlPtr, urlLen)));
+      return 0;
+    };
+  }
+
+  if (typeof expObj.wasm_match_subtitle_score === 'function') {
+    expObj.wasm_match_subtitle_score = (vPtr, vLen, sPtr, sLen) =>
+      matchSubtitleScoreFast(readUtf8(vPtr, vLen), readUtf8(sPtr, sLen));
+  }
+
+  if (typeof expObj.wasm_call === 'function') {
+    const rawWasmCall = expObj.wasm_call;
+    expObj.wasm_call = (opPtr, opLen, inPtr, inLen) => {
+      const op = readUtf8(opPtr, opLen);
+      if (op === 'share.scan') {
+        const input = JSON.parse(readUtf8(inPtr, inLen) || '{}');
+        setHostResult(JSON.stringify(scanPanSharesFast(String(input.text || ''))));
+        return 0;
+      }
+      if (op === 'probe.classify') {
+        const input = JSON.parse(readUtf8(inPtr, inLen) || '{}');
+        setHostResult(JSON.stringify(classifyProbeFast(String(input.body || ''), String(input.kind || 'pan'))));
+        return 0;
+      }
+      if (op === 'episode.parse') {
+        const input = JSON.parse(readUtf8(inPtr, inLen) || '{}');
+        setHostResult(JSON.stringify(parseEpisodeFast(String(input.name || ''))));
+        return 0;
+      }
+      useHostResult = false;
+      return rawWasmCall(opPtr, opLen, inPtr, inLen);
+    };
   }
 }
 

@@ -107,14 +107,19 @@ class SearchRun extends ChangeNotifier {
       _done = true;
       return;
     }
-    var nextIndex = 0;
+    _pending.addAll([for (var i = 0; i < sites.length; i++) i]);
     final workers = maxConcurrent.clamp(1, sites.length);
     for (var w = 0; w < workers; w++) {
       unawaited(() async {
         while (!_disposed) {
-          final idx = nextIndex++;
-          if (idx >= sites.length) break;
-          await _searchOne(api, sites[idx]);
+          if (_paused) {
+            await (_resumeGate ??= Completer<void>()).future;
+            if (_disposed) break;
+            continue;
+          }
+          if (_pending.isEmpty) break;
+          final idx = _pending.removeAt(0);
+          await _searchOne(api, sites[idx], idx);
         }
       }());
     }
@@ -123,9 +128,12 @@ class SearchRun extends ChangeNotifier {
   final String keyword;
   final int maxConcurrent;
   final int _total;
-  final CancelToken _cancelToken = CancelToken();
+  final List<int> _pending = [];
+  CancelToken _cancelToken = CancelToken();
+  Completer<void>? _resumeGate;
   final List<SiteResults> _results = [];
   int _answered = 0;
+  bool _paused = false;
   bool _done = false;
   bool _disposed = false;
   Object? _firstError;
@@ -135,6 +143,7 @@ class SearchRun extends ChangeNotifier {
 
   /// Every result in arrival order (the 列表 layout).
   List<VodItem> get allItems => [for (final r in _results) ...r.items];
+  bool get isPaused => _paused;
   bool get done => _done;
   int get total => _total;
   int get answered => _answered;
@@ -142,13 +151,36 @@ class SearchRun extends ChangeNotifier {
   /// Set when every site failed: the error of the first one.
   Object? get error => _done && _results.isEmpty && _failures == _total ? _firstError : null;
 
-  Future<void> _searchOne(SpiderApi api, SpiderSite site) async {
+  /// Suspends or resumes multi-site background requests so opening Detail on single-threaded iOS `--jitless` is not
+  /// starved behind 6 concurrent HTML `/search` parses.
+  void setPaused(bool paused) {
+    if (_disposed || _done || _paused == paused) return;
+    _paused = paused;
+    if (paused) {
+      _resumeGate ??= Completer<void>();
+      if (!_cancelToken.isCancelled) {
+        _cancelToken.cancel('search_paused');
+      }
+    } else {
+      _cancelToken = CancelToken();
+      final gate = _resumeGate;
+      _resumeGate = null;
+      if (gate != null && !gate.isCompleted) gate.complete();
+    }
+  }
+
+  Future<void> _searchOne(SpiderApi api, SpiderSite site, int idx) async {
+    final token = _cancelToken;
     try {
-      final page = await api.search(site, keyword, cancelToken: _cancelToken);
+      final page = await api.search(site, keyword, cancelToken: token);
       if (_disposed) return;
       if (page.items.isNotEmpty) _results.add(SiteResults(site, page.items));
     } catch (e) {
-      if (_disposed || (e is DioException && CancelToken.isCancel(e))) return;
+      if (_disposed) return;
+      if (token.isCancelled || (e is DioException && CancelToken.isCancel(e))) {
+        _pending.insert(0, idx);
+        return;
+      }
       _failures++;
       _firstError ??= e;
     }
@@ -163,6 +195,9 @@ class SearchRun extends ChangeNotifier {
     if (!_cancelToken.isCancelled) {
       _cancelToken.cancel('search_disposed');
     }
+    final gate = _resumeGate;
+    _resumeGate = null;
+    if (gate != null && !gate.isCompleted) gate.complete();
     super.dispose();
   }
 }

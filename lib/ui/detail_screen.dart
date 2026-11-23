@@ -24,11 +24,14 @@ abstract final class DetailScreenRetry {
 }
 
 class DetailScreen extends ConsumerStatefulWidget {
-  const DetailScreen({super.key, required this.vodId, this.siteKey});
+  const DetailScreen({super.key, required this.vodId, this.siteKey, this.initialItem});
   final String vodId;
 
   /// Site the item came from; null = the site currently selected on the home page.
   final String? siteKey;
+
+  /// Optional list/search card metadata shown immediately while `/detail` resolves episodes.
+  final VodItem? initialItem;
   @override
   ConsumerState<DetailScreen> createState() => _DetailScreenState();
 }
@@ -445,19 +448,60 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
     scroll.dispose();
   }
 
+  Widget _headerRow(BuildContext context, VodItem item, {String? area, String? fallbackPic}) {
+    final c = AppColors.of(context);
+    final pic = (item.pic ?? '').trim().isNotEmpty ? item.pic : fallbackPic;
+    final tags = [if ((item.year ?? '').isNotEmpty) item.year!, if ((area ?? '').isNotEmpty) area!];
+    return Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      ClipRRect(
+        borderRadius: BorderRadius.circular(12),
+        child: SizedBox(
+          width: 119,
+          height: 167,
+          child: posterFromUrl(pic,
+              fallback: ColoredBox(color: c.card, child: Icon(Icons.movie_outlined, color: c.secondaryLabel))),
+        ),
+      ),
+      const SizedBox(width: 21),
+      Expanded(
+        child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+          const SizedBox(height: 2),
+          Text(item.name, style: TextStyle(fontSize: 23, fontWeight: FontWeight.w700, color: c.label, height: 1.2)),
+          if ((item.remarks ?? '').isNotEmpty) ...[
+            const SizedBox(height: 6),
+            Text(item.remarks!,
+                style: TextStyle(fontSize: 13.5, fontWeight: FontWeight.w600, color: AppColors.of(context).accent)),
+          ],
+          if (tags.isNotEmpty) ...[
+            const SizedBox(height: 10),
+            Wrap(spacing: 8, runSpacing: 6, children: [
+              for (final t in tags)
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                  decoration: BoxDecoration(color: c.card, borderRadius: BorderRadius.circular(6)),
+                  child: Text(t, style: TextStyle(fontSize: 11, color: c.label.withValues(alpha: 0.85))),
+                ),
+            ]),
+          ],
+        ]),
+      ),
+    ]);
+  }
+
   @override
   Widget build(BuildContext context) {
     final l = context.l10n;
     final c = AppColors.of(context);
     final detail = ref.watch(videoDetailProvider((siteKey: widget.siteKey, vodId: widget.vodId)));
     final d0 = detail.valueOrNull;
+    final preview = widget.initialItem;
     final tmdbOn = ref.watch(tmdbProvider).valueOrNull != null;
     final tmdb = d0 == null || !tmdbOn
         ? null
         : ref.watch(tmdbMatchProvider((siteKey: _siteKey, vodId: widget.vodId, title: d0.item.name))).valueOrNull;
     return Scaffold(
       appBar: AppBar(
-        title: Text(d0?.item.name ?? ''),
+        title: Text(d0?.item.name ?? preview?.name ?? ''),
         actions: [
           IconButton(
             tooltip: '片头片尾',
@@ -476,53 +520,26 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
           ? const Center(child: CircularProgressIndicator())
           : detail.when(
         skipLoadingOnRefresh: false,
-        loading: () => const Center(child: CircularProgressIndicator()),
+        loading: () => preview == null
+            ? const Center(child: CircularProgressIndicator())
+            : ListView(
+                padding: EdgeInsets.fromLTRB(16, 10, 16, 24 + MediaQuery.paddingOf(context).bottom),
+                children: [
+                  _headerRow(context, preview),
+                  const SizedBox(height: 56),
+                  const Center(child: CircularProgressIndicator()),
+                ],
+              ),
         error: (e, _) => ErrorState(error: e, onRetry: _retry),
         data: (d) {
           if (d == null) return EmptyState(icon: Icons.search_off, title: l.notFound);
           final overview =
               (d.content ?? '').isNotEmpty ? d.content!.replaceAll(RegExp(r'<[^>]+>'), '').trim() : tmdb?.overview;
-          final tags = [if ((d.item.year ?? '').isNotEmpty) d.item.year!, if ((d.area ?? '').isNotEmpty) d.area!];
           final meta = TextStyle(fontSize: 13, color: c.label.withValues(alpha: 0.9), height: 1.5);
           return ListView(
               padding: EdgeInsets.fromLTRB(16, 10, 16, 24 + MediaQuery.paddingOf(context).bottom),
               children: [
-                Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(12),
-                    child: SizedBox(
-                      width: 119,
-                      height: 167,
-                      child: posterFromUrl(d.item.pic,
-                          fallback: ColoredBox(color: c.card, child: Icon(Icons.movie_outlined, color: c.secondaryLabel))),
-                    ),
-                  ),
-                  const SizedBox(width: 21),
-                  Expanded(
-                    child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-                      const SizedBox(height: 2),
-                      Text(d.item.name,
-                          style: TextStyle(fontSize: 23, fontWeight: FontWeight.w700, color: c.label, height: 1.2)),
-                      if ((d.item.remarks ?? '').isNotEmpty) ...[
-                        const SizedBox(height: 6),
-                        Text(d.item.remarks!,
-                            style: TextStyle(
-                                fontSize: 13.5, fontWeight: FontWeight.w600, color: AppColors.of(context).accent)),
-                      ],
-                      if (tags.isNotEmpty) ...[
-                        const SizedBox(height: 10),
-                        Wrap(spacing: 8, runSpacing: 6, children: [
-                          for (final t in tags)
-                            Container(
-                              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                              decoration: BoxDecoration(color: c.card, borderRadius: BorderRadius.circular(6)),
-                              child: Text(t, style: TextStyle(fontSize: 11, color: c.label.withValues(alpha: 0.85))),
-                            ),
-                        ]),
-                      ],
-                    ]),
-                  ),
-                ]),
+                _headerRow(context, d.item, area: d.area, fallbackPic: preview?.pic),
                 const SizedBox(height: 28),
                 Row(children: [
                   Expanded(

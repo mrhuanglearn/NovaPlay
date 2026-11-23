@@ -57,8 +57,12 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
   // site sheet focused it again and opened the keyboard (phone, 2026-11-10).
   final FocusNode _focus = FocusNode();
   SearchRun? _run;
+  bool _openingResult = false;
+  bool _routeTickerActive = true;
   List<String> _history = const [];
   final ValueNotifier<String?> _leftSite = ValueNotifier<String?>(null); // 左侧站点分类: the key of the site shown
+
+  void _syncSearchPause() => _run?.setPaused(_openingResult || !_routeTickerActive);
 
   @override
   void initState() {
@@ -68,6 +72,13 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
       if (mounted) setState(() => _history = h);
     });
     if (widget.initialQuery.trim().isNotEmpty) _search(widget.initialQuery);
+  }
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _routeTickerActive = TickerMode.valuesOf(context).enabled;
+    _syncSearchPause();
   }
 
   @override
@@ -105,7 +116,7 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
     final prefs = await ref.read(searchPrefsProvider.future);
     if (!mounted) return;
     final sites = [for (final s in ref.read(searchableSitesProvider)) if (!prefs.sitesOff.contains(s.key)) s];
-    final run = SearchRun(keyword: k, sites: sites, api: rt?.api);
+    final run = SearchRun(keyword: k, sites: sites, api: rt?.api)..setPaused(_openingResult || !_routeTickerActive);
     _leftSite.value = null;
     setState(() {
       _run?.dispose();
@@ -346,13 +357,28 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
     ]);
   }
 
+  Future<void> _openResult(BuildContext context, VodItem item) async {
+    _openingResult = true;
+    _syncSearchPause();
+    try {
+      await openVod(context, item);
+    } finally {
+      _openingResult = false;
+      if (mounted) _syncSearchPause();
+    }
+  }
+
   Widget _siteCards(BuildContext context, SiteResults r) =>
       _cards(context, [for (final i in r.items) (i, r.site.name)], const EdgeInsets.fromLTRB(12, 8, 12, 0));
 
   Widget _cards(BuildContext context, List<(VodItem, String)> items, EdgeInsets padding) => ListView.builder(
         padding: padding.copyWith(bottom: 12 + tabBottomInset(context)),
         itemCount: items.length,
-        itemBuilder: (context, i) => SearchResultCard(item: items[i].$1, siteName: items[i].$2),
+        itemBuilder: (context, i) => SearchResultCard(
+          item: items[i].$1,
+          siteName: items[i].$2,
+          onOpen: (item) => _openResult(context, item),
+        ),
       );
 
   Widget _leftView(BuildContext context, List<SiteResults> results) {
@@ -392,9 +418,10 @@ class _SearchScreenState extends ConsumerState<SearchScreen> {
 
 /// One result. OBSERVED sizes: 104 high, 8 inside, a 64×88 poster with rounded corners, 12 apart.
 class SearchResultCard extends StatelessWidget {
-  const SearchResultCard({super.key, required this.item, required this.siteName});
+  const SearchResultCard({super.key, required this.item, required this.siteName, this.onOpen});
   final VodItem item;
   final String siteName;
+  final Future<void> Function(VodItem item)? onOpen;
 
   @override
   Widget build(BuildContext context) {
@@ -407,7 +434,7 @@ class SearchResultCard extends StatelessWidget {
         borderRadius: BorderRadius.circular(12),
         clipBehavior: Clip.antiAlias,
         child: InkWell(
-          onTap: () => openVod(context, item),
+          onTap: () => onOpen != null ? onOpen!(item) : openVod(context, item),
           child: SizedBox(
             height: 104,
             child: Padding(

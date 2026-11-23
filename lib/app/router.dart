@@ -3,6 +3,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
 import '../l10n/l10n.dart';
+import '../models/vod.dart';
 import '../ui/app_shell.dart';
 import '../ui/category_screen.dart';
 import '../ui/catpaw_debug_screen.dart';
@@ -82,7 +83,11 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(path: '/search', builder: (c, s) => SearchScreen(initialQuery: s.uri.queryParameters['q'] ?? '')),
       GoRoute(
         path: '/video/detail',
-        builder: (c, s) => DetailScreen(vodId: s.uri.queryParameters['id']!, siteKey: s.uri.queryParameters['site']),
+        builder: (c, s) => DetailScreen(
+          vodId: s.uri.queryParameters['id']!,
+          siteKey: s.uri.queryParameters['site'],
+          initialItem: s.extra is VodItem ? s.extra as VodItem : null,
+        ),
       ),
       GoRoute(
         path: '/video/sub-category',

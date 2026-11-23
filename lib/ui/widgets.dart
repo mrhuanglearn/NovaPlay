@@ -75,21 +75,21 @@ SliverGridDelegate _posterGrid(int columns) => SliverGridDelegateWithFixedCrossA
     );
 
 /// Opens the detail page of [item].
-void openVod(BuildContext context, VodItem item) => _openVod(context, item);
+Future<void> openVod(BuildContext context, VodItem item) => _openVod(context, item);
 
 /// The poster of [item], or the film-icon placeholder.
 Widget vodPoster(VodItem item) => _poster(item);
 
-void _openVod(BuildContext context, VodItem item) {
+Future<void> _openVod(BuildContext context, VodItem item) async {
   AppHaptics.selection();
   if (item.id.startsWith('uzv-web:')) {
-    context.push(Uri(path: '/website', queryParameters: {'url': item.id.substring('uzv-web:'.length)}).toString());
+    await context.push<void>(Uri(path: '/website', queryParameters: {'url': item.id.substring('uzv-web:'.length)}).toString());
     return;
   }
   final folderCat = item.folderCategoryId;
   if (folderCat != null) {
     final title = (item.cateName ?? item.name).trim();
-    context.push(Uri(path: '/video/sub-category', queryParameters: {
+    await context.push<void>(Uri(path: '/video/sub-category', queryParameters: {
       'type': folderCat,
       if (title.isNotEmpty) 'name': title,
       if (item.siteKey != null) 'site': item.siteKey!,
@@ -99,12 +99,12 @@ void _openVod(BuildContext context, VodItem item) {
   // OBSERVED (UZN, 2026-11-13): an item of an index site (`indexs: 1`, e.g. 「荐」豆瓣) opens 搜索 with its name; the
   // site has no detail of its own (its `detail` answers `{}`, so UZV showed 未找到 for every poster before).
   if (_indexSiteOf(context, item) != null) {
-    context.push(Uri(path: '/search', queryParameters: {'q': item.name}).toString());
+    await context.push<void>(Uri(path: '/search', queryParameters: {'q': item.name}).toString());
     return;
   }
   final q =
       Uri(path: '/video/detail', queryParameters: {'id': item.id, if (item.siteKey != null) 'site': item.siteKey!});
-  context.push(q.toString());
+  await context.push<void>(q.toString(), extra: item);
 }
 
 SpiderSite? _indexSiteOf(BuildContext context, VodItem item) {
