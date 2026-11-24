@@ -21,7 +21,7 @@ const { WorkerMsg, LoaderMsg, SUBSCRIPTION_DANMU_PORT } = require('./protocol');
 const { createPolicy, installFsPolicy } = require('./sandbox');
 const { installJitlessPolyfill } = require('./jitless_polyfill');
 const { installLegacyPanGlobals } = require('./legacy_pan_patch');
-const { handleBlurayIsoHttp } = require('./bluray_iso_proxy');
+const { handleBlurayIsoHttp, noteUpstreamMediaHint } = require('./bluray_iso_proxy');
 
 const {
   name,
@@ -321,15 +321,46 @@ if (typeof globalThis.fetch === 'function') {
     } catch { /* fall through */ }
     const res = await baseFetch(targetInput, targetInit);
     try {
-      if (parsedUrl && !isLoopback(parsedUrl.hostname) && res && res.status === 200) {
-        const ct = String(res.headers.get('content-type') || '').toLowerCase();
-        const cl = Number(res.headers.get('content-length') || 0);
-        if (ct.includes('text/html') && (cl === 0 || cl < 262144)) {
+      if (parsedUrl && !isLoopback(parsedUrl.hostname) && res) {
+        if (res.status === 200 && parsedUrl.pathname.includes('/file/download')) {
           const text = await res.text();
-          if (text.length < 262144 && CHALLENGE_BODY_RE.test(text.slice(0, 32768)) && !VOD_DOM_HINT_RE.test(text)) {
-            return new Response(text, { status: 403, statusText: 'Browser Verification Required', headers: res.headers });
-          }
+          try {
+            const j = JSON.parse(text);
+            const items = Array.isArray(j?.data) ? j.data : (j?.data && typeof j.data === 'object' ? [j.data] : []);
+            for (const it of items) {
+              const dl = it && (it.download_url || it.url);
+              const fn = it && (it.file_name || it.filename || it.name);
+              if (typeof dl === 'string' && dl && typeof fn === 'string' && fn) {
+                noteUpstreamMediaHint(dl, { fileName: fn });
+              }
+            }
+          } catch { /* ignore non-json */ }
           return new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers });
+        }
+        if (res.status === 206) {
+          const cd = String(res.headers.get('content-disposition') || '');
+          if (cd) noteUpstreamMediaHint(parsedUrl.toString(), { fileName: cd });
+          const reqHeaders = new Headers((targetInit && targetInit.headers) || (input && input.headers) || undefined);
+          const rangeHdr = String(reqHeaders.get('range') || '').trim().toLowerCase();
+          if (rangeHdr === 'bytes=0-15') {
+            const ab = await res.arrayBuffer();
+            const buf = Buffer.from(ab);
+            if (buf.length >= 4 && !buf.every((b) => b === 0)) {
+              noteUpstreamMediaHint(parsedUrl.toString(), { nonIso: true });
+            }
+            return new Response(ab, { status: res.status, statusText: res.statusText, headers: res.headers });
+          }
+        }
+        if (res.status === 200) {
+          const ct = String(res.headers.get('content-type') || '').toLowerCase();
+          const cl = Number(res.headers.get('content-length') || 0);
+          if (ct.includes('text/html') && (cl === 0 || cl < 262144)) {
+            const text = await res.text();
+            if (text.length < 262144 && CHALLENGE_BODY_RE.test(text.slice(0, 32768)) && !VOD_DOM_HINT_RE.test(text)) {
+              return new Response(text, { status: 403, statusText: 'Browser Verification Required', headers: res.headers });
+            }
+            return new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers });
+          }
         }
       }
     } catch { /* return res if body already consumed or unsupported */ }
@@ -569,8 +600,24 @@ function patchLegacyCatpawBundle(src) {
     'function ig(e){if(typeof globalThis.__uzvExtractShareLinks==="function")return globalThis.__uzvExtractShareLinks(e);let t=new Set,r=[],n=s=>{let i=`${s.provider}:${s.shareId}:${s.folderId}`;t.has(i)||(t.add(i),r.push(s))};'
   );
   out = out.replace(
+    'async function cye(e,t){let r=await SE(e,t.shareId,t.passcode),',
+    'async function cye(e,t){if(typeof globalThis.__uzvCachedCoreShare==="function")return globalThis.__uzvCachedCoreShare(e,t,_cyeOrig);return _cyeOrig(e,t)}async function _cyeOrig(e,t){let r=await SE(e,t.shareId,t.passcode),'
+  );
+  out = out.replace(
+    'for(let l of u)await i(l.fid,l.group,c+1)};',
+    'if(u.length>0)await Promise.all(u.slice(0,8).map(l=>i(l.fid,l.group,c+1)))};'
+  );
+  out = out.replace(
+    'N=await Promise.allSettled(I.slice(0,3).map(async U=>{let Y=await S(w,U.provider),C=await cye(Y,U);return{share:U,videos:C}}));',
+    'N=null;let _hasCore=false,_extTask=tU(w,x,()=>_hasCore);N=await Promise.allSettled(I.slice(0,3).map(async U=>{let Y=await S(w,U.provider),C=await cye(Y,U);if(C.length>0)_hasCore=true;return{share:U,videos:C}}));'
+  );
+  out = out.replace(
+    'let F=await tU(w,x);',
+    'let F=await _extTask;'
+  );
+  out = out.replace(
     'async function tU(e,t){let r=t.filter(o=>o.provider!=="uc"&&o.provider!=="quark");',
-    'async function tU(e,t){if(typeof globalThis.__uzvResolveExtendedShares==="function")return globalThis.__uzvResolveExtendedShares(e,t);let r=t.filter(o=>o.provider!=="uc"&&o.provider!=="quark");'
+    'async function tU(e,t,_hc){if(typeof globalThis.__uzvResolveExtendedShares==="function")return globalThis.__uzvResolveExtendedShares(e,t,_hc);let r=t.filter(o=>o.provider!=="uc"&&o.provider!=="quark");'
   );
   out = out.replace(
     'async function rU(e,t,r,n,s){let i=s.split("*"),o=i[1],',

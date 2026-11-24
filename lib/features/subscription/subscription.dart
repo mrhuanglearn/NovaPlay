@@ -256,16 +256,19 @@ class SubscriptionService {
     Subscription sub, {
     Future<bool> Function()? confirmConfigMismatch,
     bool background = false,
+    CancelToken? cancelToken,
   }) async {
     if (sub.cloudUrl != null) {
-      await installer.probeCloud(sub.cloudUrl!);
+      await installer.probeCloud(sub.cloudUrl!, cancelToken: cancelToken);
+      if (cancelToken?.isCancelled == true) return null;
       await repository.upsert(sub.copyWith(updatedAt: _now().millisecondsSinceEpoch));
       return null;
     }
     final url = sub.indexJsUrl;
     if (url == null) return null;
     final installed = await installer.installedScript(sub);
-    final probed = await installer.probeRemoteMd5s(sub);
+    final probed = await installer.probeRemoteMd5s(sub, cancelToken: cancelToken);
+    if (cancelToken?.isCancelled == true) return null;
     if (background && probed.scriptMd5 == null && ScriptUrls.parse(url).md5Given) {
       // Offline or unreachable checksum during silent startup autoUpdate: keep cached script untouched.
       return null;
@@ -276,20 +279,24 @@ class SubscriptionService {
         knownConfigMd5: probed.configMd5,
         skipConfigMd5Fetch: probed.probed,
         confirmConfigMismatch: confirmConfigMismatch,
+        cancelToken: cancelToken,
       );
+      if (cancelToken?.isCancelled == true) return null;
       final touched = sub.copyWith(updatedAt: _now().millisecondsSinceEpoch);
       await repository.upsert(touched);
       return configChanged ? touched : null;
     }
-    final fresh = probed.probed
+    final fresh = installer.runtimeType == SubscriptionInstaller
         ? await installer.installWithKnownMd5(
             sub,
-            expectedScriptMd5: probed.scriptMd5,
-            expectedConfigMd5: probed.configMd5,
-            skipConfigMd5Fetch: true,
+            expectedScriptMd5: probed.probed ? probed.scriptMd5 : null,
+            expectedConfigMd5: probed.probed ? probed.configMd5 : null,
+            skipConfigMd5Fetch: probed.probed,
             confirmConfigMismatch: confirmConfigMismatch,
+            cancelToken: cancelToken,
           )
         : await installer.install(sub, confirmConfigMismatch: confirmConfigMismatch);
+    if (cancelToken?.isCancelled == true) return null;
     final updated = sub.copyWith(installedMd5: fresh.md5, updatedAt: _now().millisecondsSinceEpoch);
     await repository.upsert(updated);
     if (installed != null && fresh.md5 == installed.md5) return null;
@@ -394,10 +401,13 @@ class SubscriptionInstaller {
     File file, {
     String? knownExpectedMd5,
     bool skipMd5Fetch = false,
+    CancelToken? cancelToken,
   }) async {
     final urls = ScriptUrls.parse(url);
-    final expected = skipMd5Fetch ? knownExpectedMd5 : await _fetchMd5(urls.md5, required: urls.md5Given);
-    final bytes = await _bytes(urls.script);
+    final expected = skipMd5Fetch
+        ? knownExpectedMd5
+        : await _fetchMd5(urls.md5, required: urls.md5Given, cancelToken: cancelToken);
+    final bytes = await _bytes(urls.script, cancelToken: cancelToken);
     final digest = md5.convert(bytes).toString();
     if (expected != null && expected != digest) {
       throw StateError('md5 mismatch for ${redactUrl(urls.script)} (expected $expected, got $digest)');
@@ -418,6 +428,7 @@ class SubscriptionInstaller {
     String? expectedConfigMd5,
     bool skipConfigMd5Fetch = false,
     Future<bool> Function()? confirmConfigMismatch,
+    CancelToken? cancelToken,
   }) async {
     final url = sub.indexJsUrl;
     if (url == null) throw ArgumentError('subscription ${sub.key} has no index.js url');
@@ -433,7 +444,7 @@ class SubscriptionInstaller {
     // existing installation intact while avoiding sequential overseas round-trips.
     Future<String?> fetchConfigStage() async {
       if (sub.configUrl != null) {
-        final cfg = (await _dio.get<String>(sub.configUrl!)).data ?? '{}';
+        final cfg = (await _dio.get<String>(sub.configUrl!, cancelToken: cancelToken)).data ?? '{}';
         jsonDecode(cfg); // fail early if the server returned something that is not JSON
         await tmpConfigFile.writeAsString('module.exports = $cfg;', flush: true);
         return tmpConfigFile.path;
@@ -445,6 +456,7 @@ class SubscriptionInstaller {
           confirmConfigMismatch,
           knownMd5: expectedConfigMd5,
           skipMd5Fetch: skipConfigMd5Fetch,
+          cancelToken: cancelToken,
         );
       }
       return null;
@@ -458,10 +470,14 @@ class SubscriptionInstaller {
         tmpScriptFile,
         knownExpectedMd5: expectedScriptMd5,
         skipMd5Fetch: expectedScriptMd5 != null || skipConfigMd5Fetch,
+        cancelToken: cancelToken,
       );
       final configTask = fetchConfigStage();
       staged = await scriptTask;
       stagedConfigPath = await configTask;
+      if (cancelToken?.isCancelled == true) {
+        throw DioException.requestCancelled(requestOptions: RequestOptions(path: url), reason: 'cancelled');
+      }
     } catch (_) {
       if (await tmpScriptFile.exists()) await tmpScriptFile.delete();
       if (await tmpConfigFile.exists()) await tmpConfigFile.delete();
@@ -488,17 +504,21 @@ class SubscriptionInstaller {
     Future<bool> Function()? confirmMismatch, {
     String? knownMd5,
     bool skipMd5Fetch = false,
+    CancelToken? cancelToken,
   }) async {
     final List<int> bytes;
     try {
-      bytes = await _bytes(uri);
+      bytes = await _bytes(uri, cancelToken: cancelToken);
     } on DioException {
       return null;
     }
-    final expected = skipMd5Fetch ? knownMd5 : await _fetchMd5(uri.replace(path: '${uri.path}.md5'), required: false);
+    final expected = skipMd5Fetch
+        ? knownMd5
+        : await _fetchMd5(uri.replace(path: '${uri.path}.md5'), required: false, cancelToken: cancelToken);
     if (expected != null && expected != md5.convert(bytes).toString()) {
       if (confirmMismatch != null && !await confirmMismatch()) return null;
     }
+    if (cancelToken?.isCancelled == true) return null;
     await file.writeAsBytes(bytes, flush: true);
     return file.path;
   }
@@ -518,7 +538,10 @@ class SubscriptionInstaller {
 
   /// Fetches script `.md5` and companion `index.config.js.md5` concurrently in a single round-trip. Unlike [remoteMd5],
   /// connection/auth/server errors are NOT swallowed on production instances, preventing a double timeout into [install].
-  Future<({String? scriptMd5, String? configMd5, bool probed})> probeRemoteMd5s(Subscription sub) async {
+  Future<({String? scriptMd5, String? configMd5, bool probed})> probeRemoteMd5s(
+    Subscription sub, {
+    CancelToken? cancelToken,
+  }) async {
     if (runtimeType != SubscriptionInstaller) {
       return (scriptMd5: await remoteMd5(sub), configMd5: null, probed: false);
     }
@@ -530,10 +553,13 @@ class SubscriptionInstaller {
         : null;
     final cfgTask = cfgMd5Uri == null
         ? Future<String?>.value(null)
-        : _fetchMd5(cfgMd5Uri, required: false).timeout(const Duration(seconds: 6)).catchError((Object _) => null);
+        : _fetchMd5(cfgMd5Uri, required: false, cancelToken: cancelToken)
+            .timeout(const Duration(seconds: 6))
+            .catchError((Object _) => null);
     final String? scriptMd5;
     try {
-      scriptMd5 = await _fetchMd5ForRefresh(urls.md5, required: urls.md5Given).timeout(const Duration(seconds: 6));
+      scriptMd5 = await _fetchMd5ForRefresh(urls.md5, required: urls.md5Given, cancelToken: cancelToken)
+          .timeout(const Duration(seconds: 6));
     } catch (_) {
       unawaited(cfgTask);
       rethrow;
@@ -542,10 +568,10 @@ class SubscriptionInstaller {
     return (scriptMd5: scriptMd5, configMd5: configMd5, probed: true);
   }
 
-  Future<String?> _fetchMd5ForRefresh(Uri uri, {required bool required}) async {
+  Future<String?> _fetchMd5ForRefresh(Uri uri, {required bool required, CancelToken? cancelToken}) async {
     final String body;
     try {
-      body = utf8.decode(await _bytes(uri), allowMalformed: true);
+      body = utf8.decode(await _bytes(uri, cancelToken: cancelToken), allowMalformed: true);
     } on DioException catch (e) {
       if (!required && e.response?.statusCode == HttpStatus.notFound) return null;
       rethrow;
@@ -556,10 +582,10 @@ class SubscriptionInstaller {
   }
 
   /// Verifies a cloud CatPaw endpoint responds to `/config` during manual refresh.
-  Future<void> probeCloud(String cloudUrl) async {
+  Future<void> probeCloud(String cloudUrl, {CancelToken? cancelToken}) async {
     final base = Uri.parse(cloudUrl.trim().replaceAll(RegExp(r'/+$'), ''));
     final cfgUri = base.replace(path: '${base.path}/config');
-    await _bytes(cfgUri);
+    await _bytes(cfgUri, cancelToken: cancelToken);
   }
 
   /// Re-downloads `index.config.js` (or [Subscription.configUrl]) when `index.js` MD5 did not change; returns true if
@@ -569,6 +595,7 @@ class SubscriptionInstaller {
     String? knownConfigMd5,
     bool skipConfigMd5Fetch = false,
     Future<bool> Function()? confirmConfigMismatch,
+    CancelToken? cancelToken,
   }) async {
     final url = sub.indexJsUrl;
     if (url == null || await installedScript(sub) == null) return false;
@@ -582,7 +609,7 @@ class SubscriptionInstaller {
     try {
       String? stagedPath;
       if (sub.configUrl != null) {
-        final cfg = (await _dio.get<String>(sub.configUrl!)).data ?? '{}';
+        final cfg = (await _dio.get<String>(sub.configUrl!, cancelToken: cancelToken)).data ?? '{}';
         jsonDecode(cfg);
         await tmpConfigFile.writeAsString('module.exports = $cfg;', flush: true);
         stagedPath = tmpConfigFile.path;
@@ -593,9 +620,13 @@ class SubscriptionInstaller {
           confirmConfigMismatch,
           knownMd5: knownConfigMd5,
           skipMd5Fetch: skipConfigMd5Fetch,
+          cancelToken: cancelToken,
         );
       }
-      if (stagedPath == null) return false;
+      if (stagedPath == null || cancelToken?.isCancelled == true) {
+        if (await tmpConfigFile.exists()) await tmpConfigFile.delete();
+        return false;
+      }
       final nextBytes = await tmpConfigFile.readAsBytes();
       if (await configFile.exists()) {
         final prevBytes = await configFile.readAsBytes();
@@ -660,7 +691,7 @@ class SubscriptionInstaller {
     }
   }
 
-  Future<List<int>> _bytes(Uri uri) async {
+  Future<List<int>> _bytes(Uri uri, {CancelToken? cancelToken}) async {
     final headers = <String, String>{
       if (uri.userInfo.isNotEmpty)
         'Authorization': 'Basic ${base64Encode(utf8.encode(Uri.decodeFull(uri.userInfo)))}',
@@ -668,16 +699,17 @@ class SubscriptionInstaller {
     final cleanUri = uri.userInfo.isEmpty ? uri : uri.replace(userInfo: '');
     return (await _dio.getUri<List<int>>(
       cleanUri,
+      cancelToken: cancelToken,
       options: Options(responseType: ResponseType.bytes, headers: headers.isEmpty ? null : headers),
     ))
         .data!;
   }
 
   /// The first 32-hex word of [uri]. When the checksum is optional, a missing file or one without an md5 gives null.
-  Future<String?> _fetchMd5(Uri uri, {required bool required}) async {
+  Future<String?> _fetchMd5(Uri uri, {required bool required, CancelToken? cancelToken}) async {
     final String body;
     try {
-      body = utf8.decode(await _bytes(uri), allowMalformed: true);
+      body = utf8.decode(await _bytes(uri, cancelToken: cancelToken), allowMalformed: true);
     } on DioException {
       if (required) rethrow;
       return null;

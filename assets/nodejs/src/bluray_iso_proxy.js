@@ -26,7 +26,10 @@ const MAX_SESSIONS = 32;
 const DEFAULT_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
 
-const NON_ISO_PATH_RE = /\.(?:m3u8|m3u|mp4|mkv|webm|flv|avi|ts|m2ts|mts|mov|wmv|rmvb|mp3|flac|aac|vtt|srt|ass)(?:[?#]|$)/i;
+const NON_ISO_PATH_RE = /\.(?:m3u8|m3u|mp4|m4v|mkv|webm|flv|avi|ts|m2ts|mts|mov|wmv|rmvb|mp3|flac|aac|ogg|ogv|vtt|srt|ass)(?:[?&#"'%;\s]|$)/i;
+const ISO_EXT_RE = /\.iso(?:[?&#"'%;\s]|$)/i;
+const PAN_UPSTREAM_HOST_RE =
+  /(?:^|\.)(?:quark\.cn|uc\.cn|ucweb\.com|baidupcs\.com|baidu\.com|bdimg\.com|115\.com|115cdn\.(?:com|net)|anxia\.com|aliyundrive\.com|alipan\.com|123pan\.(?:com|cn)|123684\.com|123865\.com|123912\.com|189\.cn|ctyunxs\.cn|xunlei\.com|xycdn\.com|sandai\.net|139\.com|chinamobile\.com|guangyapan\.com|mypikpak\.com)$/i;
 const PLAY_ROUTE_RE = /^\/spider\/[^/?#]+\/\d+\/play(?:[?#]|$)/;
 const ISO_STREAM_ROUTE_RE = /^\/uzv-iso\/([a-f0-9]{16,32})\/([^/?#]+)(?:[?#]|$)/i;
 
@@ -35,6 +38,77 @@ const httpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 30000, max
 
 const isoSessions = new Map();
 const parsedIsoCache = new Map();
+const upstreamHintCache = new Map();
+
+function normalizeHintKey(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    return `${u.origin}${u.pathname}`;
+  } catch {
+    return String(rawUrl || '');
+  }
+}
+
+function noteUpstreamMediaHint(rawUrl, hint) {
+  if (!rawUrl || typeof rawUrl !== 'string' || !hint || typeof hint !== 'object') return;
+  const now = Date.now();
+  while (upstreamHintCache.size >= 128) {
+    const oldest = upstreamHintCache.keys().next().value;
+    if (!oldest) break;
+    upstreamHintCache.delete(oldest);
+  }
+  const entry = {
+    fileName: typeof hint.fileName === 'string' ? hint.fileName : '',
+    nonIso: Boolean(hint.nonIso),
+    expiresAt: now + 5 * 60 * 1000,
+  };
+  upstreamHintCache.set(rawUrl, entry);
+  const pathKey = normalizeHintKey(rawUrl);
+  if (pathKey && pathKey !== rawUrl) upstreamHintCache.set(pathKey, entry);
+}
+
+function lookupUpstreamMediaHint(rawUrl) {
+  const now = Date.now();
+  for (const key of [rawUrl, normalizeHintKey(rawUrl)]) {
+    if (!key) continue;
+    const hit = upstreamHintCache.get(key);
+    if (hit) {
+      if (hit.expiresAt > now) return hit;
+      upstreamHintCache.delete(key);
+    }
+  }
+  return null;
+}
+
+function safeDecode(str) {
+  try { return decodeURIComponent(str); } catch { return str; }
+}
+
+function shouldProbeCandidateForIso(u) {
+  if (NON_ISO_PATH_RE.test(u.pathname) || /\/trans\/|\/playlist\.m3u8/i.test(u.pathname)) return false;
+  const decodedSearch = u.search ? safeDecode(u.search) : '';
+  if (decodedSearch && NON_ISO_PATH_RE.test(decodedSearch)) return false;
+
+  const directHint = lookupUpstreamMediaHint(u.toString());
+  if (directHint) {
+    if (directHint.nonIso || (directHint.fileName && NON_ISO_PATH_RE.test(directHint.fileName))) return false;
+    if (directHint.fileName && ISO_EXT_RE.test(directHint.fileName)) return true;
+  }
+
+  if (ISO_EXT_RE.test(u.pathname) || (decodedSearch && ISO_EXT_RE.test(decodedSearch))) return true;
+
+  if (isLoopbackHost(u.hostname)) {
+    const innerRaw = u.searchParams.get('u');
+    if (innerRaw) {
+      try {
+        return shouldProbeCandidateForIso(new URL(innerRaw));
+      } catch { /* fall through */ }
+    }
+    return true;
+  }
+
+  return PAN_UPSTREAM_HOST_RE.test(u.hostname);
+}
 
 function registrableDomain(hostname) {
   const clean = String(hostname || '').trim().toLowerCase().replace(/^\[|\]$/g, '');
@@ -599,7 +673,7 @@ function pickUpstreamTargetFromPlayJson(playObj, localPort) {
     let u;
     try { u = new URL(c); } catch { continue; }
     if (u.protocol !== 'http:' && u.protocol !== 'https:') continue;
-    if (NON_ISO_PATH_RE.test(u.pathname) || /\/trans\//i.test(u.pathname)) continue;
+    if (!shouldProbeCandidateForIso(u)) continue;
     if (isLoopbackHost(u.hostname)) {
       if (!loopbackCandidate) {
         if (!u.port && localPort > 0) u.port = String(localPort);
@@ -1142,6 +1216,7 @@ function handleBlurayIsoHttp(inReq, outRes, handler, fallbackPort = 2333) {
 
 module.exports = {
   handleBlurayIsoHttp,
+  noteUpstreamMediaHint,
   parseUdfIsoMainStream,
   sliceExtents,
   parseHttpByteRange,

@@ -75,6 +75,7 @@ class PlayerSession implements NativePlayerFlutterApi {
   Map<String, String> _episodeHeaders = const {};
   Completer<void>? _episodeResolved;
   bool _resolvingEpisode = false;
+  (int, int, Future<PlayResult>)? _prefetchedEpisode;
   final Map<int, String> _searchTitles = {};
   final _closed = Completer<PageClosedEvent>();
 
@@ -83,6 +84,19 @@ class PlayerSession implements NativePlayerFlutterApi {
 
   int get line => _line;
   int get episode => _episode;
+
+  /// Kicks off [source.resolve] for the initial episode immediately so spider/API resolution
+  /// runs in parallel with native player Activity/ViewController creation and transition.
+  void prefetchEpisode(int lineIndex, int episodeIndex) {
+    if (lineIndex < 0 || lineIndex >= source.lines.length) return;
+    final eps = source.lines[lineIndex].episodes;
+    if (episodeIndex < 0 || episodeIndex >= eps.length) return;
+    _line = lineIndex;
+    _episode = episodeIndex;
+    final fut = Future<PlayResult>.sync(() => source.resolve(lineIndex, episodeIndex));
+    fut.ignore();
+    _prefetchedEpisode = (lineIndex, episodeIndex, fut);
+  }
 
   Future<void> open({
     required PlaybackConfig playback,
@@ -135,8 +149,12 @@ class PlayerSession implements NativePlayerFlutterApi {
     _resolvingEpisode = true;
     _line = request.lineIndex;
     _episode = request.episodeIndex;
+    final prefetched = _prefetchedEpisode;
+    _prefetchedEpisode = null;
     try {
-      var result = await source.resolve(request.lineIndex, request.episodeIndex);
+      var result = (prefetched != null && prefetched.$1 == request.lineIndex && prefetched.$2 == request.episodeIndex)
+          ? await prefetched.$3
+          : await source.resolve(request.lineIndex, request.episodeIndex);
       // The native side remembers the quality index across episodes; this episode may offer fewer, so clamp.
       final choice = result.qualities.isEmpty ? 0 : request.qualityIndex.clamp(0, result.qualities.length - 1);
       _quality = choice;

@@ -73,10 +73,13 @@ class HistoryView extends ConsumerWidget {
                         mainAxisSize: MainAxisSize.min,
                         children: [
                           InkWell(
-                            onTap: () => context.push(Uri(
-                              path: '/video/detail',
-                              queryParameters: {'id': e.item.id, if (e.item.siteKey != null) 'site': e.item.siteKey!},
-                            ).toString()),
+                            onTap: () => context.push(
+                              Uri(
+                                path: '/video/detail',
+                                queryParameters: {'id': e.item.id, if (e.item.siteKey != null) 'site': e.item.siteKey!},
+                              ).toString(),
+                              extra: e.item,
+                            ),
                             child: Padding(
                               padding: const EdgeInsets.all(12),
                               child: Row(children: [

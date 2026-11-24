@@ -182,8 +182,12 @@ class MpvCore(
         return MediaInfo(w.toInt(), ht.toInt(), fps, api.getPropertyString(h, "video-format"))
     }
 
-    /** `cache-speed` in bytes/s (OBSERVED in the original, g2.g.m). */
-    fun downloadSpeed(): Long? = number("cache-speed")?.toLong()
+    /** `cache-speed` in bytes/s (OBSERVED in the original, g2.g.m); also readable while initial `loading` buffers. */
+    fun downloadSpeed(): Long? {
+        val h = handle
+        if (h == 0L || (!loaded && !loading)) return null
+        return api.getProperty(h, "cache-speed", MpvFormat.DOUBLE).takeUnless { it.isNaN() }?.toLong()
+    }
 
     /** `video-bitrate` in bits/s (OBSERVED in the original, g2.g.l). */
     fun videoBitrate(): Long? = number("video-bitrate")?.toLong()

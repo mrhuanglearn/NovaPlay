@@ -258,6 +258,85 @@ void main() {
       expect(runtimeBuilds, greaterThanOrEqualTo(2), reason: 'active runtime reloaded onto newly downloaded script');
     });
 
+    test('iosStartupSubscriptionGateProvider updates before home entry and falls back to local cache on timeout without double refresh',
+        () async {
+      put('/ios/index.js', script);
+      final subIos = await service.addNetwork(url: '${base()}/ios/index.js.md5', name: 'iOS Sub', autoUpdate: true);
+
+      // 1. Fast remote update finishes inside gate -> runtime starts ONCE on the updated script (no double refresh).
+      const scriptV2 = 'module.exports = { start() {}, v: "ios_v2" };';
+      put('/ios/index.js', scriptV2);
+      clock = clock.add(const Duration(hours: 1));
+      var fastBuilds = 0;
+      String? startedMd5;
+      final fastContainer = ProviderContainer(overrides: [
+        iosStartupGateEnabledProvider.overrideWithValue(true),
+        iosStartupGateTimeoutProvider.overrideWithValue(const Duration(seconds: 3)),
+        subscriptionRepositoryProvider.overrideWithValue(repo),
+        subscriptionInstallerProvider.overrideWithValue(service.installer),
+        subscriptionServiceProvider.overrideWithValue(service),
+        settingsStoreProvider.overrideWithValue(JsonStore('settings.json', baseDir: dir)),
+        catpawRuntimeProvider.overrideWith((ref) async {
+          await ref.watch(iosStartupSubscriptionGateProvider.future);
+          fastBuilds++;
+          final installed = await service.installer.installedScript(subIos);
+          startedMd5 = installed?.md5;
+          final subs = await ref.read(subscriptionsProvider.future);
+          return SpiderRuntime(
+            subscription: subs.first,
+            api: SpiderApi(2333, baseUrl: 'http://127.0.0.1:2333'),
+            sites: const [],
+          );
+        }),
+      ]);
+      addTearDown(fastContainer.dispose);
+
+      await fastContainer.read(iosStartupSubscriptionGateProvider.future);
+      await fastContainer.read(catpawRuntimeProvider.future);
+      expect(fastBuilds, 1, reason: 'home runtime initialized exactly once after gate');
+      expect(startedMd5, md5Of(scriptV2), reason: 'already running the updated V2 script on first boot');
+
+      // 2. Hung remote server exceeds gate timeout -> cancels request, enters with local cache, zero late double refresh.
+      final slowServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => slowServer.close(force: true));
+      slowServer.listen((req) async {
+        await Future<void>.delayed(const Duration(milliseconds: 500));
+        req.response.write('${md5Of('module.exports = { v: 3 };')}\n');
+        await req.response.close().catchError((_) {});
+      });
+      final slowSub = subIos.copyWith(indexJsUrl: 'http://127.0.0.1:${slowServer.port}/ios/index.js.md5');
+      await repo.save([slowSub]);
+
+      var timeoutBuilds = 0;
+      String? cachedMd5;
+      final timeoutContainer = ProviderContainer(overrides: [
+        iosStartupGateEnabledProvider.overrideWithValue(true),
+        iosStartupGateTimeoutProvider.overrideWithValue(const Duration(milliseconds: 80)),
+        subscriptionRepositoryProvider.overrideWithValue(repo),
+        subscriptionInstallerProvider.overrideWithValue(service.installer),
+        subscriptionServiceProvider.overrideWithValue(service),
+        settingsStoreProvider.overrideWithValue(JsonStore('settings_slow.json', baseDir: dir)),
+        catpawRuntimeProvider.overrideWith((ref) async {
+          await ref.watch(iosStartupSubscriptionGateProvider.future);
+          timeoutBuilds++;
+          cachedMd5 = (await service.installer.installedScript(slowSub))?.md5;
+          return SpiderRuntime(
+            subscription: slowSub,
+            api: SpiderApi(2333, baseUrl: 'http://127.0.0.1:2333'),
+            sites: const [],
+          );
+        }),
+      ]);
+      addTearDown(timeoutContainer.dispose);
+
+      await timeoutContainer.read(iosStartupSubscriptionGateProvider.future);
+      await timeoutContainer.read(catpawRuntimeProvider.future);
+      // Wait past slowServer's 500ms response to prove cancelled request never causes a late second refresh.
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      expect(timeoutBuilds, 1, reason: 'no late double refresh after timeout fallback');
+      expect(cachedMd5, md5Of(scriptV2), reason: 'preserved local cached script on timeout');
+    });
+
     test('a local zip needs both index.js and index.config.js', () async {
       List<int> zip(Map<String, String> files) {
         final a = Archive();

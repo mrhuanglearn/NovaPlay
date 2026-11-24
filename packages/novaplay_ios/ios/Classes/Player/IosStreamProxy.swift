@@ -627,6 +627,11 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     ].contains(ext)
   }
 
+  static func isKnownAvPlayerExtension(_ rawExt: String) -> Bool {
+    let ext = rawExt.lowercased()
+    return ["m3u8", "m3u", "mp4", "m4v", "mov", "mp3", "m4a", "aac", "flac"].contains(ext)
+  }
+
   static func inferredKind(for url: URL) -> String {
     let ext = url.pathExtension.lowercased()
     if ext == "m3u8" || ext == "m3u" { return "hls" }
@@ -871,7 +876,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     req.httpMethod = "GET"
     req.timeoutInterval = 5.5
     applyEffectiveHeaders(for: session, into: &req)
-    let rangeValue: String? = useRangeHeader ? "bytes=0-8191" : nil
+    let rangeValue: String? = useRangeHeader ? "bytes=0-1023" : nil
     if let r = rangeValue {
       req.setValue(r, forHTTPHeaderField: "Range")
       req.setValue("identity", forHTTPHeaderField: "Accept-Encoding")
@@ -905,12 +910,12 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
           if capturedData.isEmpty && IosHlsRewriter.looksLikeHlsPlaylist(chunk) {
             isLikelyHlsResponse = true
           }
-          let capBytes = isLikelyHlsResponse ? (1024 * 1024) : 8192
+          let capBytes = isLikelyHlsResponse ? (1024 * 1024) : 1024
           let needed = max(0, capBytes - capturedData.count)
           if needed > 0 {
             capturedData.append(chunk.prefix(needed))
           }
-          if !isLikelyHlsResponse && capturedData.count >= 8192 {
+          if !isLikelyHlsResponse && capturedData.count >= 1024 {
             shouldStopNow = true
           } else if isLikelyHlsResponse && capturedData.count >= capBytes {
             shouldStopNow = true
@@ -1384,6 +1389,8 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
         }
 
         let ct = resp?.value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"
+        let sniffed = Self.sniffContainer(firstBytes: data, contentType: ct, finalURL: finalURL)
+        self.recordSessionContainer(session: session, container: sniffed)
         let headStr =
           "HTTP/1.1 \(status) OK\r\n" +
           "Content-Type: \(ct)\r\n" +

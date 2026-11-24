@@ -879,6 +879,17 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         return
       }
 
+      if IosStreamProxy.isKnownAvPlayerExtension(mediaURL.pathExtension) {
+        loadWithAvPlayer(
+          mediaURL: useProxyForFfmpeg ? defaultProxied : mediaURL,
+          audioUrl: audioUrl,
+          headers: effectiveHeaders,
+          startMs: startMs,
+          proxyToken: useProxyForFfmpeg ? token : nil
+        )
+        return
+      }
+
       cancelPendingProbe = IosStreamProxy.shared.probe(token: token) { [weak self] probeRes in
         guard let self = self, self.loadGeneration == gen else { return }
         self.cancelPendingProbe = nil
@@ -1128,6 +1139,12 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     }
     let item = AVPlayerItem(asset: asset)
     item.audioTimePitchAlgorithm = .timeDomain
+    item.preferredForwardBufferDuration = 4.0
+    if startMs > 0 {
+      let target = CMTime(value: startMs, timescale: 1000)
+      let tol = CMTime(seconds: 0.5, preferredTimescale: 600)
+      item.seek(to: target, toleranceBefore: tol, toleranceAfter: tol, completionHandler: nil)
+    }
 
     let output = AVPlayerItemVideoOutput(pixelBufferAttributes: [
       kCVPixelBufferPixelFormatTypeKey as String: Int(kCVPixelFormatType_32BGRA)
@@ -1164,6 +1181,9 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         aItem.audioTimePitchAlgorithm = .timeDomain
         secondaryAudioPlayer = AVPlayer(playerItem: aItem)
       }
+    }
+    if shouldAutoPlay && !isAppInBackground {
+      play()
     }
   }
 
@@ -1616,7 +1636,9 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
           guard self.isUsingAvPlayer else { return }
           let codec = self.videoCodecName ?? "unknown"
           playerUsbLog.notice("[NovaPlay][Player] AVPlayer readyToPlay codec=\(codec, privacy: .public)")
-          if startMs > 0 {
+          let curSec = CMTimeGetSeconds(it.currentTime())
+          let alreadyNearStart = startMs > 0 && curSec.isFinite && abs(curSec * 1000.0 - Double(startMs)) <= 1500.0
+          if startMs > 0 && !alreadyNearStart {
             let target = CMTime(value: startMs, timescale: 1000)
             let tol = CMTime(seconds: 0.5, preferredTimescale: 600)
             self.isSeeking = true

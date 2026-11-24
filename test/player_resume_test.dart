@@ -197,6 +197,41 @@ void main() {
     final saved = (await history.find('demo', '1'))!;
     expect((saved.episodeIndex, saved.positionSeconds), (1, 15));
   });
+
+  test('prefetchEpisode starts spider play before native open and reuses the single in-flight call', () async {
+    var calls = 0;
+    final gate = Completer<PlayResult>();
+    final countingSource = VodPlaybackSource(
+      site: _site,
+      api: _CountingApi(() {
+        calls++;
+        return gate.future;
+      }),
+      detail: detail,
+      history: history,
+    );
+    final host = _Host();
+    final s = session(host, countingSource);
+    s.prefetchEpisode(0, 1);
+    expect(calls, 1, reason: 'spider.play kicked off immediately before openPlayerPage');
+
+    await s.open(playback: _playback(), danmaku: _danmaku(), line: 0, episode: 1);
+    final reqFuture = s.onEpisodeRequest(
+        EpisodeRequest(sessionId: s.sessionId, requestId: 1, lineIndex: 0, episodeIndex: 1, qualityIndex: 0));
+    expect(calls, 1, reason: 'onEpisodeRequest reuses prefetched future without duplicate play()');
+
+    gate.complete(const PlayResult(url: 'http://v/prefetched.mp4'));
+    await reqFuture;
+    expect(host.sources.single.url, 'http://v/prefetched.mp4');
+  });
+}
+
+class _CountingApi extends SpiderApi {
+  _CountingApi(this._fn) : super(0);
+  final Future<PlayResult> Function() _fn;
+
+  @override
+  Future<PlayResult> play(SpiderSite site, String flag, String id) => _fn();
 }
 
 class _SlowApi extends SpiderApi {

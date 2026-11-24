@@ -209,11 +209,14 @@ final class IosMpvEngine {
     _ = uzv_ios_mpv_set_option_string(inst, "terminal", "no")
     _ = uzv_ios_mpv_set_option_string(inst, "tls-verify", "no")
     _ = uzv_ios_mpv_set_option_string(inst, "network-timeout", "15")
-    _ = uzv_ios_mpv_set_option_string(inst, "demuxer-lavf-analyzeduration", "3")
-    _ = uzv_ios_mpv_set_option_string(inst, "demuxer-lavf-probesize", "5242880")
+    _ = uzv_ios_mpv_set_option_string(inst, "demuxer-lavf-analyzeduration", "1")
+    _ = uzv_ios_mpv_set_option_string(inst, "demuxer-lavf-probesize", "1572864")
     _ = uzv_ios_mpv_set_option_string(inst, "demuxer-lavf-o", "allowed_extensions=ALL")
     _ = uzv_ios_mpv_set_option_string(inst, "stream-lavf-o", "reconnect=1,reconnect_delay_max=4")
     _ = uzv_ios_mpv_set_option_string(inst, "cache", "yes")
+    _ = uzv_ios_mpv_set_option_string(inst, "cache-pause", "yes")
+    _ = uzv_ios_mpv_set_option_string(inst, "cache-pause-initial", "no")
+    _ = uzv_ios_mpv_set_option_string(inst, "cache-pause-wait", "0.3")
     _ = uzv_ios_mpv_set_option_string(inst, "demuxer-max-bytes", "64MiB")
     _ = uzv_ios_mpv_set_option_string(inst, "demuxer-max-back-bytes", "32MiB")
 
@@ -777,7 +780,7 @@ final class IosMpvEngine {
 
   private func startStatsTimer() {
     statsTimer?.invalidate()
-    let t = Timer(timeInterval: 0.5, repeats: true) { [weak self] _ in
+    let t = Timer(timeInterval: 0.3, repeats: true) { [weak self] _ in
       self?.sampleStats()
     }
     RunLoop.main.add(t, forMode: .common)
@@ -785,13 +788,15 @@ final class IosMpvEngine {
   }
 
   private func sampleStats() {
-    guard let inst = instance, fileLoaded else { return }
+    guard let inst = instance, (fileLoaded || loadingFile) else { return }
     let cacheSpeed = uzv_ios_mpv_get_property_double(inst, "cache-speed", 0)
     downloadBytesPerSec = max(0, cacheSpeed)
-    let vBitrate = uzv_ios_mpv_get_property_double(inst, "video-bitrate", 0)
-    videoBitrateBps = max(0, vBitrate)
-    if nominalFps == nil || videoSize == .zero {
-      refreshVideoMetadata(inst: inst)
+    if fileLoaded {
+      let vBitrate = uzv_ios_mpv_get_property_double(inst, "video-bitrate", 0)
+      videoBitrateBps = max(0, vBitrate)
+      if nominalFps == nil || videoSize == .zero {
+        refreshVideoMetadata(inst: inst)
+      }
     }
     delegate?.mpvEngineDidUpdateMetrics()
   }

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:dio/dio.dart' show CancelToken;
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -260,10 +261,16 @@ class SpiderRuntime {
   final List<SpiderSite> sites;
 }
 
+/// Enabled on iOS cold start (and overridable in tests): waits for `autoUpdate` subscriptions to sync before
+/// entering the home screen so the initial page never double-refreshes; falls back to local cache on timeout.
+final iosStartupGateEnabledProvider = Provider<bool>((_) => Platform.isIOS);
+final iosStartupGateTimeoutProvider = Provider<Duration>((_) => const Duration(seconds: 4));
+
 /// Container-scoped tracker for the currently running local CatPaw worker key and in-flight background auto-updates.
 class _CatpawRuntimeState {
   String? lastRunningSubKey;
   bool disposed = false;
+  bool iosStartupGateCompleted = false;
   final Set<String> checkingAutoUpdate = {};
   final Map<String, int> lastAutoCheckedMs = {};
 }
@@ -274,7 +281,12 @@ final _catpawRuntimeStateProvider = Provider((ref) {
   return s;
 });
 
-Future<void> _autoUpdateSubscription(ProviderContainer container, Subscription sub) async {
+Future<void> _autoUpdateSubscription(
+  ProviderContainer container,
+  Subscription sub, {
+  bool reloadRuntimeOnUpdate = true,
+  CancelToken? cancelToken,
+}) async {
   final tracker = container.read(_catpawRuntimeStateProvider);
   final nowMs = DateTime.now().millisecondsSinceEpoch;
   final prevMs = tracker.lastAutoCheckedMs[sub.key];
@@ -284,14 +296,15 @@ Future<void> _autoUpdateSubscription(ProviderContainer container, Subscription s
     final updated = await container.read(subscriptionServiceProvider).refresh(
           sub,
           background: true,
+          cancelToken: cancelToken,
           confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey),
         );
-    if (tracker.disposed) return;
+    if (tracker.disposed || cancelToken?.isCancelled == true) return;
     tracker.lastAutoCheckedMs[sub.key] = DateTime.now().millisecondsSinceEpoch;
     container.invalidate(subscriptionsProvider);
-    if (updated != null) {
+    if (updated != null && reloadRuntimeOnUpdate) {
       final subs = await container.read(subscriptionsProvider.future);
-      if (tracker.disposed) return;
+      if (tracker.disposed || cancelToken?.isCancelled == true) return;
       final selected = container.read(activeSubscriptionKeyProvider).valueOrNull;
       final activeKey = subs.any((s) => s.key == selected) ? selected : subs.firstOrNull?.key;
       if (activeKey == sub.key) {
@@ -315,13 +328,53 @@ Future<void> _autoUpdateSubscription(ProviderContainer container, Subscription s
 Future<void> runStartupSubscriptionAutoUpdate(ProviderContainer container) async {
   try {
     final subs = await container.read(subscriptionsProvider.future);
-    final targets = subs.where((s) => s.autoUpdate && !s.local && s.indexJsUrl != null).toList();
+    final targets = subs.where((s) => s.autoUpdate && !s.local && (s.indexJsUrl != null || s.cloudUrl != null)).toList();
     if (targets.isEmpty) return;
     await Future.wait(targets.map((s) => _autoUpdateSubscription(container, s)));
   } catch (e) {
     debugPrint('startup autoUpdate sweep failed: $e');
   }
 }
+
+/// iOS cold-start subscription gate: waits up to [iosStartupGateTimeoutProvider] for `autoUpdate` subscriptions to
+/// finish checking/downloading before entering the home page; on timeout, cancels in-flight HTTP requests immediately
+/// so the home page loads the local cache once without a late double-refresh.
+final iosStartupSubscriptionGateProvider = FutureProvider<void>((ref) async {
+  if (!ref.watch(iosStartupGateEnabledProvider)) return;
+  final runtimeState = ref.read(_catpawRuntimeStateProvider);
+  if (runtimeState.iosStartupGateCompleted) return;
+  final timeout = ref.read(iosStartupGateTimeoutProvider);
+  final cancelToken = CancelToken();
+  try {
+    final subs = await ref.read(subscriptionsProvider.future);
+    final targets = subs.where((s) => s.autoUpdate && !s.local && (s.indexJsUrl != null || s.cloudUrl != null)).toList();
+    if (targets.isEmpty) return;
+    var timedOut = false;
+    await Future.any<void>([
+      Future.wait(targets.map((s) => _autoUpdateSubscription(
+            ref.container,
+            s,
+            reloadRuntimeOnUpdate: false,
+            cancelToken: cancelToken,
+          ))),
+      Future<void>.delayed(timeout, () {
+        timedOut = true;
+        if (!cancelToken.isCancelled) cancelToken.cancel('ios startup gate timeout');
+      }),
+    ]);
+    final stamp = DateTime.now().millisecondsSinceEpoch;
+    for (final s in targets) {
+      runtimeState.lastAutoCheckedMs[s.key] = stamp;
+    }
+    if (timedOut) {
+      debugPrint('iOS startup subscription sync timed out after ${timeout.inMilliseconds}ms; using local cache');
+    }
+  } catch (e) {
+    debugPrint('iOS startup subscription gate failed: $e');
+  } finally {
+    runtimeState.iosStartupGateCompleted = true;
+  }
+});
 
 /// Checks remote MD5 in the background so `sub.autoUpdate` never blocks app startup.
 void _scheduleBackgroundAutoUpdateCheck(Ref ref, Subscription sub) {
@@ -378,6 +431,9 @@ final catpawSupervisorProvider = Provider<CatpawSupervisor>((ref) {
 /// Installs the active subscription's script (if needed), starts it in the Node runtime and loads its sites.
 /// Cloud subscriptions skip the local runtime and talk to the given address directly.
 final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<SpiderRuntime?>((ref) async {
+  if (ref.read(iosStartupGateEnabledProvider)) {
+    await ref.watch(iosStartupSubscriptionGateProvider.future);
+  }
   // Rebuild only when what the runtime runs can change (which subscription is first, where each script comes from).
   // Renaming, 自动更新/上锁 and the 上次更新 stamp below must not restart the running script; pages that change the script
   // itself (refresh, a new zip) invalidate this provider explicitly.

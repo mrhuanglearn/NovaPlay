@@ -45,7 +45,9 @@ Future<void> main() async {
   ]);
   runApp(UncontrolledProviderScope(container: container, child: const UzvApp()));
   unawaited(_startupWebDavSync(container));
-  unawaited(runStartupSubscriptionAutoUpdate(container));
+  if (!container.read(iosStartupGateEnabledProvider)) {
+    unawaited(runStartupSubscriptionAutoUpdate(container));
+  }
 }
 
 /// 启用同步 (WebDAV settings): sync the chosen data once per app start. Failures are shown, never thrown.
@@ -112,6 +114,8 @@ class _UzvAppState extends ConsumerState<UzvApp> with WidgetsBindingObserver {
   Widget build(BuildContext context) {
     final prefs = ref.watch(appPreferencesProvider);
     final fontFamily = ref.watch(fontSettingsProvider).fontFamily;
+    final gateEnabled = ref.watch(iosStartupGateEnabledProvider);
+    final gate = gateEnabled ? ref.watch(iosStartupSubscriptionGateProvider) : const AsyncData<void>(null);
     return MaterialApp.router(
       onGenerateTitle: (c) => c.l10n.appName,
       debugShowCheckedModeBanner: false,
@@ -132,11 +136,14 @@ class _UzvAppState extends ConsumerState<UzvApp> with WidgetsBindingObserver {
       themeMode: prefs.themeMode,
       // 主题设置 → 字体大小 scales all text on top of the system font size, as the original does.
       builder: (context, child) {
-        if (prefs.textScale == 1.0) return child!;
+        final content = gate.isLoading
+            ? const Scaffold(body: Center(child: CircularProgressIndicator()))
+            : child!;
+        if (prefs.textScale == 1.0) return content;
         final mq = MediaQuery.of(context);
         return MediaQuery(
           data: mq.copyWith(textScaler: TextScaler.linear(mq.textScaler.scale(1) * prefs.textScale)),
-          child: child!,
+          child: content,
         );
       },
     );

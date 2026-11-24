@@ -103,7 +103,97 @@ function extractLegacyShareLinks(lines) {
   return out;
 }
 
-async function fetchTimed(url, init = {}, timeoutMs = 6000) {
+const SHARE_CACHE_TTL_MS = 10 * 60 * 1000;
+const SHARE_HARD_TIMEOUT_MS = 3800;
+const SHARE_STRAGGLER_GRACE_MS = 1400;
+const BAIDU_COOKIE_TTL_MS = 6 * 3600 * 1000;
+
+const resolvedShareCache = new Map();
+const inFlightShareMap = new Map();
+let cachedBaiduIdCookie = '';
+let cachedBaiduIdExpiresAt = 0;
+let inFlightBaiduId = null;
+
+function readShareCache(key) {
+  const hit = resolvedShareCache.get(key);
+  if (!hit) return null;
+  if (hit.expiresAt <= Date.now()) {
+    resolvedShareCache.delete(key);
+    return null;
+  }
+  return hit.value;
+}
+
+function writeShareCache(key, value) {
+  while (resolvedShareCache.size >= 256) {
+    const oldest = resolvedShareCache.keys().next().value;
+    if (!oldest) break;
+    resolvedShareCache.delete(oldest);
+  }
+  resolvedShareCache.set(key, { value, expiresAt: Date.now() + SHARE_CACHE_TTL_MS });
+}
+
+async function cachedCoreShareResolve(cfg, share, origCyeFn) {
+  const provider = String(cfg?.provider || share?.provider || '');
+  const key = `core:${provider}:${share?.shareId || ''}:${share?.folderId || '0'}:${share?.passcode || ''}`;
+  const cached = readShareCache(key);
+  if (cached) return cached;
+
+  let task = inFlightShareMap.get(key);
+  if (!task) {
+    task = Promise.resolve()
+      .then(() => origCyeFn(cfg, share))
+      .then((videos) => {
+        if (Array.isArray(videos) && videos.length > 0) writeShareCache(key, videos);
+        return Array.isArray(videos) ? videos : [];
+      })
+      .finally(() => inFlightShareMap.delete(key));
+    task.catch(() => {});
+    inFlightShareMap.set(key, task);
+  }
+
+  let timer = null;
+  try {
+    return await Promise.race([
+      task,
+      new Promise((resolve) => {
+        timer = setTimeout(() => resolve([]), SHARE_HARD_TIMEOUT_MS);
+        if (typeof timer.unref === 'function') timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function ensureBaiduAnonymousCookie(sampleShare) {
+  const now = Date.now();
+  if (cachedBaiduIdCookie && cachedBaiduIdExpiresAt > now) return cachedBaiduIdCookie;
+  if (inFlightBaiduId) return inFlightBaiduId;
+  inFlightBaiduId = (async () => {
+    try {
+      const ir = await fetchTimed(
+        `https://pan.baidu.com/s/${encodeURIComponent(sampleShare.shareId)}${sampleShare.passcode ? `?pwd=${encodeURIComponent(sampleShare.passcode)}` : ''}`,
+        { headers: { 'User-Agent': DEFAULT_UA }, redirect: 'manual' },
+        3000,
+      );
+      const cks = typeof ir.headers.getSetCookie === 'function' ? ir.headers.getSetCookie() : [ir.headers.get('set-cookie') || ''];
+      const bid = cks.map((c) => c.split(';')[0].trim()).filter(Boolean).join('; ');
+      if (bid && /BAIDUID=/i.test(bid)) {
+        cachedBaiduIdCookie = bid;
+        cachedBaiduIdExpiresAt = Date.now() + BAIDU_COOKIE_TTL_MS;
+      }
+      return bid;
+    } catch {
+      return '';
+    } finally {
+      inFlightBaiduId = null;
+    }
+  })();
+  return inFlightBaiduId;
+}
+
+async function fetchTimed(url, init = {}, timeoutMs = 3500) {
   return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
 }
 
@@ -150,14 +240,16 @@ async function resolveAli(share) {
         body: JSON.stringify({ share_id: share.shareId, parent_file_id: parentId, limit: 100, order_by: 'name', order_direction: 'ASC', marker }),
       });
       const j = await r.json().catch(() => ({}));
+      const folders = [];
       for (const it of j.items || []) {
         const fid = String(it.file_id || '');
         const name = String(it.name || '');
         if (!fid || !name) continue;
-        if (it.type === 'folder') await walk(fid, depth + 1);
+        if (it.type === 'folder') folders.push(fid);
         else if (it.category === 'video' || VIDEO_EXT_RE.test(name)) videos.push({ fileId: fid, name, size: Number(it.size || 0), subFileId: '', subName: '' });
         else if (SUBTITLE_EXT_RE.test(name)) subs.push({ fileId: fid, name });
       }
+      if (folders.length > 0) await Promise.all(folders.slice(0, 8).map((fid) => walk(fid, depth + 1)));
       marker = String(j.next_marker || '');
       if (!marker) break;
     }
@@ -200,11 +292,12 @@ async function resolvePan123(share, token) {
           dead = true;
           return;
         }
+        const folders = [];
         for (const it of list) {
           const fid = String(it.FileId ?? '');
           const name = String(it.FileName ?? '');
           if (!fid || !name) continue;
-          if (Number(it.Type) === 1 || Number(it.Category) === 0) await walk(fid, depth + 1);
+          if (Number(it.Type) === 1 || Number(it.Category) === 0) folders.push(fid);
           else if (Number(it.Category) === 2 || VIDEO_EXT_RE.test(name)) {
             videos.push({
               fileId: fid,
@@ -216,6 +309,7 @@ async function resolvePan123(share, token) {
             });
           }
         }
+        if (folders.length > 0) await Promise.all(folders.slice(0, 8).map((fid) => walk(fid, depth + 1)));
         const nv = String(j.data?.Next ?? '-1');
         if (!list.length || list.length < 100 || nv === '-1' || !nv) break;
         next = nv;
@@ -269,7 +363,7 @@ async function resolve115(share, cookie) {
           videos.push({ fid: String(row.fid ?? ''), pc: String(row.pc ?? ''), name, size: Number(row.s ?? 0) });
         }
       }
-      for (const sc of subs) await walk(sc, depth + 1);
+      if (subs.length > 0) await Promise.all(subs.slice(0, 8).map((sc) => walk(sc, depth + 1)));
       offset += rows.length;
       const total = Number(j.data.count ?? 0);
       if (rows.length < 115 || (total > 0 && offset >= total)) break;
@@ -292,16 +386,8 @@ async function resolveBaidu(share, cookie) {
   const referer = share.rawUrl || `https://pan.baidu.com/s/${share.shareId}`;
   let shareCookie = String(cookie || '').trim();
   if (!/BAIDUID=/i.test(shareCookie)) {
-    try {
-      const ir = await fetchTimed(
-        `https://pan.baidu.com/s/${encodeURIComponent(share.shareId)}${share.passcode ? `?pwd=${encodeURIComponent(share.passcode)}` : ''}`,
-        { headers: { 'User-Agent': DEFAULT_UA }, redirect: 'manual' },
-        5000,
-      );
-      const cks = typeof ir.headers.getSetCookie === 'function' ? ir.headers.getSetCookie() : [ir.headers.get('set-cookie') || ''];
-      const bid = cks.map((c) => c.split(';')[0].trim()).filter(Boolean).join('; ');
-      if (bid) shareCookie = shareCookie ? `${shareCookie}; ${bid}` : bid;
-    } catch { /* ignore */ }
+    const bid = await ensureBaiduAnonymousCookie(share);
+    if (bid) shareCookie = shareCookie ? `${shareCookie}; ${bid}` : bid;
   }
   if (share.passcode) {
     const vr = await fetchTimed(
@@ -355,7 +441,7 @@ async function resolveBaidu(share, cookie) {
           if (fsId) videos.push({ name, size: Number(o.size ?? 0), uk, shareid, fsId, path: p });
         }
       }
-      for (const sub of dirs) await walk(sub, false, depth + 1);
+      if (dirs.length > 0) await Promise.all(dirs.slice(0, 8).map((sub) => walk(sub, false, depth + 1)));
       if (!Number(j.has_more) || j.list.length < 100) break;
     }
   };
@@ -422,7 +508,7 @@ async function resolveXunlei(share) {
           videos.push({ id: fid, parentId: String(f.parent_id ?? parentId), name, size: Number(f.size ?? 0), passCodeToken });
         }
       }
-      for (const sub of folders) await walk(sub, depth + 1);
+      if (folders.length > 0) await Promise.all(folders.slice(0, 8).map((sub) => walk(sub, depth + 1)));
       pageToken = String(j.next_page_token || '');
       if (!pageToken) break;
     }
@@ -487,7 +573,7 @@ async function resolveGuangya(share, entry) {
         if (Number(it.resType) === 2) folders.push(fid);
         else if (VIDEO_EXT_RE.test(name)) videos.push({ fileId: fid, name, size: Number(it.fileSize ?? it.size ?? 0) });
       }
-      for (const sub of folders) await walk(sub, depth + 1);
+      if (folders.length > 0) await Promise.all(folders.slice(0, 8).map((sub) => walk(sub, depth + 1)));
       const next = Number(j.data?.cursor ?? 0);
       if (!j.data?.hasMore || next <= cursor) break;
       cursor = next;
@@ -533,10 +619,8 @@ async function resolveTianyi(share) {
         const fn = String(f.name ?? '');
         if (fid && fn && VIDEO_EXT_RE.test(fn)) videos.push({ fileId: fid, name: fn, size: Number(f.size ?? 0) });
       }
-      for (const d of j.fileListAO?.folderList || []) {
-        const did = String(d.id ?? '');
-        if (did) await walk(did, depth + 1);
-      }
+      const subDirs = (j.fileListAO?.folderList || []).map((d) => String(d.id ?? '')).filter(Boolean);
+      if (subDirs.length > 0) await Promise.all(subDirs.slice(0, 8).map((did) => walk(did, depth + 1)));
     };
     await walk(rootFileId, 0);
   }
@@ -601,10 +685,11 @@ async function resolveYidong(share, authToken = '') {
         videos.push({ name, size: Number(co.coSize ?? 0), contentId: cid, path: String(co.path ?? ''), coType: String(co.coType ?? '') });
       }
     }
-    for (const ca of data.caLst || []) {
-      const fp = String(ca.path ?? '').trim();
-      if (fp && !skipRe.test(String(ca.caName ?? ''))) await walk(fp, depth + 1);
-    }
+    const subPaths = (data.caLst || [])
+      .filter((ca) => !skipRe.test(String(ca.caName ?? '')))
+      .map((ca) => String(ca.path ?? '').trim())
+      .filter(Boolean);
+    if (subPaths.length > 0) await Promise.all(subPaths.slice(0, 8).map((fp) => walk(fp, depth + 1)));
   };
   await walk('root', 0);
   sortVideos(videos);
@@ -635,23 +720,14 @@ function selectDiverse(shares, maxCount = 16) {
   return picked;
 }
 
-async function resolveLegacyExtendedShares(fastify, shares) {
-  const [pans, rawPanList] = await Promise.all([
-    fastify?.db?.get?.('pans').then((v) => v || {}).catch(() => ({})),
-    fastify?.db?.get?.('panListConfig').catch(() => null),
-  ]);
-  const panList = Array.isArray(rawPanList) ? rawPanList : [];
-  const disabled = new Set(panList.filter((p) => p && p.enabled === false).map((p) => p.key));
-  const orderMap = new Map(panList.map((p, idx) => [p && p.key, idx]));
-  const nonCoreAll = (Array.isArray(shares) ? shares : []).filter(
-    (s) => s && s.provider !== 'uc' && s.provider !== 'quark' && !disabled.has(s.provider),
-  );
-  if (nonCoreAll.length === 0) return [];
-  const nonCore = selectDiverse(nonCoreAll, 16);
+async function resolveSingleExtendedShare(share, entry) {
+  const key = `ext:${share.provider}:${share.shareId}:${share.folderId || ''}:${share.passcode || ''}`;
+  const cached = readShareCache(key);
+  if (cached) return cached;
 
-  const settled = await Promise.allSettled(
-    nonCore.map(async (share) => {
-      const entry = (pans && pans[share.provider]) || {};
+  let task = inFlightShareMap.get(key);
+  if (!task) {
+    task = (async () => {
       let outcome = { items: [] };
       try {
         if (share.provider === 'ali') outcome = await resolveAli(share);
@@ -665,15 +741,79 @@ async function resolveLegacyExtendedShares(fastify, shares) {
       } catch {
         outcome = { items: [] };
       }
-      return { share, outcome };
-    }),
-  );
+      if ((outcome.items && outcome.items.length > 0) || outcome.dead) {
+        writeShareCache(key, outcome);
+      }
+      return outcome;
+    })().finally(() => inFlightShareMap.delete(key));
+    inFlightShareMap.set(key, task);
+  }
+  return task;
+}
 
-  const rows = settled
-    .map((s, idx) => ({
+async function resolveLegacyExtendedShares(fastify, shares, hasCoreHitsFn) {
+  const [pans, rawPanList] = await Promise.all([
+    fastify?.db?.get?.('pans').then((v) => v || {}).catch(() => ({})),
+    fastify?.db?.get?.('panListConfig').catch(() => null),
+  ]);
+  const panList = Array.isArray(rawPanList) ? rawPanList : [];
+  const disabled = new Set(panList.filter((p) => p && p.enabled === false).map((p) => p.key));
+  const orderMap = new Map(panList.map((p, idx) => [p && p.key, idx]));
+  const nonCoreAll = (Array.isArray(shares) ? shares : []).filter(
+    (s) => s && s.provider !== 'uc' && s.provider !== 'quark' && !disabled.has(s.provider),
+  );
+  if (nonCoreAll.length === 0) return [];
+  const nonCore = selectDiverse(nonCoreAll, 16);
+
+  const outcomes = new Array(nonCore.length).fill(null);
+  let remaining = nonCore.length;
+  let graceStarted = false;
+  let hardTimer = null;
+  let graceTimer = null;
+
+  await new Promise((resolve) => {
+    let finished = false;
+    const done = () => {
+      if (finished) return;
+      finished = true;
+      if (hardTimer) clearTimeout(hardTimer);
+      if (graceTimer) clearTimeout(graceTimer);
+      resolve();
+    };
+    const maybeStartGrace = () => {
+      if (graceStarted || finished || remaining <= 0) return;
+      graceStarted = true;
+      graceTimer = setTimeout(done, SHARE_STRAGGLER_GRACE_MS);
+      if (typeof graceTimer.unref === 'function') graceTimer.unref();
+    };
+    hardTimer = setTimeout(done, SHARE_HARD_TIMEOUT_MS);
+    if (typeof hardTimer.unref === 'function') hardTimer.unref();
+    if (typeof hasCoreHitsFn === 'function' && hasCoreHitsFn()) maybeStartGrace();
+
+    nonCore.forEach((share, idx) => {
+      const entry = (pans && pans[share.provider]) || {};
+      resolveSingleExtendedShare(share, entry)
+        .then((outcome) => {
+          outcomes[idx] = outcome;
+          remaining--;
+          if ((outcome?.items?.length > 0) || (typeof hasCoreHitsFn === 'function' && hasCoreHitsFn())) {
+            maybeStartGrace();
+          }
+          if (remaining <= 0) done();
+        })
+        .catch(() => {
+          outcomes[idx] = { items: [] };
+          remaining--;
+          if (remaining <= 0) done();
+        });
+    });
+  });
+
+  const rows = nonCore
+    .map((share, idx) => ({
       idx,
-      share: nonCore[idx],
-      outcome: s.status === 'fulfilled' ? s.value.outcome : { items: [] },
+      share,
+      outcome: outcomes[idx] || { items: [] },
     }))
     .sort((a, b) => (orderMap.get(a.share.provider) ?? 999) - (orderMap.get(b.share.provider) ?? 999) || a.idx - b.idx);
 
@@ -1064,6 +1204,7 @@ document.getElementById('clr').onclick=async()=>{
 function installLegacyPanGlobals() {
   globalThis.__uzvExtractShareLinks = extractLegacyShareLinks;
   globalThis.__uzvResolveExtendedShares = resolveLegacyExtendedShares;
+  globalThis.__uzvCachedCoreShare = cachedCoreShareResolve;
   globalThis.__uzvPlayExtendedShare = playLegacyExtendedShare;
   globalThis.__uzvBuildWoniuDetail = buildLegacyWoniuDetail;
   globalThis.__uzvHandleWoniuAuthHttp = handleWoniuAuthHttp;
@@ -1073,6 +1214,7 @@ module.exports = {
   installLegacyPanGlobals,
   extractLegacyShareLinks,
   resolveLegacyExtendedShares,
+  cachedCoreShareResolve,
   playLegacyExtendedShare,
   buildLegacyWoniuDetail,
   handleWoniuAuthHttp,

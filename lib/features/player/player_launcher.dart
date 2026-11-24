@@ -157,7 +157,6 @@ class PlayerLauncher {
     int episode = 0,
     void Function()? onOpened,
   }) async {
-    final (playback, danmaku) = await configs.load();
     final session = PlayerSession(
       sessionId: '${source.memoryKey ?? source.title}|${DateTime.now().microsecondsSinceEpoch}',
       source: source,
@@ -173,25 +172,33 @@ class PlayerLauncher {
     if (installRouter) router.install();
     router.register(session);
     onSession?.call(session);
-    await _enableWakelock();
+    session.prefetchEpisode(line, episode);
+    var wakelockHeld = false;
     try {
       final memKey = source.memoryKey;
-      final ht = memKey == null ? null : await headTail?.getAll(memKey);
+      final configFuture = configs.load();
+      final htFuture = memKey == null || headTail == null ? Future.value(null) : headTail!.getAll(memKey);
+      final htJsonFuture = memKey == null || headTail == null ? Future.value(null) : headTail!.sectionsJson(memKey);
+      final qualityFuture = source.resumeQuality();
+      await _enableWakelock();
+      wakelockHeld = true;
+      final (playback, danmaku) = await configFuture;
+      final ht = await htFuture;
       await session.open(
         playback: playback,
         danmaku: danmaku,
         line: line,
         episode: episode,
         startSeconds: await source.resumeSeconds(line, episode, outroSeconds: ht?.outro ?? 0),
-        quality: await source.resumeQuality(),
-        headTailJson: memKey == null ? null : await headTail?.sectionsJson(memKey),
+        quality: await qualityFuture,
+        headTailJson: await htJsonFuture,
       );
       onOpened?.call();
       return await session.closed;
     } finally {
       router.unregister(session);
       onSession?.call(router.latest); // another player may still be open (e.g. one in picture-in-picture)
-      if (router.latest == null) {
+      if (wakelockHeld && router.latest == null) {
         await _disableWakelock();
       }
     }

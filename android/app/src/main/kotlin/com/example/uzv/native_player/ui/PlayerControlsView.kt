@@ -84,8 +84,8 @@ class PlayerControlsView(
     private var cutoutInset = 0
     private var inPip = false
     private var seekWaitUntilMs = 0L
-    private var lastRxBytes = -1L
-    private var lastRxTimeMs = 0L
+    private var lastRxBytes = android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid())
+    private var lastRxTimeMs = android.os.SystemClock.elapsedRealtime()
     private var liveRxSpeed = 0L
 
     private val controls = FrameLayout(context).apply { visibility = GONE }

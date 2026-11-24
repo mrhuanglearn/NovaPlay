@@ -14,6 +14,7 @@ import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.upstream.DefaultBandwidthMeter
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
@@ -86,7 +87,16 @@ interface PlayerKernel {
 
 class ExoKernel(private val context: Context) : PlayerKernel {
     private val bandwidth = DefaultBandwidthMeter.Builder(context).build()
+    private val loadControl = DefaultLoadControl.Builder()
+        .setBufferDurationsMs(
+            /* minBufferMs = */ 15_000,
+            /* maxBufferMs = */ 50_000,
+            /* bufferForPlaybackMs = */ 600,
+            /* bufferForPlaybackAfterRebufferMs = */ 1_500,
+        )
+        .build()
     private val player = ExoPlayer.Builder(context)
+        .setLoadControl(loadControl)
         .setBandwidthMeter(bandwidth)
         .setWakeMode(C.WAKE_MODE_NETWORK)
         .build()
@@ -228,6 +238,8 @@ class ExoKernel(private val context: Context) : PlayerKernel {
         currentUrl = url
 
         val http = DefaultHttpDataSource.Factory()
+            .setConnectTimeoutMs(6_000)
+            .setReadTimeoutMs(12_000)
             .setAllowCrossProtocolRedirects(true)
             .setDefaultRequestProperties(headers)
             .setTransferListener(bandwidth)

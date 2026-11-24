@@ -511,6 +511,10 @@ class MpvCoreTest {
     fun downloadSpeedAndBitrateComeFromMpvProperties() {
         started()
         assertNull("nothing loaded yet", core.downloadSpeed())
+        load()
+        api.numbers["cache-speed"] = 1024.0
+        assertEquals("live speed visible while initial buffering before FILE_LOADED", 1024L, core.downloadSpeed())
+        api.numbers.remove("cache-speed")
         playing()
         assertNull(core.downloadSpeed())
         assertNull(core.videoBitrate())

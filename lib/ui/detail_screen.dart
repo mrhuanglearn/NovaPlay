@@ -126,12 +126,14 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
     if (rt == null || site == null || _opening) return;
     setState(() => _opening = true);
     try {
+      final loadedPrefs = ref.read(sitePrefsProvider).asData;
+      final sitePrefs = loadedPrefs != null ? loadedPrefs.value : await ref.read(sitePrefsProvider.future);
       await ref.read(playerLauncherProvider).play(
             site: site,
             api: rt.api,
             detail: detail,
             history: ref.read(historyRepositoryProvider),
-            recordHistory: (await ref.read(sitePrefsProvider.future)).recordsHistory(site.key),
+            recordHistory: sitePrefs.recordsHistory(site.key),
             line: _line,
             episode: episode,
             onOpened: () {
@@ -419,9 +421,10 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
     final d0 = detail.valueOrNull;
     final preview = widget.initialItem;
     final tmdbOn = ref.watch(tmdbProvider).valueOrNull != null;
-    final tmdb = d0 == null || !tmdbOn
+    final tmdbTitle = (d0?.item.name ?? preview?.name ?? '').trim();
+    final tmdb = !tmdbOn || tmdbTitle.isEmpty
         ? null
-        : ref.watch(tmdbMatchProvider((siteKey: _siteKey, vodId: widget.vodId, title: d0.item.name))).valueOrNull;
+        : ref.watch(tmdbMatchProvider((siteKey: _siteKey, vodId: widget.vodId, title: tmdbTitle))).valueOrNull;
     return Scaffold(
       appBar: AppBar(
         title: Text(d0?.item.name ?? preview?.name ?? ''),
