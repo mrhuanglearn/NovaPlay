@@ -49,12 +49,15 @@ object MpvOptions {
         "vo" to "libmpv", // render API; the app draws into its own GL surface
         "ao" to "audiotrack,opensles",
         "hwdec" to if (hwDecode) "mediacodec-copy" else "no",
+        "vd-lavc-threads" to "0",
         "idle" to "yes", // keep the core alive between files (episode switch = loadfile replace)
         "osd-level" to "0", // no on-screen messages; the app has its own controls
         "sub-auto" to "no", // never go looking for sidecar files next to a URL
         "audio-file-auto" to "no",
         "ytdl" to "no",
-        "network-timeout" to "8",
+        "network-timeout" to "15",
+        "demuxer-lavf-analyzeduration" to "3",
+        "demuxer-lavf-probesize" to "5242880",
         "demuxer-max-bytes" to "64MiB",
         "demuxer-max-back-bytes" to "32MiB",
         "msg-level" to "all=warn",

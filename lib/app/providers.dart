@@ -263,42 +263,69 @@ class SpiderRuntime {
 /// Container-scoped tracker for the currently running local CatPaw worker key and in-flight background auto-updates.
 class _CatpawRuntimeState {
   String? lastRunningSubKey;
+  bool disposed = false;
   final Set<String> checkingAutoUpdate = {};
+  final Map<String, int> lastAutoCheckedMs = {};
 }
 
-final _catpawRuntimeStateProvider = Provider((ref) => _CatpawRuntimeState());
+final _catpawRuntimeStateProvider = Provider((ref) {
+  final s = _CatpawRuntimeState();
+  ref.onDispose(() => s.disposed = true);
+  return s;
+});
 
-/// Checks remote MD5 in the background so `sub.autoUpdate` never blocks app startup by up to 8s.
-void _scheduleBackgroundAutoUpdateCheck(
-    Ref ref, Subscription sub, String currentMd5, SubscriptionInstaller installer) {
-  final tracker = ref.read(_catpawRuntimeStateProvider);
+Future<void> _autoUpdateSubscription(ProviderContainer container, Subscription sub) async {
+  final tracker = container.read(_catpawRuntimeStateProvider);
+  final nowMs = DateTime.now().millisecondsSinceEpoch;
+  final prevMs = tracker.lastAutoCheckedMs[sub.key];
+  if (tracker.disposed || (prevMs != null && nowMs - prevMs < 15000)) return;
   if (!tracker.checkingAutoUpdate.add(sub.key)) return;
-  var alive = true;
-  ref.onDispose(() => alive = false);
-  unawaited(() async {
-    try {
-      final remote = await installer.remoteMd5(sub);
-      if (!alive || remote == null || remote == currentMd5) return;
-      final next = await installer.install(
-        sub,
-        confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey),
-      );
-      if (!alive) return;
-      await ref
-          .read(subscriptionRepositoryProvider)
-          .upsert(sub.copyWith(installedMd5: next.md5, updatedAt: DateTime.now().millisecondsSinceEpoch));
-      ref.invalidate(subscriptionsProvider);
-      // Keep the running worker alive so Home never resets mid-scroll; the staged script takes effect on next launch
-      // or explicit refresh.
-      if (tracker.lastRunningSubKey != sub.key) {
-        ref.invalidate(catpawRuntimeProvider);
+  try {
+    final updated = await container.read(subscriptionServiceProvider).refresh(
+          sub,
+          background: true,
+          confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey),
+        );
+    if (tracker.disposed) return;
+    tracker.lastAutoCheckedMs[sub.key] = DateTime.now().millisecondsSinceEpoch;
+    container.invalidate(subscriptionsProvider);
+    if (updated != null) {
+      final subs = await container.read(subscriptionsProvider.future);
+      if (tracker.disposed) return;
+      final selected = container.read(activeSubscriptionKeyProvider).valueOrNull;
+      final activeKey = subs.any((s) => s.key == selected) ? selected : subs.firstOrNull?.key;
+      if (activeKey == sub.key) {
+        container.invalidate(catpawRuntimeProvider);
+        container.invalidate(videoFeedProvider);
+        try {
+          final ctx = rootNavigatorKey.currentContext;
+          if (ctx != null && ctx.mounted) showToast(ctx.l10n.subscriptionUpdatedOne);
+        } catch (_) {}
       }
-    } catch (e) {
-      debugPrint('background autoUpdate failed for ${sub.key}: $e');
-    } finally {
-      tracker.checkingAutoUpdate.remove(sub.key);
     }
-  }());
+  } catch (e) {
+    debugPrint('background autoUpdate failed for ${sub.key}: $e');
+  } finally {
+    tracker.checkingAutoUpdate.remove(sub.key);
+  }
+}
+
+/// Syncs every subscription with `自动更新` enabled in parallel at app start (or warm resume after >= 60s), stamping
+/// `updatedAt` and hot-reloading the active runtime if a newer script or config was downloaded.
+Future<void> runStartupSubscriptionAutoUpdate(ProviderContainer container) async {
+  try {
+    final subs = await container.read(subscriptionsProvider.future);
+    final targets = subs.where((s) => s.autoUpdate && !s.local && s.indexJsUrl != null).toList();
+    if (targets.isEmpty) return;
+    await Future.wait(targets.map((s) => _autoUpdateSubscription(container, s)));
+  } catch (e) {
+    debugPrint('startup autoUpdate sweep failed: $e');
+  }
+}
+
+/// Checks remote MD5 in the background so `sub.autoUpdate` never blocks app startup.
+void _scheduleBackgroundAutoUpdateCheck(Ref ref, Subscription sub) {
+  unawaited(_autoUpdateSubscription(ref.container, sub));
 }
 
 /// Supervises the active local CatPaw instance across idle/background resume and connection drops.
@@ -417,7 +444,7 @@ final FutureProvider<SpiderRuntime?> catpawRuntimeProvider = FutureProvider<Spid
         .upsert(sub.copyWith(installedMd5: installed.md5, updatedAt: DateTime.now().millisecondsSinceEpoch));
     freshlyInstalled = true;
   } else if (sub.autoUpdate && !sub.local) {
-    _scheduleBackgroundAutoUpdateCheck(ref, sub, installed.md5, installer);
+    _scheduleBackgroundAutoUpdateCheck(ref, sub);
   }
   final int port;
   try {

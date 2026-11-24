@@ -134,7 +134,7 @@ final class IosMpvEngine {
   var hwDecode: Bool = true {
     didSet {
       guard oldValue != hwDecode, let inst = instance else { return }
-      _ = uzv_ios_mpv_set_property_string(inst, "hwdec", hwDecode ? "videotoolbox" : "no")
+      _ = uzv_ios_mpv_set_property_string(inst, "hwdec", hwDecode ? "videotoolbox-copy" : "no")
     }
   }
 
@@ -195,8 +195,9 @@ final class IosMpvEngine {
     _ = uzv_ios_mpv_set_option_string(inst, "vo", vo)
     _ = uzv_ios_mpv_set_option_string(inst, "gpu-api", "vulkan")
     _ = uzv_ios_mpv_set_option_string(inst, "gpu-context", "moltenvk")
-    _ = uzv_ios_mpv_set_option_string(inst, "hwdec", hwDecode ? "videotoolbox" : "no")
+    _ = uzv_ios_mpv_set_option_string(inst, "hwdec", hwDecode ? "videotoolbox-copy" : "no")
     _ = uzv_ios_mpv_set_option_string(inst, "hwdec-codecs", "all")
+    _ = uzv_ios_mpv_set_option_string(inst, "vd-lavc-threads", "0")
     _ = uzv_ios_mpv_set_option_string(inst, "idle", "yes")
     _ = uzv_ios_mpv_set_option_string(inst, "keep-open", "no")
     _ = uzv_ios_mpv_set_option_string(inst, "osd-level", "0")
@@ -207,9 +208,11 @@ final class IosMpvEngine {
     _ = uzv_ios_mpv_set_option_string(inst, "ytdl", "no")
     _ = uzv_ios_mpv_set_option_string(inst, "terminal", "no")
     _ = uzv_ios_mpv_set_option_string(inst, "tls-verify", "no")
-    _ = uzv_ios_mpv_set_option_string(inst, "network-timeout", "10")
+    _ = uzv_ios_mpv_set_option_string(inst, "network-timeout", "15")
+    _ = uzv_ios_mpv_set_option_string(inst, "demuxer-lavf-analyzeduration", "3")
+    _ = uzv_ios_mpv_set_option_string(inst, "demuxer-lavf-probesize", "5242880")
     _ = uzv_ios_mpv_set_option_string(inst, "demuxer-lavf-o", "allowed_extensions=ALL")
-    _ = uzv_ios_mpv_set_option_string(inst, "stream-lavf-o", "reconnect=1,reconnect_streamed=1,reconnect_delay_max=4")
+    _ = uzv_ios_mpv_set_option_string(inst, "stream-lavf-o", "reconnect=1,reconnect_delay_max=4")
     _ = uzv_ios_mpv_set_option_string(inst, "cache", "yes")
     _ = uzv_ios_mpv_set_option_string(inst, "demuxer-max-bytes", "64MiB")
     _ = uzv_ios_mpv_set_option_string(inst, "demuxer-max-back-bytes", "32MiB")
@@ -402,7 +405,7 @@ final class IosMpvEngine {
       _ = setListOption(inst, name: "audio-files", values: [])
     }
 
-    _ = uzv_ios_mpv_set_property_string(inst, "hwdec", hwDecode ? "videotoolbox" : "no")
+    _ = uzv_ios_mpv_set_property_string(inst, "hwdec", hwDecode ? "videotoolbox-copy" : "no")
     _ = uzv_ios_mpv_set_property_string(inst, "sid", subtitlesDisabledByUser ? "no" : "auto")
     _ = uzv_ios_mpv_set_property_string(inst, "aid", "auto")
     let inBackground = UIApplication.shared.applicationState == .background

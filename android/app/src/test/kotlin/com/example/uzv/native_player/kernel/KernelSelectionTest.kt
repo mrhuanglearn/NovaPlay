@@ -2,7 +2,9 @@ package com.example.uzv.native_player.kernel
 
 import com.example.uzv.native_player.kernel.KernelSelection.Kernel
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class KernelSelectionTest {
@@ -41,5 +43,15 @@ class KernelSelectionTest {
         assertEquals(listOf(Kernel.MPV, Kernel.MDK), KernelSelection.fallbackOrder(Kernel.EXO))
         assertEquals(listOf(Kernel.EXO, Kernel.MDK), KernelSelection.fallbackOrder(Kernel.MPV))
         assertEquals(listOf(Kernel.MPV, Kernel.EXO), KernelSelection.fallbackOrder(Kernel.MDK))
+    }
+
+    @Test
+    fun blurayAndLegacyExtensionsRequireFfmpegKernel() {
+        assertTrue(KernelSelection.requiresFfmpegKernel("http://127.0.0.1:2333/uzv-iso/0123456789abcdef/main.m2ts"))
+        assertTrue(KernelSelection.requiresFfmpegKernel("https://cdn.example/disc/movie.ISO?sig=1"))
+        assertTrue(KernelSelection.requiresFfmpegKernel("http://127.0.0.1:2333/uzv-iso/0123456789abcdef/main.vob|User-Agent=x"))
+        assertFalse(KernelSelection.requiresFfmpegKernel("https://cdn.example/live/index.m3u8"))
+        assertFalse(KernelSelection.requiresFfmpegKernel("https://cdn.example/vod/movie.mp4"))
+        assertFalse(KernelSelection.requiresFfmpegKernel("http://127.0.0.1:2333/proxy/4kzn/3/stream?r=abc"))
     }
 }

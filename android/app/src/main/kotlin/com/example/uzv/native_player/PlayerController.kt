@@ -347,7 +347,31 @@ class PlayerController(
             }
         }
         triedKernels.clear()
-        triedKernels.add(KernelSelection.parse(activeKernelId))
+        val currentKernel = KernelSelection.parse(activeKernelId)
+        triedKernels.add(currentKernel)
+        if (currentKernel == KernelSelection.Kernel.EXO && KernelSelection.requiresFfmpegKernel(payload.url)) {
+            for (cand in KernelSelection.fallbackOrder(currentKernel)) {
+                if (!triedKernels.add(cand)) continue
+                val nextKernel = onAutoSwitchKernel?.invoke(cand) ?: continue
+                val old = kernel
+                old.listener = null
+                old.release()
+                kernel = nextKernel
+                activeKernelId = cand.id
+                nextKernel.listener = this
+                nextKernel.fitMode = playback.fitMode
+                nextKernel.speed = currentSpeed.toFloat()
+                applyTrackPreferences()
+                danmakuView.attach(nextKernel)
+                uiListener?.onNotice(
+                    PlayerUiText.t(
+                        "检测到蓝光原盘格式，已自动切换至 ${PlayerUiText.kernelName(cand.id)} 内核",
+                        "Blu-ray format detected; switched to ${PlayerUiText.kernelName(cand.id)}",
+                    ),
+                )
+                break
+            }
+        }
         loadPayloadIntoKernel(payload, start)
         pendingStartMs = 0
     }

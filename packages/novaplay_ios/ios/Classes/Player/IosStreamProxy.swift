@@ -328,6 +328,25 @@ enum IosMpegTsSanitizer {
     }
   }
 
+  static func findBdavM2tsSyncOffset(in data: Data) -> Int? {
+    let count = data.count
+    guard count >= 576 else { return nil }
+    return data.withUnsafeBytes { rawBuf -> Int? in
+      guard let ptr = rawBuf.bindMemory(to: UInt8.self).baseAddress else { return nil }
+      if ptr[4] == 0x47 && ptr[196] == 0x47 && ptr[388] == 0x47 {
+        return 0
+      }
+      let maxOffset = min(count - 385, 192)
+      guard maxOffset >= 0 else { return nil }
+      for off in 0...maxOffset where ptr[off] == 0x47 {
+        if ptr[off + 192] == 0x47 && ptr[off + 384] == 0x47 {
+          return off
+        }
+      }
+      return nil
+    }
+  }
+
   static func looksLikeFmp4Segment(_ data: Data) -> Bool {
     guard data.count >= 8 else { return false }
     let box = String(data: data.subdata(in: 4..<8), encoding: .ascii) ?? ""
@@ -602,13 +621,16 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
 
   static func isLikelyVlcOnlyExtension(_ rawExt: String) -> Bool {
     let ext = rawExt.lowercased()
-    return ["mkv", "webm", "flv", "avi", "rmvb", "rm", "wmv", "asf", "ogv", "ogg", "divx", "mpg", "mpeg", "vob"].contains(ext)
+    return [
+      "mkv", "webm", "flv", "avi", "rmvb", "rm", "wmv", "asf", "ogv", "ogg",
+      "divx", "mpg", "mpeg", "vob", "m2ts", "mts", "iso", "ts", "tp", "trp",
+    ].contains(ext)
   }
 
   static func inferredKind(for url: URL) -> String {
     let ext = url.pathExtension.lowercased()
     if ext == "m3u8" || ext == "m3u" { return "hls" }
-    if ["mp4", "m4v", "mov", "mkv", "webm", "flv", "avi", "ts", "mp3", "m4a", "aac", "flac"].contains(ext) {
+    if ["mp4", "m4v", "mov", "mkv", "webm", "flv", "avi", "ts", "m2ts", "mts", "vob", "mp3", "m4a", "aac", "flac"].contains(ext) {
       return "bin"
     }
     return "auto"
@@ -617,7 +639,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
   static func inferredFileName(for url: URL) -> String {
     let ext = url.pathExtension.lowercased()
     if ext == "m3u8" || ext == "m3u" { return "index.m3u8" }
-    if ["mp4", "m4v", "mov", "mkv", "webm", "flv", "avi", "ts", "mp3", "m4a", "aac", "flac"].contains(ext) {
+    if ["mp4", "m4v", "mov", "mkv", "webm", "flv", "avi", "ts", "m2ts", "mts", "vob", "mp3", "m4a", "aac", "flac"].contains(ext) {
       return "stream.\(ext)"
     }
     return "stream"
@@ -1034,6 +1056,9 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
       if bytes.count >= 3, let head3 = String(bytes: bytes[0..<3], encoding: .ascii), head3 == "ID3" {
         return .audio
       }
+      if firstBytes.count >= 576, IosMpegTsSanitizer.findBdavM2tsSyncOffset(in: firstBytes) != nil {
+        return .rawTs
+      }
       if firstBytes.count >= 377, IosMpegTsSanitizer.findSyncOffset(in: firstBytes) != nil {
         return .rawTs
       }
@@ -1042,6 +1067,9 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     let ext = finalURL.pathExtension.lowercased()
     if ctLower.contains("mpegurl") || ext == "m3u8" || ext == "m3u" {
       return .hls
+    }
+    if ctLower.contains("mp2t") || ["m2ts", "mts", "ts", "tp", "trp"].contains(ext) {
+      return .rawTs
     }
     if ctLower.contains("matroska") || ctLower.contains("webm") || isLikelyVlcOnlyExtension(ext) {
       return .mkv
@@ -2217,14 +2245,21 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
       queryLower.contains("q-signature=") ||
       queryLower.contains("x-tos-signature=") ||
       queryLower.contains("kssaccesskeyid=")
-    let sameSite = Self.sharesRegistrableSite(cb.session.rootURL, request.url)
+    let mergedHeaders = effectiveHeadersSnapshot(for: cb.session)
+    var sameSite = Self.sharesRegistrableSite(cb.session.rootURL, request.url)
+    if !sameSite,
+       let rootHost = cb.session.rootURL.host?.lowercased(),
+       (rootHost == "127.0.0.1" || rootHost == "localhost" || rootHost == "::1"),
+       let refVal = mergedHeaders.first(where: { $0.key.lowercased() == "referer" })?.value,
+       let refURL = URL(string: refVal) {
+      sameSite = Self.sharesRegistrableSite(refURL, request.url)
+    }
     if !sameSite {
       redirected.setValue(nil, forHTTPHeaderField: "Cookie")
       redirected.setValue(nil, forHTTPHeaderField: "Authorization")
       redirected.setValue(nil, forHTTPHeaderField: "Origin")
     }
 
-    let mergedHeaders = effectiveHeadersSnapshot(for: cb.session)
     for (k, v) in mergedHeaders {
       let lower = k.lowercased()
       if lower == "host" { continue }

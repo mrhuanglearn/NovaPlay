@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -250,23 +251,45 @@ class SubscriptionService {
   }
 
   /// Downloads [sub] again when the server has a different script. Returns the updated subscription, or null when it
-  /// was already up to date (OBSERVED "」已是最新" / "已更新到最新"). Cloud and local subscriptions have nothing to fetch.
-  Future<Subscription?> refresh(Subscription sub, {Future<bool> Function()? confirmConfigMismatch}) async {
+  /// was already up to date (OBSERVED "」已是最新" / "已更新到最新").
+  Future<Subscription?> refresh(
+    Subscription sub, {
+    Future<bool> Function()? confirmConfigMismatch,
+    bool background = false,
+  }) async {
     if (sub.cloudUrl != null) {
       await installer.probeCloud(sub.cloudUrl!);
       await repository.upsert(sub.copyWith(updatedAt: _now().millisecondsSinceEpoch));
       return null;
     }
-    if (sub.indexJsUrl == null) return null;
+    final url = sub.indexJsUrl;
+    if (url == null) return null;
     final installed = await installer.installedScript(sub);
-    final remote = await installer.remoteMd5(sub);
-    if (installed != null && remote != null && remote == installed.md5) {
-      final configChanged = await installer.refreshConfig(sub, confirmConfigMismatch: confirmConfigMismatch);
+    final probed = await installer.probeRemoteMd5s(sub);
+    if (background && probed.scriptMd5 == null && ScriptUrls.parse(url).md5Given) {
+      // Offline or unreachable checksum during silent startup autoUpdate: keep cached script untouched.
+      return null;
+    }
+    if (installed != null && probed.scriptMd5 != null && probed.scriptMd5 == installed.md5) {
+      final configChanged = await installer.refreshConfig(
+        sub,
+        knownConfigMd5: probed.configMd5,
+        skipConfigMd5Fetch: probed.probed,
+        confirmConfigMismatch: confirmConfigMismatch,
+      );
       final touched = sub.copyWith(updatedAt: _now().millisecondsSinceEpoch);
       await repository.upsert(touched);
       return configChanged ? touched : null;
     }
-    final fresh = await installer.install(sub, confirmConfigMismatch: confirmConfigMismatch);
+    final fresh = probed.probed
+        ? await installer.installWithKnownMd5(
+            sub,
+            expectedScriptMd5: probed.scriptMd5,
+            expectedConfigMd5: probed.configMd5,
+            skipConfigMd5Fetch: true,
+            confirmConfigMismatch: confirmConfigMismatch,
+          )
+        : await installer.install(sub, confirmConfigMismatch: confirmConfigMismatch);
     final updated = sub.copyWith(installedMd5: fresh.md5, updatedAt: _now().millisecondsSinceEpoch);
     await repository.upsert(updated);
     if (installed != null && fresh.md5 == installed.md5) return null;
@@ -329,7 +352,7 @@ String redactUrl(Uri uri) => uri.userInfo.isEmpty ? uri.toString() : uri.replace
 /// them for the Node runtime.
 class SubscriptionInstaller {
   SubscriptionInstaller({Dio? dio, Directory? root})
-      : _dio = dio ?? createAppDio(connectTimeout: const Duration(seconds: 12), receiveTimeout: const Duration(seconds: 30)),
+      : _dio = dio ?? createAppDio(connectTimeout: const Duration(seconds: 6), receiveTimeout: const Duration(seconds: 30)),
         _root = root;
   final Dio _dio;
   final Directory? _root;
@@ -366,9 +389,14 @@ class SubscriptionInstaller {
 
   /// Downloads the script [url] names to [file] and checks it against its md5 (see [ScriptUrls]). Used for
   /// subscription scripts and for the embedded danmu_api script.
-  Future<({String path, String md5})> downloadScript(String url, File file) async {
+  Future<({String path, String md5})> downloadScript(
+    String url,
+    File file, {
+    String? knownExpectedMd5,
+    bool skipMd5Fetch = false,
+  }) async {
     final urls = ScriptUrls.parse(url);
-    final expected = await _fetchMd5(urls.md5, required: urls.md5Given);
+    final expected = skipMd5Fetch ? knownExpectedMd5 : await _fetchMd5(urls.md5, required: urls.md5Given);
     final bytes = await _bytes(urls.script);
     final digest = md5.convert(bytes).toString();
     if (expected != null && expected != digest) {
@@ -381,7 +409,16 @@ class SubscriptionInstaller {
 
   /// [confirmConfigMismatch] is asked when `index.config.js` does not match its `.md5` (OBSERVED dialog
   /// "配置文件校验不一致"); declining starts the script with an empty config ("已忽略 md5 不匹配的 config").
-  Future<InstalledScript> install(Subscription sub, {Future<bool> Function()? confirmConfigMismatch}) async {
+  Future<InstalledScript> install(Subscription sub, {Future<bool> Function()? confirmConfigMismatch}) =>
+      installWithKnownMd5(sub, confirmConfigMismatch: confirmConfigMismatch);
+
+  Future<InstalledScript> installWithKnownMd5(
+    Subscription sub, {
+    String? expectedScriptMd5,
+    String? expectedConfigMd5,
+    bool skipConfigMd5Fetch = false,
+    Future<bool> Function()? confirmConfigMismatch,
+  }) async {
     final url = sub.indexJsUrl;
     if (url == null) throw ArgumentError('subscription ${sub.key} has no index.js url');
     final dir = await _dir(sub);
@@ -390,21 +427,41 @@ class SubscriptionInstaller {
     final scriptFile = File(p.join(dir.path, 'index.js'));
     final marker = File(p.join(dir.path, _markerName));
     final configFile = File(p.join(dir.path, 'config.js'));
-
-    // Download & checksum-verify to a staging file first so a failed URL edit leaves any existing install intact.
-    final staged = await downloadScript(url, tmpScriptFile);
-
-    String? stagedConfigPath;
     final tmpConfigFile = File(p.join(dir.path, 'config.js.tmp'));
-    try {
+
+    // Download & checksum-verify script and companion config concurrently into staging files so a failure leaves any
+    // existing installation intact while avoiding sequential overseas round-trips.
+    Future<String?> fetchConfigStage() async {
       if (sub.configUrl != null) {
         final cfg = (await _dio.get<String>(sub.configUrl!)).data ?? '{}';
         jsonDecode(cfg); // fail early if the server returned something that is not JSON
         await tmpConfigFile.writeAsString('module.exports = $cfg;', flush: true);
-        stagedConfigPath = tmpConfigFile.path;
-      } else if (ScriptUrls.parse(url).config case final configUri?) {
-        stagedConfigPath = await _downloadConfig(configUri, tmpConfigFile, confirmConfigMismatch);
+        return tmpConfigFile.path;
       }
+      if (ScriptUrls.parse(url).config case final configUri?) {
+        return _downloadConfig(
+          configUri,
+          tmpConfigFile,
+          confirmConfigMismatch,
+          knownMd5: expectedConfigMd5,
+          skipMd5Fetch: skipConfigMd5Fetch,
+        );
+      }
+      return null;
+    }
+
+    final ({String path, String md5}) staged;
+    final String? stagedConfigPath;
+    try {
+      final scriptTask = downloadScript(
+        url,
+        tmpScriptFile,
+        knownExpectedMd5: expectedScriptMd5,
+        skipMd5Fetch: expectedScriptMd5 != null || skipConfigMd5Fetch,
+      );
+      final configTask = fetchConfigStage();
+      staged = await scriptTask;
+      stagedConfigPath = await configTask;
     } catch (_) {
       if (await tmpScriptFile.exists()) await tmpScriptFile.delete();
       if (await tmpConfigFile.exists()) await tmpConfigFile.delete();
@@ -425,14 +482,20 @@ class SubscriptionInstaller {
   }
 
   /// OBSERVED: a config that cannot be downloaded is not an error ("index.config.js 下载失败（将以空 config 启动）").
-  Future<String?> _downloadConfig(Uri uri, File file, Future<bool> Function()? confirmMismatch) async {
+  Future<String?> _downloadConfig(
+    Uri uri,
+    File file,
+    Future<bool> Function()? confirmMismatch, {
+    String? knownMd5,
+    bool skipMd5Fetch = false,
+  }) async {
     final List<int> bytes;
     try {
       bytes = await _bytes(uri);
     } on DioException {
       return null;
     }
-    final expected = await _fetchMd5(uri.replace(path: '${uri.path}.md5'), required: false);
+    final expected = skipMd5Fetch ? knownMd5 : await _fetchMd5(uri.replace(path: '${uri.path}.md5'), required: false);
     if (expected != null && expected != md5.convert(bytes).toString()) {
       if (confirmMismatch != null && !await confirmMismatch()) return null;
     }
@@ -447,10 +510,49 @@ class SubscriptionInstaller {
     final url = sub.indexJsUrl;
     if (url == null) return null;
     try {
-      return await _fetchMd5(ScriptUrls.parse(url).md5, required: false).timeout(const Duration(seconds: 8));
+      return await _fetchMd5(ScriptUrls.parse(url).md5, required: false).timeout(const Duration(seconds: 6));
     } catch (_) {
       return null;
     }
+  }
+
+  /// Fetches script `.md5` and companion `index.config.js.md5` concurrently in a single round-trip. Unlike [remoteMd5],
+  /// connection/auth/server errors are NOT swallowed on production instances, preventing a double timeout into [install].
+  Future<({String? scriptMd5, String? configMd5, bool probed})> probeRemoteMd5s(Subscription sub) async {
+    if (runtimeType != SubscriptionInstaller) {
+      return (scriptMd5: await remoteMd5(sub), configMd5: null, probed: false);
+    }
+    final url = sub.indexJsUrl;
+    if (url == null) return (scriptMd5: null, configMd5: null, probed: true);
+    final urls = ScriptUrls.parse(url);
+    final cfgMd5Uri = (sub.configUrl == null && urls.config != null)
+        ? urls.config!.replace(path: '${urls.config!.path}.md5')
+        : null;
+    final cfgTask = cfgMd5Uri == null
+        ? Future<String?>.value(null)
+        : _fetchMd5(cfgMd5Uri, required: false).timeout(const Duration(seconds: 6)).catchError((Object _) => null);
+    final String? scriptMd5;
+    try {
+      scriptMd5 = await _fetchMd5ForRefresh(urls.md5, required: urls.md5Given).timeout(const Duration(seconds: 6));
+    } catch (_) {
+      unawaited(cfgTask);
+      rethrow;
+    }
+    final configMd5 = await cfgTask;
+    return (scriptMd5: scriptMd5, configMd5: configMd5, probed: true);
+  }
+
+  Future<String?> _fetchMd5ForRefresh(Uri uri, {required bool required}) async {
+    final String body;
+    try {
+      body = utf8.decode(await _bytes(uri), allowMalformed: true);
+    } on DioException catch (e) {
+      if (!required && e.response?.statusCode == HttpStatus.notFound) return null;
+      rethrow;
+    }
+    final match = _md5Pattern.firstMatch(body);
+    if (match == null && required) throw StateError('no 32-hex md5 found at ${redactUrl(uri)}');
+    return match?.group(0)!.toLowerCase();
   }
 
   /// Verifies a cloud CatPaw endpoint responds to `/config` during manual refresh.
@@ -462,11 +564,20 @@ class SubscriptionInstaller {
 
   /// Re-downloads `index.config.js` (or [Subscription.configUrl]) when `index.js` MD5 did not change; returns true if
   /// the config file on disk changed.
-  Future<bool> refreshConfig(Subscription sub, {Future<bool> Function()? confirmConfigMismatch}) async {
+  Future<bool> refreshConfig(
+    Subscription sub, {
+    String? knownConfigMd5,
+    bool skipConfigMd5Fetch = false,
+    Future<bool> Function()? confirmConfigMismatch,
+  }) async {
     final url = sub.indexJsUrl;
     if (url == null || await installedScript(sub) == null) return false;
     final dir = await _dir(sub);
     final configFile = File(p.join(dir.path, 'config.js'));
+    if (sub.configUrl == null && knownConfigMd5 != null && await configFile.exists()) {
+      final localMd5 = md5.convert(await configFile.readAsBytes()).toString();
+      if (localMd5 == knownConfigMd5) return false;
+    }
     final tmpConfigFile = File(p.join(dir.path, 'config.js.tmp'));
     try {
       String? stagedPath;
@@ -476,7 +587,13 @@ class SubscriptionInstaller {
         await tmpConfigFile.writeAsString('module.exports = $cfg;', flush: true);
         stagedPath = tmpConfigFile.path;
       } else if (ScriptUrls.parse(url).config case final configUri?) {
-        stagedPath = await _downloadConfig(configUri, tmpConfigFile, confirmConfigMismatch);
+        stagedPath = await _downloadConfig(
+          configUri,
+          tmpConfigFile,
+          confirmConfigMismatch,
+          knownMd5: knownConfigMd5,
+          skipMd5Fetch: skipConfigMd5Fetch,
+        );
       }
       if (stagedPath == null) return false;
       final nextBytes = await tmpConfigFile.readAsBytes();

@@ -147,16 +147,26 @@ class _SubscriptionsScreenState extends ConsumerState<SubscriptionsScreen> {
   Future<void> _refreshAll(List<Subscription> list) async {
     final l = context.l10n;
     final container = ProviderScope.containerOf(context, listen: false);
-    setState(() => _refreshingAll = true);
+    final targets = list.where((s) => s.indexJsUrl != null || s.cloudUrl != null).toList();
+    if (targets.isEmpty) {
+      showToast(l.subscriptionAllUpToDate);
+      return;
+    }
+    setState(() {
+      _refreshingAll = true;
+      _refreshing.addAll(targets.map((s) => s.key));
+    });
     showToast(l.subscriptionChecking);
     final service = ref.read(subscriptionServiceProvider);
     final active = effectiveActiveKey(list, ref.read(activeSubscriptionKeyProvider).valueOrNull);
     var updated = 0;
+    var succeeded = 0;
     Object? failure;
-    for (final s in list.where((s) => s.indexJsUrl != null || s.cloudUrl != null)) {
+    await Future.wait(targets.map((s) async {
       try {
         final res =
             await service.refresh(s, confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey));
+        succeeded++;
         if (res != null) {
           updated++;
           if (s.key == active) refreshActiveSubscriptionRuntime(ref);
@@ -165,13 +175,18 @@ class _SubscriptionsScreenState extends ConsumerState<SubscriptionsScreen> {
         }
       } catch (e) {
         failure ??= e;
+      } finally {
+        ref.invalidate(subscriptionsProvider);
+        if (mounted) setState(() => _refreshing.remove(s.key));
       }
-    }
-    ref.invalidate(subscriptionsProvider);
+    }));
     if (!mounted) return;
     setState(() => _refreshingAll = false);
-    if (failure != null) {
-      showToast(l.subscriptionCheckFailed(describeLoadError(failure, l)));
+    if (failure != null && succeeded == 0) {
+      showToast(l.subscriptionCheckFailed(describeLoadError(failure!, l)));
+    } else if (failure != null) {
+      final okMsg = updated == 0 ? l.subscriptionAllUpToDate : l.subscriptionUpdatedCount(updated);
+      showToast('$okMsg（部分源失败：${describeLoadError(failure!, l)}）');
     } else {
       showToast(updated == 0 ? l.subscriptionAllUpToDate : l.subscriptionUpdatedCount(updated));
     }

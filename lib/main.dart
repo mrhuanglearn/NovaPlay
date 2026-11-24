@@ -45,6 +45,7 @@ Future<void> main() async {
   ]);
   runApp(UncontrolledProviderScope(container: container, child: const UzvApp()));
   unawaited(_startupWebDavSync(container));
+  unawaited(runStartupSubscriptionAutoUpdate(container));
 }
 
 /// 启用同步 (WebDAV settings): sync the chosen data once per app start. Failures are shown, never thrown.
@@ -75,6 +76,8 @@ class UzvApp extends ConsumerStatefulWidget {
 }
 
 class _UzvAppState extends ConsumerState<UzvApp> with WidgetsBindingObserver {
+  DateTime? _backgroundedAt;
+
   @override
   void initState() {
     super.initState();
@@ -89,8 +92,19 @@ class _UzvAppState extends ConsumerState<UzvApp> with WidgetsBindingObserver {
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    if (state == AppLifecycleState.resumed) {
+    if (state == AppLifecycleState.paused || state == AppLifecycleState.hidden) {
+      if (ref.read(activePlayerSessionProvider) == null) {
+        _backgroundedAt ??= DateTime.now();
+      }
+    } else if (state == AppLifecycleState.resumed) {
+      final bgAt = _backgroundedAt;
+      _backgroundedAt = null;
       unawaited(ref.read(catpawSupervisorProvider).onAppResumed());
+      if (bgAt != null &&
+          DateTime.now().difference(bgAt) >= const Duration(seconds: 60) &&
+          ref.read(activePlayerSessionProvider) == null) {
+        unawaited(runStartupSubscriptionAutoUpdate(ProviderScope.containerOf(context, listen: false)));
+      }
     }
   }
 

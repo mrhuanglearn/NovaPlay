@@ -1289,7 +1289,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
       self.delegate?.kernelDidFail(message: msg, code: -1001)
     }
     vlcOpenWatchdog = watchdog
-    DispatchQueue.main.asyncAfter(deadline: .now() + 10.0, execute: watchdog)
+    DispatchQueue.main.asyncAfter(deadline: .now() + 15.0, execute: watchdog)
   }
 
   private func sampleVlcMetrics() {
@@ -1397,7 +1397,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     let rootFailed = IosStreamProxy.shared.hasRootUpstreamFailure(for: activeLoad?.proxyToken)
 
     if !rootFailed, let ctx = activeLoad, ctx.generation == loadGeneration, !ctx.cleanUrl.isFileURL {
-      if !mpvLoadedViaProxy, !mpvRetriedViaProxy, let proxied = ctx.proxiedUrl {
+      if !mpvLoadedViaProxy, !mpvRetriedViaProxy, !Self.isLoopbackHost(ctx.cleanUrl), let proxied = ctx.proxiedUrl {
         playerUsbLog.notice("[NovaPlay][Player] MPV direct open failed -> retrying via IosStreamProxy")
         mpvRetriedViaProxy = true
         let resumeAt = max(ctx.startMs, positionMs)

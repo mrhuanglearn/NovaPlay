@@ -111,10 +111,34 @@ class ExoKernel(private val context: Context) : PlayerKernel {
     private var preferredAudioLanguage: String? = null
     private var chosenAudioLabel: String? = null
     private var audioAutoApplied = false
+    private var reportedUnsupportedTrack = false
+
+    private fun canRetryAsExtensionlessHls(rawUrl: String): Boolean {
+        val clean = rawUrl.substringBefore('|').substringBefore('#').substringBefore('?').lowercase()
+        if (clean.contains("/stream") || clean.contains("/uzv-iso/") || clean.contains("/down/")) return false
+        val ext = clean.substringAfterLast('/', "").substringAfterLast('.', "")
+        return ext.isEmpty() || ext in setOf("php", "asp", "aspx", "jsp", "txt")
+    }
 
     init {
         player.addListener(object : Player.Listener {
             override fun onTracksChanged(tracks: Tracks) {
+                if (!reportedUnsupportedTrack && tracks.groups.isNotEmpty()) {
+                    val videoGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_VIDEO }
+                    val audioGroups = tracks.groups.filter { it.type == C.TRACK_TYPE_AUDIO }
+                    if (videoGroups.isNotEmpty() && videoGroups.none { it.isSupported }) {
+                        reportedUnsupportedTrack = true
+                        player.stop()
+                        listener?.onError("ExoPlayer 视频编码不支持硬解", PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED)
+                        return
+                    }
+                    if (audioGroups.isNotEmpty() && audioGroups.none { it.isSupported }) {
+                        reportedUnsupportedTrack = true
+                        player.stop()
+                        listener?.onError("ExoPlayer 音轨编码不支持系统解码", PlaybackException.ERROR_CODE_DECODING_FORMAT_UNSUPPORTED)
+                        return
+                    }
+                }
                 applyDefaultTextOnce()
                 applyPreferredAudioOnce()
             }
@@ -132,8 +156,8 @@ class ExoKernel(private val context: Context) : PlayerKernel {
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                // Exo picks HLS only from a .m3u8 path; an extension-less playlist lands in the progressive extractor
-                if (error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED && !forceHls) {
+                // Exo picks HLS only from a .m3u8 path; only retry extension-less non-binary URLs so multi-GB raw streams never hang HlsPlaylistParser
+                if (error.errorCode == PlaybackException.ERROR_CODE_PARSING_CONTAINER_UNSUPPORTED && !forceHls && canRetryAsExtensionlessHls(currentUrl)) {
                     val retry = lastLoadArgs
                     if (retry != null) {
                         forceHls = true
@@ -200,6 +224,7 @@ class ExoKernel(private val context: Context) : PlayerKernel {
             .build()
         textAutoApplied = false
         audioAutoApplied = false
+        reportedUnsupportedTrack = false
         currentUrl = url
 
         val http = DefaultHttpDataSource.Factory()

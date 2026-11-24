@@ -21,6 +21,7 @@ const { WorkerMsg, LoaderMsg, SUBSCRIPTION_DANMU_PORT } = require('./protocol');
 const { createPolicy, installFsPolicy } = require('./sandbox');
 const { installJitlessPolyfill } = require('./jitless_polyfill');
 const { installLegacyPanGlobals } = require('./legacy_pan_patch');
+const { handleBlurayIsoHttp } = require('./bluray_iso_proxy');
 
 const {
   name,
@@ -375,6 +376,9 @@ globalThis.catServerFactory = (handler) => {
     try {
       if (inReq && typeof inReq.url === 'string' && inReq.url.startsWith('/woniu-auth') && typeof globalThis.__uzvHandleWoniuAuthHttp === 'function') {
         return globalThis.__uzvHandleWoniuAuthHttp(inReq, outRes);
+      }
+      if (handleBlurayIsoHttp(inReq, outRes, handler, port || 2333)) {
+        return;
       }
       if (inReq && typeof inReq.url === 'string' && inReq.url.startsWith('/proxy/img?') && inReq.url.includes('hp=1')) {
         const q = new URL(inReq.url, 'http://127.0.0.1');

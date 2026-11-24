@@ -3,8 +3,11 @@ import 'dart:io';
 
 import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:uzv_reimpl/app/providers.dart';
 import 'package:uzv_reimpl/core/json_store.dart';
+import 'package:uzv_reimpl/features/catpaw/spider_api.dart';
 import 'package:uzv_reimpl/features/subscription/subscription.dart';
 
 /// The layout the original documents (`https://user:pass@host/index.js.md5`): the URL users paste is the checksum
@@ -13,14 +16,17 @@ void main() {
   late HttpServer server;
   late Directory dir;
   late Map<String, List<int>> files;
+  late List<String> requestedPaths;
   String? requiredAuth;
 
   setUp(() async {
     dir = Directory.systemTemp.createTempSync('uzv_sub');
     files = {};
+    requestedPaths = [];
     requiredAuth = null;
     server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
     server.listen((req) async {
+      requestedPaths.add(req.uri.path);
       final auth = requiredAuth;
       if (auth != null && req.headers.value('authorization') != 'Basic ${base64Encode(utf8.encode(auth))}') {
         req.response.statusCode = 401;
@@ -190,11 +196,66 @@ void main() {
 
       const v2 = 'module.exports = { start() {}, v: 2 };';
       put('/sub/index.js', v2);
+      requestedPaths.clear();
       clock = clock.add(const Duration(hours: 1));
       final updated = await service.refresh(sub);
       expect(updated!.installedMd5, md5Of(v2));
       expect(updated.updatedAt, clock.millisecondsSinceEpoch);
       expect((await repo.all()).firstWhere((s) => s.key == sub.key).installedMd5, md5Of(v2));
+      expect(
+        requestedPaths.where((p) => p == '/sub/index.js.md5').length,
+        1,
+        reason: 'refresh must not re-fetch index.js.md5 a second time during install',
+      );
+
+      // Up-to-date refresh checks only .md5 sidecars and downloads zero JS files.
+      requestedPaths.clear();
+      expect(await service.refresh(sub), isNull);
+      expect(requestedPaths.toSet(), {'/sub/index.js.md5', '/sub/index.config.js.md5'});
+    });
+
+    test('runStartupSubscriptionAutoUpdate syncs all autoUpdate subscriptions and reloads active runtime on update',
+        () async {
+      put('/a/index.js', script);
+      put('/b/index.js', script);
+      final subA = await service.addNetwork(url: '${base()}/a/index.js.md5', name: 'Active', autoUpdate: true);
+      final subB = await service.addNetwork(url: '${base()}/b/index.js.md5', name: 'Secondary', autoUpdate: true);
+
+      const scriptV2 = 'module.exports = { start() {}, v: "new_active" };';
+      put('/a/index.js', scriptV2);
+      clock = clock.add(const Duration(hours: 2));
+
+      var runtimeBuilds = 0;
+      final container = ProviderContainer(overrides: [
+        subscriptionRepositoryProvider.overrideWithValue(repo),
+        subscriptionInstallerProvider.overrideWithValue(service.installer),
+        subscriptionServiceProvider.overrideWithValue(service),
+        settingsStoreProvider.overrideWithValue(JsonStore('settings.json', baseDir: dir)),
+        catpawRuntimeProvider.overrideWith((ref) async {
+          runtimeBuilds++;
+          final subs = await ref.read(subscriptionsProvider.future);
+          return SpiderRuntime(
+            subscription: subs.first,
+            api: SpiderApi(2333, baseUrl: 'http://127.0.0.1:2333'),
+            sites: const [],
+          );
+        }),
+      ]);
+      addTearDown(container.dispose);
+
+      await container.read(catpawRuntimeProvider.future);
+      expect(runtimeBuilds, 1);
+
+      await runStartupSubscriptionAutoUpdate(container);
+      await container.read(catpawRuntimeProvider.future);
+
+      final all = await repo.all();
+      final savedA = all.firstWhere((s) => s.key == subA.key);
+      final savedB = all.firstWhere((s) => s.key == subB.key);
+      expect(savedA.installedMd5, md5Of(scriptV2));
+      expect(savedA.updatedAt, clock.millisecondsSinceEpoch, reason: 'active autoUpdate stamped and updated');
+      expect(savedB.updatedAt, clock.millisecondsSinceEpoch, reason: 'non-active autoUpdate also checked and stamped');
+      expect(runtimeBuilds, greaterThanOrEqualTo(2), reason: 'active runtime reloaded onto newly downloaded script');
     });
 
     test('a local zip needs both index.js and index.config.js', () async {

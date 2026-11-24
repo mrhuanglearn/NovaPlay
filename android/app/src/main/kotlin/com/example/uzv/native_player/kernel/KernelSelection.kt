@@ -29,4 +29,16 @@ object KernelSelection {
         Kernel.MPV -> listOf(Kernel.EXO, Kernel.MDK)
         Kernel.MDK -> listOf(Kernel.MPV, Kernel.EXO)
     }
+
+    private val ffmpegOnlyExtensions = setOf(
+        "m2ts", "mts", "iso", "vob", "rmvb", "rm", "wmv", "asf", "divx", "mpg", "mpeg",
+    )
+
+    /** True when [rawUrl] carries a Blu-ray/DVD/legacy container extension that ExoPlayer cannot demux or decode cleanly. */
+    fun requiresFfmpegKernel(rawUrl: String?): Boolean {
+        if (rawUrl.isNullOrBlank()) return false
+        val pathPart = rawUrl.substringBefore('|').substringBefore('#').substringBefore('?').trim()
+        val ext = pathPart.substringAfterLast('/', "").substringAfterLast('.', "").lowercase()
+        return ext in ffmpegOnlyExtensions
+    }
 }

@@ -296,16 +296,21 @@ class _EditSubscriptionScreenState extends ConsumerState<EditSubscriptionScreen>
     setState(() => _busy = true);
     try {
       final subsBefore = await ref.read(subscriptionRepositoryProvider).all();
+      final current = subsBefore.where((x) => x.key == s.key).firstOrNull ?? s;
       final wasActive = effectiveActiveKey(subsBefore, ref.read(activeSubscriptionKeyProvider).valueOrNull) == s.key;
+      final urlChanged = !current.local && _url.text.trim() != subscriptionDisplayUrl(current).trim();
+      final missingInstall = !current.local &&
+          current.cloudUrl == null &&
+          await ref.read(subscriptionInstallerProvider).installedScript(current) == null;
       await ref.read(subscriptionServiceProvider).updateSubscription(
-            s,
-            url: s.local ? null : _url.text,
+            current,
+            url: current.local ? null : _url.text,
             name: _name.text,
-            forceRefreshScript: wasActive && !s.local && s.cloudUrl == null,
+            forceRefreshScript: missingInstall,
             confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey),
           );
       ref.invalidate(subscriptionsProvider);
-      if (wasActive) {
+      if (wasActive && (urlChanged || missingInstall)) {
         refreshActiveSubscriptionRuntime(ref, resetCategory: true);
       }
       if (!mounted) return;
