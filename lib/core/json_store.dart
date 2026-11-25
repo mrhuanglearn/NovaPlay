@@ -151,7 +151,8 @@ class JsonStore {
     final targetEpoch = ++core.writeEpoch;
     core.pendingDiskJson = snap;
 
-    core.diskQueue = core.diskQueue.then((_) async {
+    // catchError: one failed write (e.g. disk full) must not fail every later write chained on the same queue.
+    core.diskQueue = core.diskQueue.catchError((Object _) {}).then((_) async {
       if (core.flushedEpoch >= targetEpoch) return;
       final toWrite = core.pendingDiskJson;
       final epochNow = core.writeEpoch;

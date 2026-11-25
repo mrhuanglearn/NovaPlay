@@ -300,7 +300,6 @@ Future<void> _autoUpdateSubscription(
           confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey),
         );
     if (tracker.disposed || cancelToken?.isCancelled == true) return;
-    tracker.lastAutoCheckedMs[sub.key] = DateTime.now().millisecondsSinceEpoch;
     container.invalidate(subscriptionsProvider);
     if (updated != null && reloadRuntimeOnUpdate) {
       final subs = await container.read(subscriptionsProvider.future);
@@ -319,6 +318,7 @@ Future<void> _autoUpdateSubscription(
   } catch (e) {
     debugPrint('background autoUpdate failed for ${sub.key}: $e');
   } finally {
+    if (!tracker.disposed) tracker.lastAutoCheckedMs[sub.key] = DateTime.now().millisecondsSinceEpoch;
     tracker.checkingAutoUpdate.remove(sub.key);
   }
 }

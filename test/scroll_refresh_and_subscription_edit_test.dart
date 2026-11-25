@@ -37,9 +37,10 @@ class _MemoryStore extends JsonStore {
 }
 
 class _MemorySubscriptionInstaller extends SubscriptionInstaller {
-  _MemorySubscriptionInstaller(this._remoteScripts);
+  _MemorySubscriptionInstaller(this._remoteScripts, {this.installGate});
 
   final Map<String, String> _remoteScripts;
+  final Future<void>? installGate;
   final Map<String, InstalledScript> _installed = {};
 
   static String md5Of(String s) => md5.convert(utf8.encode(s)).toString();
@@ -49,6 +50,7 @@ class _MemorySubscriptionInstaller extends SubscriptionInstaller {
 
   @override
   Future<InstalledScript> install(Subscription sub, {Future<bool> Function()? confirmConfigMismatch}) async {
+    if (installGate != null) await installGate;
     final url = sub.indexJsUrl;
     final body = url == null ? null : _remoteScripts[url];
     if (body == null) throw StateError('404 for $url');
@@ -496,6 +498,89 @@ void main() {
       await container.read(catpawRuntimeProvider.future);
       expect(latestRuntime, isNull);
       expect(runtimeBuilds, greaterThanOrEqualTo(2));
+    });
+
+    testWidgets('leaving AddSubscriptionScreen mid-download still refreshes list and activates on finish',
+        (tester) async {
+      const slowUrl = 'http://127.0.0.1:3006/slow/index.js.md5';
+      final gate = Completer<void>();
+      final repo = SubscriptionRepository(store: _MemoryStore('subscriptions.json'));
+      final installer = _MemorySubscriptionInstaller({slowUrl: 'module.exports = {};'}, installGate: gate.future);
+      final service = SubscriptionService(repository: repo, installer: installer);
+      final first = await service.addCloud(url: 'http://127.0.0.1:9001', name: 'Existing');
+
+      String? activeRuntimeKey;
+      final container = ProviderContainer(overrides: [
+        settingsStoreProvider.overrideWithValue(_MemoryStore('settings.json', <String, dynamic>{
+          'activeSubscription': first.key,
+        })),
+        initialAppPreferencesProvider.overrideWithValue(const AppPreferences()),
+        subscriptionRepositoryProvider.overrideWithValue(repo),
+        subscriptionInstallerProvider.overrideWithValue(installer),
+        subscriptionServiceProvider.overrideWithValue(service),
+        nodeBridgeProvider.overrideWithValue(_NoopNodeBridge()),
+        catpawRuntimeProvider.overrideWith((ref) async {
+          final subs = await ref.watch(subscriptionsProvider.future);
+          final key = await ref.watch(activeSubscriptionKeyProvider.future);
+          final sub = subs.firstWhere((s) => s.key == key, orElse: () => subs.first);
+          activeRuntimeKey = sub.key;
+          return SpiderRuntime(
+            subscription: sub,
+            api: SpiderApi(9001, baseUrl: 'http://127.0.0.1:9001'),
+            sites: const [],
+          );
+        }),
+      ]);
+      addTearDown(container.dispose);
+
+      final router = GoRouter(
+        initialLocation: '/subscriptions',
+        routes: [
+          GoRoute(path: '/subscriptions', builder: (_, __) => const SubscriptionsScreen()),
+          GoRoute(path: '/subscriptions/add', builder: (_, __) => const AddSubscriptionScreen()),
+        ],
+      );
+      addTearDown(router.dispose);
+
+      await tester.pumpWidget(UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp.router(
+          locale: const Locale('zh'),
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          theme: buildAppTheme(Brightness.dark),
+          scaffoldMessengerKey: rootMessengerKey,
+          routerConfig: router,
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.byIcon(Icons.add));
+      await tester.pumpAndSettle();
+      final fields = find.byType(TextField);
+      await tester.enterText(fields.at(0), slowUrl);
+      await tester.enterText(fields.at(1), 'SlowAdded');
+      final installBtn = find.text('安装不受信任的订阅');
+      await tester.ensureVisible(installBtn);
+      await tester.tap(installBtn);
+      await tester.pump();
+
+      // Leave the add page before the download finishes (cannot pumpAndSettle while button CircularProgressIndicator spins).
+      Navigator.of(tester.element(find.byType(AddSubscriptionScreen))).pop();
+      for (var i = 0; i < 6; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect(find.byType(AddSubscriptionScreen), findsNothing);
+
+      // Finish the background download: list refreshes and active subscription switches without unmounted-ref error.
+      gate.complete();
+      await tester.pumpAndSettle();
+
+      expect(find.text('SlowAdded'), findsOneWidget);
+      final added = (await repo.all()).firstWhere((s) => s.name == 'SlowAdded');
+      expect(await container.read(activeSubscriptionKeyProvider.future), added.key);
+      await container.read(catpawRuntimeProvider.future);
+      expect(activeRuntimeKey, added.key);
     });
   });
 }

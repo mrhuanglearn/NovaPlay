@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
@@ -18,6 +19,26 @@ import '../l10n/l10n.dart';
 import 'widgets.dart';
 
 final _mediaUrl = RegExp(r'\.(m3u8|mp4|mpd|flv)(\?|$)', caseSensitive: false);
+
+/// CatPaw's `/website` 网盘凭证 page re-renders its horizontal drive rail on every pick, which resets the rail to the
+/// start and hides the picked pill. Keep the active pill in view (horizontal only, so the page itself never jumps).
+/// shortcut: works around the page (CatPaw websiteHtml.ts renderLogin), drop once the page scrolls the rail itself.
+final _keepDrivePillVisible = UserScript(
+  injectionTime: UserScriptInjectionTime.AT_DOCUMENT_END,
+  source: r'''
+(function () {
+  if (!/\/website\/?$/.test(location.pathname)) return;
+  var last = null;
+  new MutationObserver(function () {
+    var pill = document.querySelector('.drive-rail .drive-pill.active');
+    if (!pill || pill === last) return;
+    last = pill;
+    var rail = pill.parentElement, r = rail.getBoundingClientRect(), p = pill.getBoundingClientRect();
+    rail.scrollLeft += p.left - r.left - (r.width - p.width) / 2;
+  }).observe(document.documentElement, { childList: true, subtree: true });
+})();
+''',
+);
 
 /// In-app browser. With [sniff] on (`/sniffer/web`) it collects the media streams the page requests and lets the user
 /// play them; without it (`/website`, opened by a script's `openInternalWebview` or 403 site verification) it is a
@@ -395,6 +416,7 @@ class _WebScreenState extends ConsumerState<WebScreen> {
                   child: InAppWebView(
                     initialUrlRequest: URLRequest(url: WebUri(_current)),
                     initialSettings: settings,
+                    initialUserScripts: UnmodifiableListView([_keepDrivePillVisible]),
                     onWebViewCreated: (c) => _web = c,
                     onTitleChanged: (c, title) => setState(() => _title = title),
                     onLoadStop: (c, uri) {

@@ -30,7 +30,7 @@ android {
         // Native libraries that must not live in the repository (libnode.so, libmpv.so and its ffmpeg libraries): point
         // UZV_EXTRA_JNILIBS at a directory laid out like jniLibs (<dir>/<abi>/lib*.so) when building.
         System.getenv("UZV_EXTRA_JNILIBS")?.takeIf { it.isNotBlank() }?.let { dir ->
-            getByName("main").jniLibs.srcDir(dir)
+            getByName("main").jniLibs.setSrcDirs(listOf(dir))
         }
     }
 

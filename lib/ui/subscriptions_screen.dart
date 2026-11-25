@@ -63,12 +63,15 @@ String _chipLabel(AppLocalizations l, Subscription s) =>
 IconData _kindIcon(Subscription s) =>
     s.cloudUrl != null ? Icons.cloud_outlined : (s.local ? Icons.folder_zip_outlined : Icons.rss_feed);
 
-void refreshActiveSubscriptionRuntime(WidgetRef ref, {bool resetCategory = false}) {
-  if (resetCategory) ref.read(selectedTypeIdProvider.notifier).select(null);
-  ref.invalidate(catpawRuntimeProvider);
-  ref.invalidate(videoFeedProvider);
-  ref.read(catpawRuntimeProvider);
+void refreshActiveRuntimeIn(ProviderContainer container, {bool resetCategory = false}) {
+  if (resetCategory) container.read(selectedTypeIdProvider.notifier).select(null);
+  container.invalidate(catpawRuntimeProvider);
+  container.invalidate(videoFeedProvider);
+  container.read(catpawRuntimeProvider);
 }
+
+void refreshActiveSubscriptionRuntime(WidgetRef ref, {bool resetCategory = false}) =>
+    refreshActiveRuntimeIn(ProviderScope.containerOf(ref.context, listen: false), resetCategory: resetCategory);
 
 Future<bool> deleteSubscriptionsAndRefresh(
   BuildContext context,
@@ -78,26 +81,27 @@ Future<bool> deleteSubscriptionsAndRefresh(
   required String confirmMessage,
 }) async {
   if (doomed.isEmpty) return false;
+  final container = ProviderScope.containerOf(context, listen: false);
   if (!await confirmSubscriptionDelete(context, confirmMessage)) return false;
-  final savedSelected = ref.read(activeSubscriptionKeyProvider).valueOrNull;
+  final savedSelected = container.read(activeSubscriptionKeyProvider).valueOrNull;
   final currentActive = effectiveActiveKey(all, savedSelected);
   final doomedKeys = {for (final s in doomed) s.key};
   final deletedActive = currentActive != null && doomedKeys.contains(currentActive);
   for (final s in doomed) {
     try {
-      await ref.read(catpawClientProvider).uninstall(s.key);
+      await container.read(catpawClientProvider).uninstall(s.key);
     } catch (e) {
       debugPrint('uninstall catpaw ${s.key} ignored: $e');
     }
   }
-  await ref.read(subscriptionServiceProvider).removeAll(doomed);
-  final remaining = await ref.read(subscriptionRepositoryProvider).all();
+  await container.read(subscriptionServiceProvider).removeAll(doomed);
+  final remaining = await container.read(subscriptionRepositoryProvider).all();
   if (deletedActive || (savedSelected != null && doomedKeys.contains(savedSelected))) {
-    await ref.read(activeSubscriptionKeyProvider.notifier).select(remaining.firstOrNull?.key);
+    await container.read(activeSubscriptionKeyProvider.notifier).select(remaining.firstOrNull?.key);
   }
-  ref.invalidate(subscriptionsProvider);
+  container.invalidate(subscriptionsProvider);
   if (deletedActive) {
-    refreshActiveSubscriptionRuntime(ref, resetCategory: true);
+    refreshActiveRuntimeIn(container, resetCategory: true);
   }
   return true;
 }
@@ -106,18 +110,18 @@ Future<void> _refreshOne(BuildContext context, WidgetRef ref, Subscription s) as
   final l = context.l10n;
   final container = ProviderScope.containerOf(context, listen: false);
   try {
-    final updated = await ref.read(subscriptionServiceProvider).refresh(
+    final updated = await container.read(subscriptionServiceProvider).refresh(
           s,
           confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey),
         );
-    ref.invalidate(subscriptionsProvider);
-    final subs = await ref.read(subscriptionsProvider.future);
-    final active = effectiveActiveKey(subs, ref.read(activeSubscriptionKeyProvider).valueOrNull);
+    container.invalidate(subscriptionsProvider);
+    final subs = await container.read(subscriptionsProvider.future);
+    final active = effectiveActiveKey(subs, container.read(activeSubscriptionKeyProvider).valueOrNull);
     if (updated == null) {
       if (active == s.key) reloadLiveCatalog(container);
       showToast(l.subscriptionUpToDate(s.name));
     } else {
-      if (active == s.key) refreshActiveSubscriptionRuntime(ref);
+      if (active == s.key) refreshActiveRuntimeIn(container);
       showToast(l.subscriptionUpdatedOne);
     }
   } catch (e) {
@@ -157,8 +161,8 @@ class _SubscriptionsScreenState extends ConsumerState<SubscriptionsScreen> {
       _refreshing.addAll(targets.map((s) => s.key));
     });
     showToast(l.subscriptionChecking);
-    final service = ref.read(subscriptionServiceProvider);
-    final active = effectiveActiveKey(list, ref.read(activeSubscriptionKeyProvider).valueOrNull);
+    final service = container.read(subscriptionServiceProvider);
+    final active = effectiveActiveKey(list, container.read(activeSubscriptionKeyProvider).valueOrNull);
     var updated = 0;
     var succeeded = 0;
     Object? failure;
@@ -169,14 +173,14 @@ class _SubscriptionsScreenState extends ConsumerState<SubscriptionsScreen> {
         succeeded++;
         if (res != null) {
           updated++;
-          if (s.key == active) refreshActiveSubscriptionRuntime(ref);
+          if (s.key == active) refreshActiveRuntimeIn(container);
         } else if (s.key == active) {
           reloadLiveCatalog(container);
         }
       } catch (e) {
         failure ??= e;
       } finally {
-        ref.invalidate(subscriptionsProvider);
+        container.invalidate(subscriptionsProvider);
         if (mounted) setState(() => _refreshing.remove(s.key));
       }
     }));

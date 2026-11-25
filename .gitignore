@@ -51,5 +51,8 @@ app.*.map.json
 # Widget Preview related
 .widget_preview/
 
+# Local Android prebuilt native libraries (libnode.so, libmpv.so, ffmpeg, etc.)
+/android/app/src/main/jniLibs/
+
 # Downloaded iOS binary frameworks (fetched automatically during CI / package_ipa.sh)
 packages/novaplay_ios/ios/Frameworks/NodeMobile.xcframework/

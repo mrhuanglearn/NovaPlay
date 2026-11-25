@@ -5,6 +5,7 @@ import 'dart:io';
 import 'package:archive/archive.dart';
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
 
@@ -259,7 +260,12 @@ class SubscriptionService {
     CancelToken? cancelToken,
   }) async {
     if (sub.cloudUrl != null) {
-      await installer.probeCloud(sub.cloudUrl!, cancelToken: cancelToken);
+      try {
+        await installer.probeCloud(sub.cloudUrl!, cancelToken: cancelToken);
+      } on DioException {
+        if (background) return null;
+        rethrow;
+      }
       if (cancelToken?.isCancelled == true) return null;
       await repository.upsert(sub.copyWith(updatedAt: _now().millisecondsSinceEpoch));
       return null;
@@ -267,7 +273,13 @@ class SubscriptionService {
     final url = sub.indexJsUrl;
     if (url == null) return null;
     final installed = await installer.installedScript(sub);
-    final probed = await installer.probeRemoteMd5s(sub, cancelToken: cancelToken);
+    final ({String? scriptMd5, String? configMd5, bool probed}) probed;
+    try {
+      probed = await installer.probeRemoteMd5s(sub, cancelToken: cancelToken);
+    } on DioException {
+      if (background && installed != null) return null;
+      rethrow;
+    }
     if (cancelToken?.isCancelled == true) return null;
     if (background && probed.scriptMd5 == null && ScriptUrls.parse(url).md5Given) {
       // Offline or unreachable checksum during silent startup autoUpdate: keep cached script untouched.
@@ -286,16 +298,22 @@ class SubscriptionService {
       await repository.upsert(touched);
       return configChanged ? touched : null;
     }
-    final fresh = installer.runtimeType == SubscriptionInstaller
-        ? await installer.installWithKnownMd5(
-            sub,
-            expectedScriptMd5: probed.probed ? probed.scriptMd5 : null,
-            expectedConfigMd5: probed.probed ? probed.configMd5 : null,
-            skipConfigMd5Fetch: probed.probed,
-            confirmConfigMismatch: confirmConfigMismatch,
-            cancelToken: cancelToken,
-          )
-        : await installer.install(sub, confirmConfigMismatch: confirmConfigMismatch);
+    final InstalledScript fresh;
+    try {
+      fresh = installer.runtimeType == SubscriptionInstaller
+          ? await installer.installWithKnownMd5(
+              sub,
+              expectedScriptMd5: probed.probed ? probed.scriptMd5 : null,
+              expectedConfigMd5: probed.probed ? probed.configMd5 : null,
+              skipConfigMd5Fetch: probed.probed,
+              confirmConfigMismatch: confirmConfigMismatch,
+              cancelToken: cancelToken,
+            )
+          : await installer.install(sub, confirmConfigMismatch: confirmConfigMismatch);
+    } on DioException {
+      if (background && installed != null) return null;
+      rethrow;
+    }
     if (cancelToken?.isCancelled == true) return null;
     final updated = sub.copyWith(installedMd5: fresh.md5, updatedAt: _now().millisecondsSinceEpoch);
     await repository.upsert(updated);
@@ -366,6 +384,11 @@ class SubscriptionInstaller {
 
   Duration? get dioConnectTimeout => _dio.options.connectTimeout;
 
+  /// Bytes of the script download in flight (null when idle). A slow link (seen 2026-11-25: ~3 KB/s to an overseas
+  /// VPS for a 2 MB index.js) never trips the idle receiveTimeout, so the install button shows this instead of a
+  /// spinner that looks hung.
+  final downloadProgress = ValueNotifier<({int received, int total})?>(null);
+
   /// Written last by [install]; an install without it (interrupted, or from before 2026-11-09) is not reused.
   static const _markerName = 'installed.json';
   static const _format = 1;
@@ -407,7 +430,13 @@ class SubscriptionInstaller {
     final expected = skipMd5Fetch
         ? knownExpectedMd5
         : await _fetchMd5(urls.md5, required: urls.md5Given, cancelToken: cancelToken);
-    final bytes = await _bytes(urls.script, cancelToken: cancelToken);
+    final List<int> bytes;
+    try {
+      bytes = await _bytes(urls.script,
+          cancelToken: cancelToken, onReceiveProgress: (r, t) => downloadProgress.value = (received: r, total: t));
+    } finally {
+      downloadProgress.value = null;
+    }
     final digest = md5.convert(bytes).toString();
     if (expected != null && expected != digest) {
       throw StateError('md5 mismatch for ${redactUrl(urls.script)} (expected $expected, got $digest)');
@@ -691,7 +720,7 @@ class SubscriptionInstaller {
     }
   }
 
-  Future<List<int>> _bytes(Uri uri, {CancelToken? cancelToken}) async {
+  Future<List<int>> _bytes(Uri uri, {CancelToken? cancelToken, ProgressCallback? onReceiveProgress}) async {
     final headers = <String, String>{
       if (uri.userInfo.isNotEmpty)
         'Authorization': 'Basic ${base64Encode(utf8.encode(Uri.decodeFull(uri.userInfo)))}',
@@ -700,6 +729,7 @@ class SubscriptionInstaller {
     return (await _dio.getUri<List<int>>(
       cleanUri,
       cancelToken: cancelToken,
+      onReceiveProgress: onReceiveProgress,
       options: Options(responseType: ResponseType.bytes, headers: headers.isEmpty ? null : headers),
     ))
         .data!;

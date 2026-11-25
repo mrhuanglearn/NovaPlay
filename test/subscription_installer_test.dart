@@ -64,6 +64,16 @@ void main() {
     expect(r.md5, md5Of(script));
   });
 
+  test('script download progress is published while downloading and cleared after', () async {
+    put('/sub/index.js', script);
+    final installer = SubscriptionInstaller(root: dir);
+    final seen = <({int received, int total})?>[];
+    installer.downloadProgress.addListener(() => seen.add(installer.downloadProgress.value));
+    await installer.install(sub('${base()}/sub/index.js.md5'));
+    expect(seen.whereType<({int received, int total})>().last.received, utf8.encode(script).length);
+    expect(installer.downloadProgress.value, isNull);
+  });
+
   test('credentials in the URL are sent as basic auth and kept out of error messages', () async {
     requiredAuth = 'u:secret';
     put('/sub/index.js', script, md5Text: '0' * 32);
@@ -256,6 +266,40 @@ void main() {
       expect(savedA.updatedAt, clock.millisecondsSinceEpoch, reason: 'active autoUpdate stamped and updated');
       expect(savedB.updatedAt, clock.millisecondsSinceEpoch, reason: 'non-active autoUpdate also checked and stamped');
       expect(runtimeBuilds, greaterThanOrEqualTo(2), reason: 'active runtime reloaded onto newly downloaded script');
+    });
+
+    test('runStartupSubscriptionAutoUpdate silently keeps cached script when an autoUpdate source is unreachable',
+        () async {
+      final tmpServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      tmpServer.listen((req) async {
+        if (req.uri.path == '/dead/index.js.md5') {
+          req.response.write('${md5Of(script)}\n');
+        } else {
+          req.response.write(script);
+        }
+        await req.response.close();
+      });
+      final deadSub = await service.addNetwork(
+        url: 'http://127.0.0.1:${tmpServer.port}/dead/index.js.md5',
+        name: 'USB Tunnel',
+        autoUpdate: true,
+      );
+      final initialUpdatedAt = deadSub.updatedAt;
+      await tmpServer.close(force: true);
+
+      clock = clock.add(const Duration(hours: 1));
+      final container = ProviderContainer(overrides: [
+        subscriptionRepositoryProvider.overrideWithValue(repo),
+        subscriptionInstallerProvider.overrideWithValue(service.installer),
+        subscriptionServiceProvider.overrideWithValue(service),
+        settingsStoreProvider.overrideWithValue(JsonStore('settings_dead.json', baseDir: dir)),
+      ]);
+      addTearDown(container.dispose);
+
+      await runStartupSubscriptionAutoUpdate(container);
+      final saved = (await repo.all()).single;
+      expect(saved.installedMd5, md5Of(script));
+      expect(saved.updatedAt, initialUpdatedAt, reason: 'unreachable background check leaves cached record untouched');
     });
 
     test('iosStartupSubscriptionGateProvider updates before home entry and falls back to local cache on timeout without double refresh',

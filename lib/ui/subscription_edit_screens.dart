@@ -1,3 +1,4 @@
+import 'package:dio/dio.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -15,6 +16,25 @@ import 'subscriptions_screen.dart';
 import 'widgets.dart';
 
 enum _SubscriptionKind { network, local, cloud }
+
+/// A stalled slow link (no data for the installer's receiveTimeout) gets a readable reason instead of Dio's essay.
+String _downloadError(Object e) => e is DioException && e.type == DioExceptionType.receiveTimeout
+    ? '网络过慢，${e.requestOptions.receiveTimeout?.inSeconds ?? 30} 秒内没有收到数据，请检查网络或代理后重试'
+    : '$e';
+
+/// Builds a button with [idle] as its label, or the script download progress while [busy], so a slow link reads as
+/// progress instead of a hung spinner (see [SubscriptionInstaller.downloadProgress]).
+Widget _withDownloadProgress(WidgetRef ref, bool busy, String idle, Widget Function(String label) build) =>
+    ValueListenableBuilder<({int received, int total})?>(
+      valueListenable: ref.read(subscriptionInstallerProvider).downloadProgress,
+      builder: (_, p, __) {
+        if (!busy || p == null) return build(idle);
+        String mb(int b) => (b / 1048576).toStringAsFixed(2);
+        return build(p.total > 0
+            ? '下载中 ${p.received * 100 ~/ p.total}% · ${mb(p.received)}/${mb(p.total)} MB'
+            : '下载中 ${mb(p.received)} MB');
+      },
+    );
 
 /// `/subscriptions/add`. Layout OBSERVED on the original: 网络 / 本地 / 云端 segments, a hint line, a card with the address
 /// (or archive picker) and 名称, 自动更新 (network only), 上锁, then 安装不受信任的订阅 (or 连接云端服务) and 无法添加？.
@@ -49,7 +69,8 @@ class _AddSubscriptionScreenState extends ConsumerState<AddSubscriptionScreen> {
 
   Future<void> _save() async {
     final l = context.l10n;
-    final service = ref.read(subscriptionServiceProvider);
+    final container = ProviderScope.containerOf(context, listen: false);
+    final service = container.read(subscriptionServiceProvider);
     setState(() => _busy = true);
     try {
       final Subscription added;
@@ -71,16 +92,17 @@ class _AddSubscriptionScreenState extends ConsumerState<AddSubscriptionScreen> {
           if (_url.text.trim().isEmpty) return showToast(l.subscriptionUrlRequired);
           added = await service.addCloud(url: _url.text, name: _name.text, locked: _lock);
       }
-      ref.invalidate(subscriptionsProvider);
-      await ref.read(activeSubscriptionKeyProvider.notifier).select(added.key);
-      refreshActiveSubscriptionRuntime(ref, resetCategory: true);
-      if (!mounted) return;
+      // Use container, not ref: if the user left this page during a slow download, ref is unmounted.
+      container.invalidate(subscriptionsProvider);
+      await container.read(activeSubscriptionKeyProvider.notifier).select(added.key);
+      refreshActiveRuntimeIn(container, resetCategory: true);
+      if (!mounted) return showToast(l.subscriptionSwitchedTo(added.name));
       showSuccessHud(context, l.added);
       context.pop();
     } on DuplicateSubscriptionException {
       showToast(l.subscriptionDuplicate);
     } catch (e) {
-      showToast(_kind == _SubscriptionKind.local ? l.subscriptionZipFailed('$e') : l.subscriptionDownloadFailed('$e'));
+      showToast(_kind == _SubscriptionKind.local ? l.subscriptionZipFailed('$e') : l.subscriptionDownloadFailed(_downloadError(e)));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -212,7 +234,7 @@ class _AddSubscriptionScreenState extends ConsumerState<AddSubscriptionScreen> {
                   ),
                   onPressed: _busy ? null : _save,
                   icon: _busy ? spinner : const Icon(Icons.warning_rounded, size: 20),
-                  label: Text(l.subscriptionInstallUntrusted),
+                  label: _withDownloadProgress(ref, _busy, l.subscriptionInstallUntrusted, Text.new),
                 ),
         ),
         const SizedBox(height: 18),
@@ -272,15 +294,16 @@ class _EditSubscriptionScreenState extends ConsumerState<EditSubscriptionScreen>
 
   Future<void> _replaceZip(Subscription s) async {
     final l = context.l10n;
+    final container = ProviderScope.containerOf(context, listen: false);
     final f = await FilePicker.pickFile(type: FileType.custom, allowedExtensions: const ['zip']);
     if (f == null) return;
-    setState(() => _busy = true);
+    if (mounted) setState(() => _busy = true);
     try {
-      await ref.read(subscriptionServiceProvider).replaceZip(s, await f.readAsBytes());
-      ref.invalidate(subscriptionsProvider);
-      final subs = await ref.read(subscriptionsProvider.future);
-      if (effectiveActiveKey(subs, ref.read(activeSubscriptionKeyProvider).valueOrNull) == s.key) {
-        refreshActiveSubscriptionRuntime(ref);
+      await container.read(subscriptionServiceProvider).replaceZip(s, await f.readAsBytes());
+      container.invalidate(subscriptionsProvider);
+      final subs = await container.read(subscriptionsProvider.future);
+      if (effectiveActiveKey(subs, container.read(activeSubscriptionKeyProvider).valueOrNull) == s.key) {
+        refreshActiveRuntimeIn(container);
       }
       showToast(l.subscriptionUpdatedOne);
     } catch (e) {
@@ -293,33 +316,35 @@ class _EditSubscriptionScreenState extends ConsumerState<EditSubscriptionScreen>
   Future<void> _save(Subscription s) async {
     final l = context.l10n;
     if (!s.local && _url.text.trim().isEmpty) return showToast(l.subscriptionUrlRequired);
+    final container = ProviderScope.containerOf(context, listen: false);
     setState(() => _busy = true);
     try {
-      final subsBefore = await ref.read(subscriptionRepositoryProvider).all();
+      final subsBefore = await container.read(subscriptionRepositoryProvider).all();
       final current = subsBefore.where((x) => x.key == s.key).firstOrNull ?? s;
-      final wasActive = effectiveActiveKey(subsBefore, ref.read(activeSubscriptionKeyProvider).valueOrNull) == s.key;
+      final wasActive =
+          effectiveActiveKey(subsBefore, container.read(activeSubscriptionKeyProvider).valueOrNull) == s.key;
       final urlChanged = !current.local && _url.text.trim() != subscriptionDisplayUrl(current).trim();
       final missingInstall = !current.local &&
           current.cloudUrl == null &&
-          await ref.read(subscriptionInstallerProvider).installedScript(current) == null;
-      await ref.read(subscriptionServiceProvider).updateSubscription(
+          await container.read(subscriptionInstallerProvider).installedScript(current) == null;
+      await container.read(subscriptionServiceProvider).updateSubscription(
             current,
             url: current.local ? null : _url.text,
             name: _name.text,
             forceRefreshScript: missingInstall,
             confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey),
           );
-      ref.invalidate(subscriptionsProvider);
+      container.invalidate(subscriptionsProvider);
       if (wasActive && (urlChanged || missingInstall)) {
-        refreshActiveSubscriptionRuntime(ref, resetCategory: true);
+        refreshActiveRuntimeIn(container, resetCategory: true);
       }
-      if (!mounted) return;
+      if (!mounted) return showToast(l.saved);
       showSuccessHud(context, l.saved);
       context.pop();
     } on DuplicateSubscriptionException {
       showToast(l.subscriptionDuplicate);
     } catch (e) {
-      showToast(l.subscriptionDownloadFailed('$e'));
+      showToast(l.subscriptionDownloadFailed(_downloadError(e)));
     } finally {
       if (mounted) setState(() => _busy = false);
     }
@@ -400,12 +425,17 @@ class _EditSubscriptionScreenState extends ConsumerState<EditSubscriptionScreen>
                   ]),
                   Padding(
                     padding: const EdgeInsets.fromLTRB(16, 20, 16, 0),
-                    child: PrimaryButton(
-                      label: l.save,
-                      icon: _busy ? null : Icons.check_rounded,
-                      expand: true,
-                      height: 46,
-                      onPressed: _busy ? null : () => _save(s),
+                    child: _withDownloadProgress(
+                      ref,
+                      _busy,
+                      l.save,
+                      (label) => PrimaryButton(
+                        label: label,
+                        icon: _busy ? null : Icons.check_rounded,
+                        expand: true,
+                        height: 46,
+                        onPressed: _busy ? null : () => _save(s),
+                      ),
                     ),
                   ),
                   SettingsSection(dividers: false, children: [
