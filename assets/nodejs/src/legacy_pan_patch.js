@@ -197,6 +197,71 @@ async function fetchTimed(url, init = {}, timeoutMs = 3500) {
   return fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
 }
 
+// 123 share download/info needs a web login token; scripts save username/password but never log in (douer bundle loin()).
+const PAN123_LOGIN_UA =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36';
+const pan123Tokens = new Map(); // passport -> { password, token, exp } | { password, pending }
+
+function jwtExpMs(token) {
+  try { return Number(JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString('utf8')).exp) * 1000 || 0; } catch { return 0; }
+}
+
+async function pan123Token(entry, now = Date.now()) {
+  const saved = String(entry?.token ?? '').trim();
+  if (saved && jwtExpMs(saved) > now + 60e3) return saved;
+  const passport = String(entry?.username || entry?.phone || '').trim();
+  const password = String(entry?.password ?? '');
+  if (!passport || !password) return saved;
+  const hit = pan123Tokens.get(passport);
+  if (hit && hit.password === password) {
+    if (hit.pending) return hit.pending;
+    if (hit.exp > now + 60e3) return hit.token;
+    if (hit.failedUntil > now) return saved; // a wrong password retried on every play could trip 123's risk control
+  }
+  const pending = (async () => {
+    try {
+      const r = await fetchTimed('https://login.123pan.com/api/user/sign_in', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'App-Version': '43',
+          'User-Agent': PAN123_LOGIN_UA,
+          Referer: 'https://login.123pan.com/centerlogin?redirect_url=https%3A%2F%2Fwww.123pan.cn&source_page=website',
+        },
+        body: JSON.stringify({ passport, password, remember: true }),
+      }, 10000);
+      const j = await r.json().catch(() => ({}));
+      const token = String(j?.data?.token || '');
+      if (!token) {
+        console.log(`[pan123] login failed: ${j?.message || r.status}`);
+        pan123Tokens.set(passport, { password, failedUntil: Date.now() + 60e3 });
+        return saved;
+      }
+      pan123Tokens.set(passport, { password, token, exp: jwtExpMs(token) || Date.now() + 3600e3 });
+      return token;
+    } catch (e) {
+      console.log(`[pan123] login error: ${(e && e.message) || e}`);
+      pan123Tokens.set(passport, { password, failedUntil: Date.now() + 60e3 });
+      return saved;
+    }
+  })();
+  pan123Tokens.set(passport, { password, pending });
+  return pending;
+}
+
+// download/info answers https://…/download-v2/?params=<base64 of the CDN URL>; the CDN URL is what plays.
+function decodePan123Url(raw) {
+  const s = String(raw || '');
+  try {
+    const p = new URL(s).searchParams.get('params');
+    if (p) {
+      const d = Buffer.from(p, 'base64').toString('utf8');
+      if (/^https?:\/\//i.test(d)) return d;
+    }
+  } catch { /* not a URL */ }
+  return s;
+}
+
 function sortVideos(videos) {
   videos.sort((a, b) => String(a.name || '').localeCompare(String(b.name || ''), undefined, { numeric: true, sensitivity: 'base' }));
 }
@@ -857,8 +922,9 @@ async function playLegacyExtendedShare(fastify, req, spiderKey, spiderType, rawI
   if (provider === 'pan123') {
     const [, , shareId, fileId, encS3, encEtag, rawSize, encName, encHost = 'www.123pan.cn', encDirect = ''] = parts;
     const host = normalizePan123Host(decodeSafe(encHost));
-    const token = String(entry.token || '').trim();
-    let directUrl = decodeSafe(encDirect);
+    const token = await pan123Token(entry);
+    // 123's share listing now returns a signed 24x24 thumbnail as DownloadUrl; only a real link may skip download/info.
+    let directUrl = /123pan-thumbnail/.test(decodeSafe(encDirect)) ? '' : decodeSafe(encDirect);
     let errMsg = '';
     if (!directUrl && fileId && parts.length >= 8) {
       const r = await fetchTimed(`https://${host}/a/api/share/download/info`, {
@@ -867,7 +933,7 @@ async function playLegacyExtendedShare(fastify, req, spiderKey, spiderType, rawI
         body: JSON.stringify({ ShareKey: shareId, FileID: Number(fileId) || fileId, S3KeyFlag: decodeSafe(encS3), Etag: decodeSafe(encEtag), Size: Number(rawSize) || 0 }),
       }, 8000);
       const j = await r.json().catch(() => ({}));
-      directUrl = j.data?.DownloadURL || j.data?.DownloadUrl || '';
+      directUrl = decodePan123Url(j.data?.DownloadURL || j.data?.DownloadUrl || '');
       errMsg = j.message || '';
     }
     if (!directUrl) {
@@ -1208,6 +1274,8 @@ function installLegacyPanGlobals() {
   globalThis.__uzvPlayExtendedShare = playLegacyExtendedShare;
   globalThis.__uzvBuildWoniuDetail = buildLegacyWoniuDetail;
   globalThis.__uzvHandleWoniuAuthHttp = handleWoniuAuthHttp;
+  globalThis.__uzvPan123Token = pan123Token;
+  globalThis.__uzvDecodePan123Url = decodePan123Url;
 }
 
 module.exports = {
@@ -1218,4 +1286,6 @@ module.exports = {
   playLegacyExtendedShare,
   buildLegacyWoniuDetail,
   handleWoniuAuthHttp,
+  pan123Token,
+  decodePan123Url,
 };

@@ -16,11 +16,15 @@ import java.net.ServerSocket
 import java.net.URI
 import java.net.URL
 import java.nio.charset.StandardCharsets
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 
 class PlayerStreamProxyTest {
     private lateinit var upstream: ServerSocket
     private var upstreamPort = 0
-    private val routes = HashMap<String, Pair<String, ByteArray>>()
+    private val routes = ConcurrentHashMap<String, Pair<String, ByteArray>>()
+    private val redirects = ConcurrentHashMap<String, String>()
+    private val requestHeaders = ConcurrentHashMap<String, Map<String, String>>()
 
     @Before
     fun setUp() {
@@ -33,14 +37,21 @@ class PlayerStreamProxyTest {
                     sock.use { s ->
                         val reader = BufferedReader(InputStreamReader(s.getInputStream(), StandardCharsets.US_ASCII))
                         val line = reader.readLine() ?: return@use
+                        val headers = mutableMapOf<String, String>()
                         while (true) {
                             val h = reader.readLine() ?: break
                             if (h.isEmpty()) break
+                            headers[h.substringBefore(':').lowercase(Locale.ROOT)] = h.substringAfter(':').trim()
                         }
                         val path = line.split(' ').getOrNull(1)?.substringBefore('?').orEmpty()
+                        requestHeaders[path] = headers
                         val hit = routes[path]
+                        val location = redirects[path]
                         val out = s.getOutputStream()
-                        if (hit == null) {
+                        if (location != null) {
+                            val response = "HTTP/1.1 302 Found\r\nLocation: $location\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            out.write(response.toByteArray(StandardCharsets.US_ASCII))
+                        } else if (hit == null) {
                             out.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".toByteArray())
                         } else {
                             val (ct, body) = hit
@@ -100,6 +111,54 @@ class PlayerStreamProxyTest {
         val segBytes = conn.inputStream.use { it.readBytes() }
         assertArrayEquals(tsPayload, segBytes)
         assertNull(PlayerStreamProxy.upstreamError(wrapped.token))
+    }
+
+    @Test
+    fun crossOriginHlsSegmentKeepsUserAgentAndOmitsOriginOnlyMetadata() {
+        routes["/segment.m4s"] = "video/mp4" to "segment".toByteArray()
+        // Same host, different port: the playlist's headers belong to its full origin.
+        val source = URI("http://127.000.000.001:80/playlist.m3u8")
+        val wrapped = PlayerStreamProxy.wrap(
+            source.toString(),
+            mapOf("User-Agent" to "Test Player", "X-Playback-Context" to "fixture"),
+        )
+        val playlist = PlayerStreamProxy.rewriteHlsPlaylist(
+            "#EXTM3U\n#EXTINF:2,\nhttp://127.000.000.001:$upstreamPort/segment.m4s\n#EXT-X-ENDLIST\n",
+            source,
+            URI(wrapped.url).port,
+            requireNotNull(wrapped.token),
+        )
+        val segmentUrl = playlist.lines().first { it.startsWith("http://") }
+        assertEquals("segment", URL(segmentUrl).readText())
+        val headers = requestHeaders.getValue("/segment.m4s")
+        assertEquals("Test Player", headers["user-agent"])
+        assertNull(headers["x-playback-context"])
+    }
+
+    @Test
+    fun redirectChainStopsSendingOriginOnlyMetadataAfterLeavingSource() {
+        // Dotted IPv4 with zero padding still connects to the JVM fixture's loopback address.
+        val sourceOrigin = "http://127.000.000.001:$upstreamPort"
+        redirects["/start.mp4"] = "/same-origin.mp4"
+        redirects["/same-origin.mp4"] = "http://127.0.0.1:$upstreamPort/cdn.mp4"
+        redirects["/cdn.mp4"] = "$sourceOrigin/return.mp4"
+        routes["/return.mp4"] = "video/mp4" to "video".toByteArray()
+        val referer = "https://example.test:443/watch?view=fixture"
+        val wrapped = PlayerStreamProxy.wrap(
+            "$sourceOrigin/start.mp4",
+            mapOf("X-Playback-Context" to "fixture", "Referer" to referer, "User-Agent" to "Test Player"),
+        )
+        assertNotNull(wrapped.token)
+        assertEquals("video", URL(wrapped.url).readText())
+        for (path in listOf("/start.mp4", "/same-origin.mp4")) {
+            assertEquals("fixture", requestHeaders.getValue(path)["x-playback-context"])
+            assertEquals(referer, requestHeaders.getValue(path)["referer"])
+        }
+        for (path in listOf("/cdn.mp4", "/return.mp4")) {
+            assertNull(requestHeaders.getValue(path)["x-playback-context"])
+            assertEquals("https://example.test/", requestHeaders.getValue(path)["referer"])
+            assertEquals("Test Player", requestHeaders.getValue(path)["user-agent"])
+        }
     }
 
     @Test

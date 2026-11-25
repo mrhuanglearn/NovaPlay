@@ -640,6 +640,20 @@ function patchLegacyCatpawBundle(src) {
     've={parse:0,url:gt,...H?{}:{header:te},',
     've={parse:0,url:gt,header:te,'
   );
+  // 123's listing DownloadUrl is now a signed thumbnail; drop it so download/info runs, with a token from the saved login.
+  out = out.replace(
+    'S=hj(Pt(k)),x=String(f.token??"").trim(),I=Pt(w),R="";',
+    'S=hj(Pt(k)),x=typeof globalThis.__uzvPan123Token==="function"?await globalThis.__uzvPan123Token(f):String(f.token??"").trim(),I=/123pan-thumbnail/.test(Pt(w))?"":Pt(w),R="";'
+  );
+  out = out.replace(
+    'I=N.data?.DownloadURL||N.data?.DownloadUrl||"",R=N.message||""',
+    'I=N.data?.DownloadURL||N.data?.DownloadUrl||"",I=typeof globalThis.__uzvDecodePan123Url==="function"?globalThis.__uzvDecodePan123Url(I):I,R=N.message||""'
+  );
+  // TG search ranks logged-in drives first and keeps 50, so with 123/Quark logins every 移动 hit was cut; keep them all.
+  out = out.replaceAll(
+    '.sort((d,f)=>f.score-d.score||d.idx-f.idx).slice(0,50)',
+    '.sort((d,f)=>f.score-d.score||d.idx-f.idx).slice(0,300)'
+  );
   out = out.replace(
     'Checking your browser)/i',
     'Checking your browser|__cdn_pow|acw_sc__v2)/i'

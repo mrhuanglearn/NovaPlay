@@ -9,7 +9,7 @@ import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URI
-import java.net.URL
+import java.net.URISyntaxException
 import java.nio.charset.StandardCharsets
 import java.util.Base64
 import java.util.Locale
@@ -42,8 +42,25 @@ object PlayerStreamProxy {
 
     internal class Session(
         val token: String,
+        val origin: String,
         val headers: Map<String, String>,
     ) {
+        // Custom headers may carry credentials under provider-specific names.
+        val crossOriginHeaders = buildMap {
+            for ((name, value) in headers) {
+                when (name.lowercase(Locale.ROOT)) {
+                    "user-agent", "accept", "accept-language" -> put(name, value)
+                    "origin", "referer" -> {
+                        val headerOrigin = runCatching { originOf(URI(value)) }.getOrDefault("")
+                        if (headerOrigin.isNotEmpty()) {
+                            put(name, if (name.equals("referer", ignoreCase = true)) "$headerOrigin/" else headerOrigin)
+                        } else if (name.equals("origin", ignoreCase = true) && value == "null") {
+                            put(name, value)
+                        }
+                    }
+                }
+            }
+        }
         val hostFallbacks = ConcurrentHashMap<String, String>()
         @Volatile var rootError: String? = null
     }
@@ -61,17 +78,15 @@ object PlayerStreamProxy {
     fun wrap(rawUrl: String, headers: Map<String, String>): WrappedSource {
         val (cleanUrl, mergedHeaders) = normalizeUrlAndHeaders(rawUrl, headers)
         val uri = try { URI(cleanUrl) } catch (_: Exception) { return WrappedSource(rawUrl, null, headers) }
-        val scheme = uri.scheme?.lowercase(Locale.ROOT).orEmpty()
-        val host = uri.host?.lowercase(Locale.ROOT).orEmpty()
-        if ((scheme != "http" && scheme != "https") || host.isEmpty() ||
-            host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
-        ) {
+        val origin = originOf(uri)
+        val host = uri.host?.lowercase(Locale.ROOT)
+        if (origin.isEmpty() || host == "127.0.0.1" || host == "localhost" || host == "[::1]" || host == "::1") {
             return WrappedSource(cleanUrl, null, mergedHeaders)
         }
         val port = ensureStarted() ?: return WrappedSource(cleanUrl, null, mergedHeaders)
         val token = UUID.randomUUID().toString().replace("-", "").take(16)
         synchronized(lock) {
-            sessions[token] = Session(token, mergedHeaders)
+            sessions[token] = Session(token, origin, mergedHeaders)
             while (sessions.size > 16) {
                 val eldest = sessions.keys.firstOrNull() ?: break
                 sessions.remove(eldest)
@@ -81,7 +96,7 @@ object PlayerStreamProxy {
         val isHls = pathLower.endsWith(".m3u8") || pathLower.endsWith(".m3u")
         val kind = if (isHls) "hls" else "auto"
         val fileName = if (isHls) "index.m3u8" else inferredFileName(uri.path.orEmpty())
-        val proxied = buildProxyUrl(port, token, fileName, cleanUrl, originOf(uri), kind, rawSeg = false, isRoot = true)
+        val proxied = buildProxyUrl(port, token, fileName, cleanUrl, origin, kind, rawSeg = false, isRoot = true)
         return WrappedSource(proxied, token, emptyMap())
     }
 
@@ -188,7 +203,7 @@ object PlayerStreamProxy {
         try {
             val wantIdentity = kind != "hls"
             val sendRange = if (kind == "hls" || kind == "ts" || kind == "key") null else clientRange
-            val attempt = tryOpenUpstream(primaryUrl, method, session.headers, sendRange, wantIdentity)
+            val attempt = tryOpenUpstream(primaryUrl, method, session, sendRange, wantIdentity)
             val needOriginFallback = mappedOrigin == null &&
                 playlistOrigin.isNotEmpty() &&
                 !originOf(targetUri).equals(playlistOrigin, ignoreCase = true) &&
@@ -197,7 +212,7 @@ object PlayerStreamProxy {
             val resolved = if (needOriginFallback) {
                 attempt.conn?.disconnect()
                 val altUrl = replaceOrigin(targetUri, playlistOrigin)
-                val second = tryOpenUpstream(altUrl, method, session.headers, sendRange, wantIdentity)
+                val second = tryOpenUpstream(altUrl, method, session, sendRange, wantIdentity)
                 if (second.error == null && second.code in 200..399 && origAuth.isNotEmpty()) {
                     session.hostFallbacks[origAuth] = playlistOrigin
                 }
@@ -289,16 +304,22 @@ object PlayerStreamProxy {
     private fun tryOpenUpstream(
         urlStr: String,
         method: String,
-        headers: Map<String, String>,
+        session: Session,
         rangeHeader: String?,
         identityEncoding: Boolean,
     ): UpstreamAttempt {
         var currentUrl = urlStr
+        var originHeadersAllowed = true
         var redirects = 0
         while (redirects <= 5) {
             var c: HttpURLConnection? = null
             try {
-                c = (URL(currentUrl).openConnection() as HttpURLConnection).apply {
+                val uri = URI(currentUrl)
+                val origin = originOf(uri)
+                if (origin.isEmpty()) return UpstreamAttempt(null, -1, IOException("Invalid upstream origin"))
+                originHeadersAllowed = originHeadersAllowed && origin == session.origin
+                val headers = if (originHeadersAllowed) session.headers else session.crossOriginHeaders
+                c = (uri.toURL().openConnection() as HttpURLConnection).apply {
                     instanceFollowRedirects = false
                     requestMethod = method
                     connectTimeout = CONNECT_TIMEOUT_MS
@@ -318,7 +339,7 @@ object PlayerStreamProxy {
                     val loc = c.getHeaderField("Location")?.trim()
                     c.disconnect()
                     if (loc.isNullOrEmpty()) return UpstreamAttempt(null, code, null)
-                    currentUrl = URI(currentUrl).resolve(sanitizePercentEncoding(loc)).toString()
+                    currentUrl = uri.resolve(URI(sanitizePercentEncoding(loc))).toString()
                     redirects++
                     continue
                 }
@@ -326,6 +347,9 @@ object PlayerStreamProxy {
             } catch (e: IOException) {
                 c?.disconnect()
                 return UpstreamAttempt(null, -1, e)
+            } catch (e: URISyntaxException) {
+                c?.disconnect()
+                return UpstreamAttempt(null, -1, IOException("Invalid upstream URL", e))
             }
         }
         return UpstreamAttempt(null, 508, IOException("Too many redirects"))
@@ -548,9 +572,17 @@ object PlayerStreamProxy {
     }
 
     private fun originOf(uri: URI): String {
-        val scheme = uri.scheme?.lowercase(Locale.ROOT) ?: return ""
-        val auth = uri.rawAuthority ?: return ""
-        return "$scheme://$auth"
+        val scheme = uri.scheme?.lowercase(Locale.ROOT)
+        val defaultPort = when (scheme) {
+            "http" -> 80
+            "https" -> 443
+            else -> return ""
+        }
+        val host = uri.host?.lowercase(Locale.ROOT) ?: return ""
+        val port = uri.port
+        if (port !in -1..65535) return ""
+        val suffix = if (port == -1 || port == defaultPort) "" else ":$port"
+        return "$scheme://$host$suffix"
     }
 
     private fun authorityKey(uri: URI): String = uri.rawAuthority?.lowercase(Locale.ROOT).orEmpty()
