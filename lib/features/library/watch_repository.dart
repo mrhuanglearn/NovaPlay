@@ -19,7 +19,14 @@ class ProgressEntry {
     required this.durationSeconds,
     required this.updatedAt,
     this.qualityIndex = 0,
+    this.videoWidth,
+    this.videoHeight,
   });
+
+  static int? _posInt(Object? v) {
+    final n = v is int ? v : (v is num ? v.round() : null);
+    return (n != null && n > 0) ? n : null;
+  }
 
   factory ProgressEntry.fromJson(Map<String, dynamic> j) => ProgressEntry(
         item: VodItem.fromJson((j['item'] as Map).cast<String, dynamic>(), siteKey: j['siteKey'] as String?),
@@ -30,6 +37,8 @@ class ProgressEntry {
         durationSeconds: (j['dur'] as num?)?.toDouble() ?? 0,
         updatedAt: j['updatedAt'] as int? ?? 0,
         qualityIndex: j['quality'] as int? ?? 0,
+        videoWidth: _posInt(j['vw']),
+        videoHeight: _posInt(j['vh']),
       );
 
   final VodItem item;
@@ -43,6 +52,11 @@ class ProgressEntry {
   /// The source quality picked last (index into the play result's quality list; 0 = the first, e.g. 原画).
   final int qualityIndex;
 
+  /// Known display dimensions of this VOD (populated once probed or decoded), so resuming or playing later episodes
+  /// adapts immediately without flashing the wrong orientation.
+  final int? videoWidth;
+  final int? videoHeight;
+
   double get fraction => durationSeconds <= 0 ? 0 : (positionSeconds / durationSeconds).clamp(0, 1);
 
   Map<String, dynamic> toJson() => {
@@ -55,6 +69,8 @@ class ProgressEntry {
         'dur': durationSeconds,
         'updatedAt': updatedAt,
         'quality': qualityIndex,
+        if (videoWidth != null && videoWidth! > 0) 'vw': videoWidth,
+        if (videoHeight != null && videoHeight! > 0) 'vh': videoHeight,
       };
 }
 
@@ -93,6 +109,7 @@ class HistoryRepository {
   Future<void> record(ProgressEntry entry, {bool flush = true}) async {
     await _ensureLoaded();
     final key = vodKey(entry.item.siteKey ?? '', entry.item.id);
+    final prev = _byKey[key];
     final stamped = ProgressEntry(
       item: entry.item,
       lineIndex: entry.lineIndex,
@@ -102,6 +119,8 @@ class HistoryRepository {
       durationSeconds: entry.durationSeconds,
       updatedAt: now().millisecondsSinceEpoch,
       qualityIndex: entry.qualityIndex,
+      videoWidth: entry.videoWidth ?? prev?.videoWidth,
+      videoHeight: entry.videoHeight ?? prev?.videoHeight,
     );
     _entries.removeWhere((e) => vodKey(e.item.siteKey ?? '', e.item.id) == key);
     _entries.insert(0, stamped);

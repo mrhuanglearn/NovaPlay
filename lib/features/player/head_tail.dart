@@ -115,14 +115,15 @@ class HeadTailRepository {
     await _store.write(all);
   }
 
-  /// The marks as the native player reads them (OpenPlayerRequest.headTailSectionsJson); null when there are none.
-  Future<String?> sectionsJson(String key) async {
-    final data = await getAll(key);
-    if (data.intro <= 0 && data.outro <= 0 && data.ranges.isEmpty) return null;
+  static String? sectionsJsonFrom(({double intro, double outro, List<(double, double)> ranges})? data) {
+    if (data == null || (data.intro <= 0 && data.outro <= 0 && data.ranges.isEmpty)) return null;
     return jsonEncode([
       if (data.intro > 0) {'type': 'intro', 'endMs': (data.intro * 1000).round()},
       if (data.outro > 0) {'type': 'outro', 'beforeEndMs': (data.outro * 1000).round()},
       for (final (s, e) in data.ranges) {'type': 'range', 'startMs': (s * 1000).round(), 'endMs': (e * 1000).round()},
     ]);
   }
+
+  /// The marks as the native player reads them (OpenPlayerRequest.headTailSectionsJson); null when there are none.
+  Future<String?> sectionsJson(String key) async => sectionsJsonFrom(await getAll(key));
 }

@@ -116,6 +116,7 @@ class PlaybackConfig {
     this.accentColorHex,
     this.audioLang,
     this.isLongPressSpeedAdjustEnabled,
+    this.orientationMode,
   });
   bool hwDecode;
   String fitMode;
@@ -145,6 +146,9 @@ class PlaybackConfig {
   /// 长按滑动调节倍速 (OBSERVED in the original's PlaybackConfig as `isLongPressSpeedAdjustEnabled`; null = on, as the
   /// original only turns it off for an explicit false). Added last so files saved before it still load.
   bool? isLongPressSpeedAdjustEnabled;
+
+  /// 屏幕方向: auto|landscape|portrait. null = derive from isPriorityLandscape (true->auto, false->portrait).
+  String? orientationMode;
 }
 
 /// Patch applied to a running player (all fields optional).
@@ -172,6 +176,10 @@ class OpenPlayerRequest {
     this.epgProgrammes,
     this.headTailSectionsJson,
     this.startQualityIndex,
+    this.initialSource,
+    this.initialVideoWidth,
+    this.initialVideoHeight,
+    this.probeBudgetMs,
   });
   String sessionId;
   String title;
@@ -194,6 +202,19 @@ class OpenPlayerRequest {
   /// DEVIATION: this project's addition. The source quality the watch history remembers for this video (the index into
   /// `SourcePayload.qualities`), so 立即播放 / the history continue with the quality picked last time.
   int? startQualityIndex;
+
+  /// Scheme A: the source already resolved on the Dart side while the detail page was still showing (null = the
+  /// native side asks via onEpisodeRequest as before; a failed payload is fed to the normal error path).
+  SourcePayload? initialSource;
+
+  /// Known display dimensions of this specific video/item when [initialSource] is still resolving (e.g. from previous
+  /// playback of the same VOD or media server metadata). Null for unknown items, which open in landscape first.
+  int? initialVideoWidth;
+  int? initialVideoHeight;
+
+  /// Remaining milliseconds of the unified click-to-open fast budget available for native handheld `auto` mode to
+  /// header-probe [initialSource.url] when dimensions are not yet cached. <= 0 skips pre-open waiting.
+  int? probeBudgetMs;
 }
 
 /// A subtitle file to load next to the video.
@@ -218,6 +239,8 @@ class SourcePayload {
     this.qualities,
     this.subtitles,
     this.errorMessage,
+    this.videoWidth,
+    this.videoHeight,
   });
   int requestId;
   bool success;
@@ -227,6 +250,10 @@ class SourcePayload {
   List<QualityOption>? qualities;
   List<SubtitleOption>? subtitles;
   String? errorMessage;
+
+  /// Fast-probed display dimensions of the stream, when already known before or alongside playback startup.
+  int? videoWidth;
+  int? videoHeight;
 }
 
 class DanmakuPayload {
@@ -249,6 +276,12 @@ class DanmakuPromptInfo {
   DanmakuPromptInfo({required this.keyword, this.episodeNumber});
   String keyword;
   int? episodeNumber;
+}
+
+class ProbedVideoSize {
+  ProbedVideoSize({required this.width, required this.height});
+  int width;
+  int height;
 }
 
 // ---- Kotlin -> Dart events ----------------------------------------------------------------------
@@ -312,8 +345,10 @@ class DanmakuSearchRequest {
 /// Dart -> Kotlin
 @HostApi()
 abstract class NativePlayerHostApi {
+  @async
   void openPlayerPage(OpenPlayerRequest request);
   void provideSource(SourcePayload payload);
+  void updateVideoSize(String sessionId, int lineIndex, int episodeIndex, int width, int height);
   void updateDanmaku(DanmakuPayload payload);
   void updateLineTmdbMatches(String sessionId, List<TmdbEpisodeItem> matches);
   void updateRuntimeConfig(String sessionId, RuntimeConfigPatch patch);
@@ -331,6 +366,17 @@ abstract class NativePlayerHostApi {
 abstract class NativePlayerFlutterApi {
   @async
   void onEpisodeRequest(EpisodeRequest request);
+  @async
+  ProbedVideoSize? onProbeVideoSize(
+    String sessionId,
+    int lineIndex,
+    int episodeIndex,
+    String url,
+    Map<String, String> headers,
+    int budgetMs,
+  );
+  @async
+  void onVideoSizeDetected(String sessionId, int lineIndex, int episodeIndex, int width, int height);
   @async
   void onDanmakuRequest(DanmakuRequest request);
   @async

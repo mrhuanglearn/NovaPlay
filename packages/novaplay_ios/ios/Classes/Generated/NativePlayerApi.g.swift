@@ -308,6 +308,8 @@ struct PlaybackConfig {
   /// 长按滑动调节倍速 (OBSERVED in the original's PlaybackConfig as `isLongPressSpeedAdjustEnabled`; null = on, as the
   /// original only turns it off for an explicit false). Added last so files saved before it still load.
   var isLongPressSpeedAdjustEnabled: Bool? = nil
+  /// 屏幕方向: auto|landscape|portrait. null = derive from isPriorityLandscape (true->auto, false->portrait).
+  var orientationMode: String? = nil
 
 
   // swift-format-ignore: AlwaysUseLowerCamelCase
@@ -335,6 +337,7 @@ struct PlaybackConfig {
     let accentColorHex: String? = nilOrValue(pigeonVar_list[20])
     let audioLang: String? = nilOrValue(pigeonVar_list[21])
     let isLongPressSpeedAdjustEnabled: Bool? = nilOrValue(pigeonVar_list[22])
+    let orientationMode: String? = nilOrValue(pigeonVar_list[23])
 
     return PlaybackConfig(
       hwDecode: hwDecode,
@@ -359,7 +362,8 @@ struct PlaybackConfig {
       uiLocale: uiLocale,
       accentColorHex: accentColorHex,
       audioLang: audioLang,
-      isLongPressSpeedAdjustEnabled: isLongPressSpeedAdjustEnabled
+      isLongPressSpeedAdjustEnabled: isLongPressSpeedAdjustEnabled,
+      orientationMode: orientationMode
     )
   }
   func toList() -> [Any?] {
@@ -387,6 +391,7 @@ struct PlaybackConfig {
       accentColorHex,
       audioLang,
       isLongPressSpeedAdjustEnabled,
+      orientationMode,
     ]
   }
 }
@@ -438,6 +443,16 @@ struct OpenPlayerRequest {
   /// DEVIATION: this project's addition. The source quality the watch history remembers for this video (the index into
   /// `SourcePayload.qualities`), so 立即播放 / the history continue with the quality picked last time.
   var startQualityIndex: Int64? = nil
+  /// Scheme A: the source already resolved on the Dart side while the detail page was still showing (null = the
+  /// native side asks via onEpisodeRequest as before; a failed payload is fed to the normal error path).
+  var initialSource: SourcePayload? = nil
+  /// Known display dimensions of this specific video/item when [initialSource] is still resolving (e.g. from previous
+  /// playback of the same VOD or media server metadata). Null for unknown items, which open in landscape first.
+  var initialVideoWidth: Int64? = nil
+  var initialVideoHeight: Int64? = nil
+  /// Remaining milliseconds of the unified click-to-open fast budget available for native handheld `auto` mode to
+  /// header-probe [initialSource.url] when dimensions are not yet cached. <= 0 skips pre-open waiting.
+  var probeBudgetMs: Int64? = nil
 
 
   // swift-format-ignore: AlwaysUseLowerCamelCase
@@ -458,6 +473,10 @@ struct OpenPlayerRequest {
     let epgProgrammes: [EpgProgramme]? = nilOrValue(pigeonVar_list[13])
     let headTailSectionsJson: String? = nilOrValue(pigeonVar_list[14])
     let startQualityIndex: Int64? = nilOrValue(pigeonVar_list[15])
+    let initialSource: SourcePayload? = nilOrValue(pigeonVar_list[16])
+    let initialVideoWidth: Int64? = nilOrValue(pigeonVar_list[17])
+    let initialVideoHeight: Int64? = nilOrValue(pigeonVar_list[18])
+    let probeBudgetMs: Int64? = nilOrValue(pigeonVar_list[19])
 
     return OpenPlayerRequest(
       sessionId: sessionId,
@@ -475,7 +494,11 @@ struct OpenPlayerRequest {
       currentTmdbEpisodeNumber: currentTmdbEpisodeNumber,
       epgProgrammes: epgProgrammes,
       headTailSectionsJson: headTailSectionsJson,
-      startQualityIndex: startQualityIndex
+      startQualityIndex: startQualityIndex,
+      initialSource: initialSource,
+      initialVideoWidth: initialVideoWidth,
+      initialVideoHeight: initialVideoHeight,
+      probeBudgetMs: probeBudgetMs
     )
   }
   func toList() -> [Any?] {
@@ -496,6 +519,10 @@ struct OpenPlayerRequest {
       epgProgrammes,
       headTailSectionsJson,
       startQualityIndex,
+      initialSource,
+      initialVideoWidth,
+      initialVideoHeight,
+      probeBudgetMs,
     ]
   }
 }
@@ -546,6 +573,9 @@ struct SourcePayload {
   var qualities: [QualityOption]? = nil
   var subtitles: [SubtitleOption]? = nil
   var errorMessage: String? = nil
+  /// Fast-probed display dimensions of the stream, when already known before or alongside playback startup.
+  var videoWidth: Int64? = nil
+  var videoHeight: Int64? = nil
 
 
   // swift-format-ignore: AlwaysUseLowerCamelCase
@@ -558,6 +588,8 @@ struct SourcePayload {
     let qualities: [QualityOption]? = nilOrValue(pigeonVar_list[5])
     let subtitles: [SubtitleOption]? = nilOrValue(pigeonVar_list[6])
     let errorMessage: String? = nilOrValue(pigeonVar_list[7])
+    let videoWidth: Int64? = nilOrValue(pigeonVar_list[8])
+    let videoHeight: Int64? = nilOrValue(pigeonVar_list[9])
 
     return SourcePayload(
       requestId: requestId,
@@ -567,7 +599,9 @@ struct SourcePayload {
       headers: headers,
       qualities: qualities,
       subtitles: subtitles,
-      errorMessage: errorMessage
+      errorMessage: errorMessage,
+      videoWidth: videoWidth,
+      videoHeight: videoHeight
     )
   }
   func toList() -> [Any?] {
@@ -580,6 +614,8 @@ struct SourcePayload {
       qualities,
       subtitles,
       errorMessage,
+      videoWidth,
+      videoHeight,
     ]
   }
 }
@@ -668,6 +704,30 @@ struct DanmakuPromptInfo {
     return [
       keyword,
       episodeNumber,
+    ]
+  }
+}
+
+/// Generated class from Pigeon that represents data sent in messages.
+struct ProbedVideoSize {
+  var width: Int64
+  var height: Int64
+
+
+  // swift-format-ignore: AlwaysUseLowerCamelCase
+  static func fromList(_ pigeonVar_list: [Any?]) -> ProbedVideoSize? {
+    let width = pigeonVar_list[0] as! Int64
+    let height = pigeonVar_list[1] as! Int64
+
+    return ProbedVideoSize(
+      width: width,
+      height: height
+    )
+  }
+  func toList() -> [Any?] {
+    return [
+      width,
+      height,
     ]
   }
 }
@@ -932,20 +992,22 @@ private class NativePlayerApiPigeonCodecReader: FlutterStandardReader {
     case 142:
       return DanmakuPromptInfo.fromList(self.readValue() as! [Any?])
     case 143:
-      return Heartbeat.fromList(self.readValue() as! [Any?])
+      return ProbedVideoSize.fromList(self.readValue() as! [Any?])
     case 144:
-      return StateEvent.fromList(self.readValue() as! [Any?])
+      return Heartbeat.fromList(self.readValue() as! [Any?])
     case 145:
-      return ErrorReport.fromList(self.readValue() as! [Any?])
+      return StateEvent.fromList(self.readValue() as! [Any?])
     case 146:
-      return PreferenceReport.fromList(self.readValue() as! [Any?])
+      return ErrorReport.fromList(self.readValue() as! [Any?])
     case 147:
-      return PageClosedEvent.fromList(self.readValue() as! [Any?])
+      return PreferenceReport.fromList(self.readValue() as! [Any?])
     case 148:
-      return EpisodeRequest.fromList(self.readValue() as! [Any?])
+      return PageClosedEvent.fromList(self.readValue() as! [Any?])
     case 149:
-      return DanmakuRequest.fromList(self.readValue() as! [Any?])
+      return EpisodeRequest.fromList(self.readValue() as! [Any?])
     case 150:
+      return DanmakuRequest.fromList(self.readValue() as! [Any?])
+    case 151:
       return DanmakuSearchRequest.fromList(self.readValue() as! [Any?])
     default:
       return super.readValue(ofType: type)
@@ -997,29 +1059,32 @@ private class NativePlayerApiPigeonCodecWriter: FlutterStandardWriter {
     } else if let value = value as? DanmakuPromptInfo {
       super.writeByte(142)
       super.writeValue(value.toList())
-    } else if let value = value as? Heartbeat {
+    } else if let value = value as? ProbedVideoSize {
       super.writeByte(143)
       super.writeValue(value.toList())
-    } else if let value = value as? StateEvent {
+    } else if let value = value as? Heartbeat {
       super.writeByte(144)
       super.writeValue(value.toList())
-    } else if let value = value as? ErrorReport {
+    } else if let value = value as? StateEvent {
       super.writeByte(145)
       super.writeValue(value.toList())
-    } else if let value = value as? PreferenceReport {
+    } else if let value = value as? ErrorReport {
       super.writeByte(146)
       super.writeValue(value.toList())
-    } else if let value = value as? PageClosedEvent {
+    } else if let value = value as? PreferenceReport {
       super.writeByte(147)
       super.writeValue(value.toList())
-    } else if let value = value as? EpisodeRequest {
+    } else if let value = value as? PageClosedEvent {
       super.writeByte(148)
       super.writeValue(value.toList())
-    } else if let value = value as? DanmakuRequest {
+    } else if let value = value as? EpisodeRequest {
       super.writeByte(149)
       super.writeValue(value.toList())
-    } else if let value = value as? DanmakuSearchRequest {
+    } else if let value = value as? DanmakuRequest {
       super.writeByte(150)
+      super.writeValue(value.toList())
+    } else if let value = value as? DanmakuSearchRequest {
+      super.writeByte(151)
       super.writeValue(value.toList())
     } else {
       super.writeValue(value)
@@ -1041,12 +1106,14 @@ class NativePlayerApiPigeonCodec: FlutterStandardMessageCodec, @unchecked Sendab
   static let shared = NativePlayerApiPigeonCodec(readerWriter: NativePlayerApiPigeonCodecReaderWriter())
 }
 
+
 /// Dart -> Kotlin
 ///
 /// Generated protocol from Pigeon that represents a handler of messages from Flutter.
 protocol NativePlayerHostApi {
-  func openPlayerPage(request: OpenPlayerRequest) throws
+  func openPlayerPage(request: OpenPlayerRequest, completion: @escaping (Result<Void, Error>) -> Void)
   func provideSource(payload: SourcePayload) throws
+  func updateVideoSize(sessionId: String, lineIndex: Int64, episodeIndex: Int64, width: Int64, height: Int64) throws
   func updateDanmaku(payload: DanmakuPayload) throws
   func updateLineTmdbMatches(sessionId: String, matches: [TmdbEpisodeItem]) throws
   func updateRuntimeConfig(sessionId: String, patch: RuntimeConfigPatch) throws
@@ -1068,11 +1135,13 @@ class NativePlayerHostApiSetup {
       openPlayerPageChannel.setMessageHandler { message, reply in
         let args = message as! [Any?]
         let requestArg = args[0] as! OpenPlayerRequest
-        do {
-          try api.openPlayerPage(request: requestArg)
-          reply(wrapResult(nil))
-        } catch {
-          reply(wrapError(error))
+        api.openPlayerPage(request: requestArg) { result in
+          switch result {
+          case .success:
+            reply(wrapResult(nil))
+          case .failure(let error):
+            reply(wrapError(error))
+          }
         }
       }
     } else {
@@ -1092,6 +1161,25 @@ class NativePlayerHostApiSetup {
       }
     } else {
       provideSourceChannel.setMessageHandler(nil)
+    }
+    let updateVideoSizeChannel = FlutterBasicMessageChannel(name: "dev.flutter.pigeon.uzv_reimpl.NativePlayerHostApi.updateVideoSize\(channelSuffix)", binaryMessenger: binaryMessenger, codec: codec)
+    if let api = api {
+      updateVideoSizeChannel.setMessageHandler { message, reply in
+        let args = message as! [Any?]
+        let sessionIdArg = args[0] as! String
+        let lineIndexArg = args[1] as! Int64
+        let episodeIndexArg = args[2] as! Int64
+        let widthArg = args[3] as! Int64
+        let heightArg = args[4] as! Int64
+        do {
+          try api.updateVideoSize(sessionId: sessionIdArg, lineIndex: lineIndexArg, episodeIndex: episodeIndexArg, width: widthArg, height: heightArg)
+          reply(wrapResult(nil))
+        } catch {
+          reply(wrapError(error))
+        }
+      }
+    } else {
+      updateVideoSizeChannel.setMessageHandler(nil)
     }
     let updateDanmakuChannel = FlutterBasicMessageChannel(name: "dev.flutter.pigeon.uzv_reimpl.NativePlayerHostApi.updateDanmaku\(channelSuffix)", binaryMessenger: binaryMessenger, codec: codec)
     if let api = api {
@@ -1198,6 +1286,8 @@ class NativePlayerHostApiSetup {
 /// Generated protocol from Pigeon that represents Flutter messages that can be called from Swift.
 protocol NativePlayerFlutterApiProtocol {
   func onEpisodeRequest(request requestArg: EpisodeRequest, completion: @escaping (Result<Void, PigeonError>) -> Void)
+  func onProbeVideoSize(sessionId sessionIdArg: String, lineIndex lineIndexArg: Int64, episodeIndex episodeIndexArg: Int64, url urlArg: String, headers headersArg: [String: String], budgetMs budgetMsArg: Int64, completion: @escaping (Result<ProbedVideoSize?, PigeonError>) -> Void)
+  func onVideoSizeDetected(sessionId sessionIdArg: String, lineIndex lineIndexArg: Int64, episodeIndex episodeIndexArg: Int64, width widthArg: Int64, height heightArg: Int64, completion: @escaping (Result<Void, PigeonError>) -> Void)
   func onDanmakuRequest(request requestArg: DanmakuRequest, completion: @escaping (Result<Void, PigeonError>) -> Void)
   func onDanmakuSearchRequest(request requestArg: DanmakuSearchRequest, completion: @escaping (Result<Void, PigeonError>) -> Void)
   func onDanmakuEpisodesRequest(sessionId sessionIdArg: String, animeId animeIdArg: Int64, completion: @escaping (Result<Void, PigeonError>) -> Void)
@@ -1226,6 +1316,43 @@ class NativePlayerFlutterApi: NativePlayerFlutterApiProtocol {
     let channelName: String = "dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onEpisodeRequest\(messageChannelSuffix)"
     let channel = FlutterBasicMessageChannel(name: channelName, binaryMessenger: binaryMessenger, codec: codec)
     channel.sendMessage([requestArg] as [Any?]) { response in
+      guard let listResponse = response as? [Any?] else {
+        completion(.failure(createConnectionError(withChannelName: channelName)))
+        return
+      }
+      if listResponse.count > 1 {
+        let code: String = listResponse[0] as! String
+        let message: String? = nilOrValue(listResponse[1])
+        let details: String? = nilOrValue(listResponse[2])
+        completion(.failure(PigeonError(code: code, message: message, details: details)))
+      } else {
+        completion(.success(Void()))
+      }
+    }
+  }
+  func onProbeVideoSize(sessionId sessionIdArg: String, lineIndex lineIndexArg: Int64, episodeIndex episodeIndexArg: Int64, url urlArg: String, headers headersArg: [String: String], budgetMs budgetMsArg: Int64, completion: @escaping (Result<ProbedVideoSize?, PigeonError>) -> Void) {
+    let channelName: String = "dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onProbeVideoSize\(messageChannelSuffix)"
+    let channel = FlutterBasicMessageChannel(name: channelName, binaryMessenger: binaryMessenger, codec: codec)
+    channel.sendMessage([sessionIdArg, lineIndexArg, episodeIndexArg, urlArg, headersArg, budgetMsArg] as [Any?]) { response in
+      guard let listResponse = response as? [Any?] else {
+        completion(.failure(createConnectionError(withChannelName: channelName)))
+        return
+      }
+      if listResponse.count > 1 {
+        let code: String = listResponse[0] as! String
+        let message: String? = nilOrValue(listResponse[1])
+        let details: String? = nilOrValue(listResponse[2])
+        completion(.failure(PigeonError(code: code, message: message, details: details)))
+      } else {
+        let result: ProbedVideoSize? = nilOrValue(listResponse[0])
+        completion(.success(result))
+      }
+    }
+  }
+  func onVideoSizeDetected(sessionId sessionIdArg: String, lineIndex lineIndexArg: Int64, episodeIndex episodeIndexArg: Int64, width widthArg: Int64, height heightArg: Int64, completion: @escaping (Result<Void, PigeonError>) -> Void) {
+    let channelName: String = "dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onVideoSizeDetected\(messageChannelSuffix)"
+    let channel = FlutterBasicMessageChannel(name: channelName, binaryMessenger: binaryMessenger, codec: codec)
+    channel.sendMessage([sessionIdArg, lineIndexArg, episodeIndexArg, widthArg, heightArg] as [Any?]) { response in
       guard let listResponse = response as? [Any?] else {
         completion(.failure(createConnectionError(withChannelName: channelName)))
         return

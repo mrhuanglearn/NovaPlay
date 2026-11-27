@@ -33,7 +33,8 @@ enum { MDK_SEEK_DEFAULT = 1282 }; /* FromStart | KeyFrame | InCache */
 /* Indexes into mdkPlayerAPI (pointer-sized slots; slot 0 is the mdkPlayer* object). */
 enum {
     I_OBJECT = 0, I_SET_MEDIA = 3, I_SET_MEDIA_FOR_TYPE = 4, I_PREPARE = 13, I_MEDIA_INFO = 14, I_SET_STATE = 15,
-    I_STATE = 16, I_ON_STATE_CHANGED = 17, I_MEDIA_STATUS = 19, I_UPDATE_NATIVE_SURFACE = 21, I_SET_ASPECT_RATIO = 28,
+    I_STATE = 16, I_ON_STATE_CHANGED = 17, I_MEDIA_STATUS = 19, I_UPDATE_NATIVE_SURFACE = 21,
+    I_SET_VIDEO_SURFACE_SIZE = 26, I_SET_ASPECT_RATIO = 28,
     I_POSITION = 38, I_SEEK_WITH_FLAGS = 39, I_SET_PLAYBACK_RATE = 41, I_BUFFERED = 43, I_ON_EVENT = 46,
     I_SET_PROPERTY = 49, I_GET_PROPERTY = 50, I_SET_ACTIVE_TRACKS = 61, I_SET_DECODERS = 62, I_ON_MEDIA_STATUS = 67,
 };
@@ -337,6 +338,8 @@ JNIEXPORT void JNICALL JNI(setSurface)(JNIEnv *env, jclass cls, jlong handle, jo
      * ref, since MDK's render thread keeps using it after this call returns. */
     if (surface && p->surface && (*env)->IsSameObject(env, surface, p->surface)) { /* a resize: same ref, new size */
         CALL(p, I_UPDATE_NATIVE_SURFACE, void (*)(void *, void *, int, int, int32_t), p->surface, w, h, 0);
+        CALL(p, I_SET_VIDEO_SURFACE_SIZE, void (*)(void *, int, int, void *), w, h, p->surface);
+        if (p->has_aspect) CALL(p, I_SET_ASPECT_RATIO, void (*)(void *, float, void *), p->aspect, p->surface);
         return;
     }
     jobject ref = surface ? (*env)->NewGlobalRef(env, surface) : NULL;
@@ -363,7 +366,18 @@ JNIEXPORT jdoubleArray JNICALL JNI(videoInfo)(JNIEnv *env, jclass cls, jlong han
     memset(buf, 0, sizeof buf);
     g.video_params(&i->video[0], buf);
     const mdkVideoCodecParameters *c = (const mdkVideoCodecParameters *)buf;
-    jdouble v[4] = {c->width, c->height, c->frame_rate, (double)(c->bit_rate > 0 ? c->bit_rate : i->bit_rate)};
+    double w = (double)c->width;
+    double h = (double)c->height;
+    if (c->par > 0.01f && c->par < 10.0f) {
+        w *= (double)c->par;
+    }
+    int rot = ((i->video[0].rotation % 180) + 180) % 180;
+    if (rot == 90) {
+        double tmp = w;
+        w = h;
+        h = tmp;
+    }
+    jdouble v[4] = {w, h, c->frame_rate, (double)(c->bit_rate > 0 ? c->bit_rate : i->bit_rate)};
     jdoubleArray out = (*env)->NewDoubleArray(env, 4);
     (*env)->SetDoubleArrayRegion(env, out, 0, 4, v);
     return out;

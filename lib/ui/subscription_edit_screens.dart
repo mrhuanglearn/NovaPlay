@@ -317,6 +317,7 @@ class _EditSubscriptionScreenState extends ConsumerState<EditSubscriptionScreen>
     final l = context.l10n;
     if (!s.local && _url.text.trim().isEmpty) return showToast(l.subscriptionUrlRequired);
     final container = ProviderScope.containerOf(context, listen: false);
+    cancelBackgroundAutoUpdate(container, s.key);
     setState(() => _busy = true);
     try {
       final subsBefore = await container.read(subscriptionRepositoryProvider).all();

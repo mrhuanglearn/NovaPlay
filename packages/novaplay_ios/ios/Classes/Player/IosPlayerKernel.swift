@@ -64,11 +64,15 @@ private final class VlcDrawableContainerView: UIView {
   override func didAddSubview(_ subview: UIView) {
     super.didAddSubview(subview)
     disableInteractionsRecursively(on: subview)
+    subview.frame = bounds
+    subview.autoresizingMask = [.flexibleWidth, .flexibleHeight]
   }
 
   override func layoutSubviews() {
     super.layoutSubviews()
     for sub in subviews {
+      sub.frame = bounds
+      sub.autoresizingMask = [.flexibleWidth, .flexibleHeight]
       disableInteractionsRecursively(on: sub)
     }
   }
@@ -164,7 +168,10 @@ final class PlayerVideoContainerView: UIView {
 
   override func layoutSubviews() {
     super.layoutSubviews()
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
     avLayerView.frame = bounds
+    CATransaction.commit()
     mpvMetalView.frame = bounds
     applyFitLayout()
   }
@@ -690,7 +697,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     audioUrl: String?,
     headers: [String: String],
     startMs: Int64,
-    subtitles: [SubtitleOption]
+    subtitles: [SubtitleOption],
+    autoPlay: Bool = true
   ) {
     loadGeneration &+= 1
     let gen = loadGeneration
@@ -709,7 +717,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     nominalFps = nil
     selectedSubtitleIdx = -1
     selectedAudioIdx = -1
-    shouldAutoPlay = true
+    shouldAutoPlay = autoPlay
     isSeeking = false
     seekSerial &+= 1
     didAutoFallbackFromAv = false
@@ -1682,8 +1690,10 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     presentationSizeObs = item.observe(\.presentationSize, options: [.new, .initial]) { [weak self] it, _ in
       DispatchQueue.main.async {
         guard let self = self, self.isUsingAvPlayer else { return }
-        self.videoSize = it.presentationSize
-        self.videoView.naturalVideoSize = it.presentationSize
+        let sz = it.presentationSize
+        guard sz.width > 0 && sz.height > 0 else { return }
+        self.videoSize = sz
+        self.videoView.naturalVideoSize = sz
         self.delegate?.kernelDidUpdateMetrics()
       }
     }
@@ -1747,6 +1757,18 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
   private func inspectAvTrackMetadata(on item: AVPlayerItem) {
     guard item.asset.statusOfValue(forKey: "tracks", error: nil) == .loaded,
           let vTrack = item.asset.tracks(withMediaType: .video).first else { return }
+    var metricsChanged = false
+    if videoSize.width <= 0 || videoSize.height <= 0 {
+      let transformed = vTrack.naturalSize.applying(vTrack.preferredTransform)
+      let w = abs(transformed.width)
+      let h = abs(transformed.height)
+      if w > 0 && h > 0 {
+        let sz = CGSize(width: w, height: h)
+        videoSize = sz
+        videoView.naturalVideoSize = sz
+        metricsChanged = true
+      }
+    }
     if vTrack.nominalFrameRate > 0 {
       nominalFps = Double(vTrack.nominalFrameRate)
     }
@@ -1773,6 +1795,9 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         let raw = String(cString: bytes).trimmingCharacters(in: .whitespacesAndNewlines)
         if !raw.isEmpty { videoCodecName = raw.uppercased() }
       }
+    }
+    if metricsChanged {
+      delegate?.kernelDidUpdateMetrics()
     }
   }
 

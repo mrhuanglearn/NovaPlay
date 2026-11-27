@@ -290,9 +290,10 @@ class _WebScreenState extends ConsumerState<WebScreen> {
 
   Future<void> _play(SniffedResource r) async {
     try {
-      await ref
-          .read(playerLauncherProvider)
-          .playSource(DirectPlaybackSource.single(title: r.title ?? _url.text, url: r.url, headers: r.headers));
+      await ref.read(playerLauncherProvider).playSource(
+            DirectPlaybackSource.single(title: r.title ?? _url.text, url: r.url, headers: r.headers),
+            isCancelled: () => !mounted,
+          );
     } catch (e) {
       showToast('$e');
     }

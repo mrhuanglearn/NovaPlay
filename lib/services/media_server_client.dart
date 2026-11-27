@@ -49,21 +49,28 @@ class MediaItem {
     this.seasonNumber,
     this.episodeNumber,
     this.isFavorite = false,
+    this.videoWidth,
+    this.videoHeight,
   });
 
-  factory MediaItem.fromJson(Map<String, dynamic> j) => MediaItem(
-        id: j['Id'] as String,
-        name: (j['Name'] ?? '') as String,
-        type: (j['Type'] ?? '') as String,
-        year: j['ProductionYear'] as int?,
-        overview: j['Overview'] as String?,
-        runTimeTicks: j['RunTimeTicks'] as int?,
-        positionTicks: (j['UserData'] as Map?)?['PlaybackPositionTicks'] as int?,
-        seriesId: j['SeriesId'] as String?,
-        seasonNumber: j['ParentIndexNumber'] as int?,
-        episodeNumber: j['IndexNumber'] as int?,
-        isFavorite: (j['UserData'] as Map?)?['IsFavorite'] == true,
-      );
+  factory MediaItem.fromJson(Map<String, dynamic> j) {
+    final dims = MediaServerClient.extractVideoDimensions(j);
+    return MediaItem(
+      id: j['Id'] as String,
+      name: (j['Name'] ?? '') as String,
+      type: (j['Type'] ?? '') as String,
+      year: j['ProductionYear'] as int?,
+      overview: j['Overview'] as String?,
+      runTimeTicks: j['RunTimeTicks'] as int?,
+      positionTicks: (j['UserData'] as Map?)?['PlaybackPositionTicks'] as int?,
+      seriesId: j['SeriesId'] as String?,
+      seasonNumber: j['ParentIndexNumber'] as int?,
+      episodeNumber: j['IndexNumber'] as int?,
+      isFavorite: (j['UserData'] as Map?)?['IsFavorite'] == true,
+      videoWidth: dims?.$1,
+      videoHeight: dims?.$2,
+    );
+  }
 
   final String id;
   final String name;
@@ -76,6 +83,8 @@ class MediaItem {
   final int? seasonNumber;
   final int? episodeNumber;
   final bool isFavorite;
+  final int? videoWidth;
+  final int? videoHeight;
 
   bool get isSeries => type == 'Series';
 
@@ -136,8 +145,11 @@ class MediaServerClient {
         'Limit': 50,
       });
   Future<List<MediaItem>> seasons(String seriesId) => _items('/Shows/$seriesId/Seasons', {'UserId': account.userId});
-  Future<List<MediaItem>> episodes(String seriesId, {String? seasonId}) =>
-      _items('/Shows/$seriesId/Episodes', {'UserId': account.userId, if (seasonId != null) 'SeasonId': seasonId});
+  Future<List<MediaItem>> episodes(String seriesId, {String? seasonId}) => _items('/Shows/$seriesId/Episodes', {
+        'UserId': account.userId,
+        'Fields': 'MediaStreams',
+        if (seasonId != null) 'SeasonId': seasonId,
+      });
 
   String imageUrl(String itemId, {String type = 'Primary', int maxWidth = 400}) =>
       '$_base/Items/$itemId/Images/$type?maxWidth=$maxWidth${account.token == null ? '' : '&api_key=${account.token}'}';
@@ -161,14 +173,53 @@ class MediaServerClient {
         : _dio.delete<dynamic>(path, options: Options(headers: _headers));
   }
 
-  /// Direct-play URL (static stream) plus the header map the native player must send.
-  Future<({String url, Map<String, String> headers})> playbackUrl(String itemId) async {
-    await _dio.post<dynamic>('$_base/Items/$itemId/PlaybackInfo',
+  /// Direct-play URL (static stream) plus the header map and any stream dimensions reported by `PlaybackInfo`.
+  Future<({String url, Map<String, String> headers, int? width, int? height})> playbackUrl(String itemId) async {
+    final res = await _dio.post<dynamic>('$_base/Items/$itemId/PlaybackInfo',
         queryParameters: {'UserId': account.userId}, data: const {}, options: Options(headers: _headers));
+    final dims = extractVideoDimensions(res.data);
     return (
       url: '$_base/Videos/$itemId/stream?static=true&api_key=${account.token}',
       headers: {'X-Emby-Token': account.token ?? ''},
+      width: dims?.$1,
+      height: dims?.$2,
     );
+  }
+
+  static (int, int)? _dimsFromStreams(Object? streams) {
+    if (streams is! List) return null;
+    for (final st in streams) {
+      if (st is! Map || '${st['Type']}'.toLowerCase() != 'video') continue;
+      final rawW = st['Width'];
+      final rawH = st['Height'];
+      final w = rawW is int ? rawW : int.tryParse('$rawW');
+      final h = rawH is int ? rawH : int.tryParse('$rawH');
+      if (w == null || h == null || w <= 0 || h <= 0) continue;
+      final rawRot = st['Rotation'];
+      final rot = rawRot is int ? rawRot : (int.tryParse('$rawRot') ?? 0);
+      return rot.abs() % 180 != 0 ? (h, w) : (w, h);
+    }
+    return null;
+  }
+
+  static (int, int)? extractVideoDimensions(Object? data) {
+    if (data is! Map) return null;
+    final sources = data['MediaSources'];
+    if (sources is List) {
+      for (final src in sources) {
+        if (src is! Map) continue;
+        final hit = _dimsFromStreams(src['MediaStreams']);
+        if (hit != null) return hit;
+      }
+    }
+    final directStreams = _dimsFromStreams(data['MediaStreams']);
+    if (directStreams != null) return directStreams;
+    final rawW = data['Width'];
+    final rawH = data['Height'];
+    final w = rawW is int ? rawW : int.tryParse('$rawW');
+    final h = rawH is int ? rawH : int.tryParse('$rawH');
+    if (w != null && h != null && w > 0 && h > 0) return (w, h);
+    return null;
   }
 
   Future<void> reportStarted(String itemId) => _session('/Sessions/Playing', itemId, 0);

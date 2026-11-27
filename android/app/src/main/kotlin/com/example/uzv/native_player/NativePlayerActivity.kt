@@ -40,8 +40,6 @@ import com.example.uzv.native_player.kernel.KernelSelection
 import com.example.uzv.native_player.kernel.PlayerKernel
 import com.example.uzv.native_player.kernel.mpv.MpvKernel
 import com.example.uzv.native_player.kernel.mdk.MdkKernel
-import com.example.uzv.native_player.kernel.mdk.MdkNative
-import com.example.uzv.native_player.kernel.mpv.MpvNative
 import com.example.uzv.native_player.media.PlaybackNotificationService
 import com.example.uzv.Haptics
 import com.example.uzv.native_player.ui.DanmakuView
@@ -65,8 +63,12 @@ import com.example.uzv.native_player.ui.SwitchView
 class NativePlayerActivity : AppCompatActivity() {
     private var controller: PlayerController? = null
     private var rootView: FrameLayout? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
     private var inPip = false
     private var wasInPip = false
+    private var manualOrientationThisEpisode = false
+    private var lastVideoSize: Pair<Int, Int>? = null
+    private var deferredAutoOrientSize: Pair<Int, Int>? = null
     private val danmakuPanel by lazy {
         DanmakuPanelController(
             activity = this,
@@ -84,22 +86,47 @@ class NativePlayerActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val request = NativePlayerHost.takePending()
-        if (request == null) { finish(); return }
+        val launch = NativePlayerHost.takePendingLaunch()
+        if (launch == null) { finish(); return }
+        val request = launch.request
 
         ensureKeepScreenOn()
-        applyOrientation(request.playbackConfig)
+        val initialMode = PlayerUiText.effectiveOrientationMode(request.playbackConfig)
+        requestedOrientation = when (initialMode) {
+            "landscape" -> ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            "portrait" -> ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            else -> if (isHandheldPhone()) {
+                if (launch.initialLandscape) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                else ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            } else {
+                ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
+        }
+        lastVideoSize = launch.probedSize
+        manualOrientationThisEpisode = launch.manualOrientation
 
         val root = FrameLayout(this).apply {
             setBackgroundColor(0xFF000000.toInt())
             keepScreenOn = true
         }
         rootView = root
-        val (kernel, activeKernel) = createKernel(request.playbackConfig)
+        val (kernel, activeKernelId) = if (launch.kernel != null) {
+            launch.kernel to launch.activeKernelId
+        } else {
+            val requestedEnum = KernelSelection.parse(launch.activeKernelId)
+            val built = buildSpecificKernel(requestedEnum, request.playbackConfig.hwDecode)
+            if (built != null) {
+                built to requestedEnum.id
+            } else {
+                val (fallbackKernel, fallbackEnum) = createKernel(request.playbackConfig)
+                fallbackKernel to fallbackEnum.id
+            }
+        }
+        val kernelView = kernel.attachActivity(this)
         val danmaku = DanmakuView(this).also { it.attach(kernel) }
-        root.addView(kernel.view, FrameLayout.LayoutParams(-1, -1))
+        root.addView(kernelView, FrameLayout.LayoutParams(-1, -1))
         root.addView(danmaku, FrameLayout.LayoutParams(-1, -1))
-        val c = PlayerController(request, kernel, danmaku, activeKernel.id) { finish() }
+        val c = PlayerController(request, kernel, danmaku, activeKernelId, prewarmed = launch) { finish() }
         controller = c
         NativePlayerHost.controller = c
         c.applyHeadTail()
@@ -108,7 +135,7 @@ class NativePlayerActivity : AppCompatActivity() {
                 val oldView = c.kernel.view
                 val idx = root.indexOfChild(oldView).coerceAtLeast(0)
                 root.removeView(oldView)
-                root.addView(nextKernel.view, idx, FrameLayout.LayoutParams(-1, -1))
+                root.addView(nextKernel.attachActivity(this), idx, FrameLayout.LayoutParams(-1, -1))
             }
         }
 
@@ -132,6 +159,21 @@ class NativePlayerActivity : AppCompatActivity() {
             override fun onHaptic() = haptic(c, Haptics.SELECTION)
         }).also { it.setTitle(request.title) }
         this.controls = controls
+        controls.onOverlayClosed = {
+            if (deferredAutoOrientSize != null) {
+                mainHandler.post {
+                    if (isFinishing || isDestroyed || controls.menuOpen || controls.panelOpen) return@post
+                    val pending = deferredAutoOrientSize ?: return@post
+                    deferredAutoOrientSize = null
+                    val ctrl = controller ?: return@post
+                    if (PlayerUiText.effectiveOrientationMode(ctrl.playbackConfig) == "auto" &&
+                        !manualOrientationThisEpisode
+                    ) {
+                        applyAutoOrientationForSize(pending.first, pending.second)
+                    }
+                }
+            }
+        }
         root.addView(controls, FrameLayout.LayoutParams(-1, -1))
         c.uiListener = object : PlayerController.UiListener {
             override fun onChanged() {
@@ -143,6 +185,44 @@ class NativePlayerActivity : AppCompatActivity() {
             override fun onNotice(text: String) = controls.showNotice(text)
             override fun onToast(text: String, long: Boolean) =
                 Toast.makeText(this@NativePlayerActivity, text, if (long) Toast.LENGTH_LONG else Toast.LENGTH_SHORT).show()
+            override fun onVideoSizeChanged(width: Int, height: Int) {
+                if (width <= 0 || height <= 0) return
+                lastVideoSize = width to height
+                controls.refresh()
+                if (inPip && Build.VERSION.SDK_INT >= 26) {
+                    syncPipAspectRatio()
+                }
+                val mode = PlayerUiText.effectiveOrientationMode(c.playbackConfig)
+                if (mode != "auto" || manualOrientationThisEpisode) return
+                if (controls.menuOpen || controls.panelOpen) {
+                    deferredAutoOrientSize = width to height
+                    return
+                }
+                applyAutoOrientationForSize(width, height)
+            }
+            override fun onEpisodeStarted() {
+                val wasManual = manualOrientationThisEpisode
+                val prevSize = lastVideoSize
+                lastVideoSize = null
+                deferredAutoOrientSize = null
+                if (PlayerUiText.effectiveOrientationMode(c.playbackConfig) == "auto") {
+                    manualOrientationThisEpisode = false
+                    if (wasManual && isHandheldPhone()) {
+                        val targetLandscape = resolveEpisodeResetLandscape(prevSize)
+                        val desired = if (targetLandscape) {
+                            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                        } else {
+                            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+                        }
+                        if (isCurrentlyLandscape() != targetLandscape || requestedOrientation != desired) {
+                            requestedOrientation = desired
+                        }
+                    }
+                }
+            }
+            override fun onOrientationConfigChanged() {
+                onOrientationModeChanged(PlayerUiText.effectiveOrientationMode(c.playbackConfig))
+            }
         }
         c.danmakuSearchListener = { results -> danmakuPanel.onSearchResults(c, results) }
         c.danmakuEpisodesListener = { episodes -> danmakuPanel.onEpisodeResults(c, episodes) }
@@ -287,26 +367,16 @@ class NativePlayerActivity : AppCompatActivity() {
         android.provider.Settings.System.getInt(contentResolver, android.provider.Settings.System.SCREEN_BRIGHTNESS) / 255f
     } catch (e: Exception) { 0.5f }
 
-    private fun kernelAvailable(k: KernelSelection.Kernel) = when (k) {
-        KernelSelection.Kernel.EXO -> true
-        KernelSelection.Kernel.MPV -> MpvNative.isAvailable()
-        KernelSelection.Kernel.MDK -> MdkNative.isAvailable()
-    }
-
-    private fun kernelUnavailableReason(k: KernelSelection.Kernel) = when (k) {
-        KernelSelection.Kernel.MPV -> MpvNative.unavailableReason()
-        KernelSelection.Kernel.MDK -> MdkNative.unavailableReason()
-        else -> ""
+    private fun instantiateKernel(k: KernelSelection.Kernel, hwDecode: Boolean): PlayerKernel = when (k) {
+        KernelSelection.Kernel.MPV -> MpvKernel(this, hwDecode)
+        KernelSelection.Kernel.MDK -> MdkKernel(this, hwDecode)
+        KernelSelection.Kernel.EXO -> ExoKernel(this)
     }
 
     private fun buildSpecificKernel(k: KernelSelection.Kernel, hwDecode: Boolean): PlayerKernel? {
-        if (!kernelAvailable(k)) return null
+        if (!NativePlayerHost.kernelAvailable(k)) return null
         return try {
-            when (k) {
-                KernelSelection.Kernel.MPV -> MpvKernel(this, hwDecode)
-                KernelSelection.Kernel.MDK -> MdkKernel(this, hwDecode)
-                KernelSelection.Kernel.EXO -> ExoKernel(this)
-            }
+            instantiateKernel(k, hwDecode)
         } catch (_: Throwable) {
             null
         }
@@ -318,15 +388,19 @@ class NativePlayerActivity : AppCompatActivity() {
      * ([PlayerControlsView]) and panels, so the page looks and works the same whatever the kernel.
      */
     private fun createKernel(config: PlaybackConfig): Pair<PlayerKernel, KernelSelection.Kernel> {
-        val choice = KernelSelection.choose(config.kernel, ::kernelAvailable, ::kernelUnavailableReason)
-        try {
-            when (choice.kernel) {
-                KernelSelection.Kernel.MPV -> return MpvKernel(this, config.hwDecode) to KernelSelection.Kernel.MPV
-                KernelSelection.Kernel.MDK -> return MdkKernel(this, config.hwDecode) to KernelSelection.Kernel.MDK
-                KernelSelection.Kernel.EXO -> choice.notice?.let { Toast.makeText(this, it, Toast.LENGTH_LONG).show() }
+        val choice = KernelSelection.choose(
+            config.kernel,
+            NativePlayerHost::kernelAvailable,
+            NativePlayerHost::kernelUnavailableReason,
+        )
+        if (choice.kernel == KernelSelection.Kernel.EXO) {
+            choice.notice?.let { Toast.makeText(this, it, Toast.LENGTH_LONG).show() }
+        } else {
+            try {
+                return instantiateKernel(choice.kernel, config.hwDecode) to choice.kernel
+            } catch (e: Throwable) {
+                Toast.makeText(this, KernelSelection.fallbackNotice(choice.kernel, e.message), Toast.LENGTH_LONG).show()
             }
-        } catch (e: Throwable) {
-            Toast.makeText(this, KernelSelection.fallbackNotice(choice.kernel, e.message), Toast.LENGTH_LONG).show()
         }
         return ExoKernel(this) to KernelSelection.Kernel.EXO
     }
@@ -817,8 +891,8 @@ class NativePlayerActivity : AppCompatActivity() {
                         val next = item.select(c.effectivePlaybackConfig)
                         if (item.key.startsWith(PlayerSettings.KERNEL)) {
                             val k = KernelSelection.parse(next.kernel)
-                            if (!kernelAvailable(k)) {
-                                toast(PlayerUiText.t("${k.label} 内核不可用：${kernelUnavailableReason(k)}", "${k.label} kernel unavailable: ${kernelUnavailableReason(k)}"))
+                            if (!NativePlayerHost.kernelAvailable(k)) {
+                                toast(PlayerUiText.t("${k.label} 内核不可用：${NativePlayerHost.kernelUnavailableReason(k)}", "${k.label} kernel unavailable: ${NativePlayerHost.kernelUnavailableReason(k)}"))
                                 return@setOnClickListener
                             }
                         }
@@ -864,16 +938,62 @@ class NativePlayerActivity : AppCompatActivity() {
         val old = c.effectivePlaybackConfig
         if (PlayerSettings.needsReload(old, next)) { reloadWith(c, next); return }
         c.updatePlayback(next)
-        if (old.isPriorityLandscape != next.isPriorityLandscape) applyOrientation(next)
+        val oldMode = PlayerUiText.effectiveOrientationMode(old)
+        val newMode = PlayerUiText.effectiveOrientationMode(next)
+        if (oldMode != newMode || old.isPriorityLandscape != next.isPriorityLandscape) {
+            onOrientationModeChanged(newMode)
+        }
     }
 
-    private fun applyOrientation(config: PlaybackConfig) {
-        requestedOrientation = if (config.isPriorityLandscape) ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
-        else ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+    private fun isHandheldPhone(): Boolean =
+        resources.configuration.smallestScreenWidthDp < 600 &&
+            !inPip &&
+            !(Build.VERSION.SDK_INT >= 24 && isInMultiWindowMode)
+
+    private fun onOrientationModeChanged(mode: String) {
+        manualOrientationThisEpisode = false
+        deferredAutoOrientSize = null
+        when (mode) {
+            "landscape" -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            "portrait" -> requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            else -> {
+                val size = lastVideoSize
+                    ?: controller?.kernel?.mediaInfo()?.takeIf { it.width > 0 && it.height > 0 }?.let { it.width to it.height }
+                if (size != null) {
+                    applyAutoOrientationForSize(size.first, size.second)
+                } else if (isHandheldPhone()) {
+                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                }
+            }
+        }
+    }
+
+    private fun isCurrentlyLandscape(): Boolean {
+        val root = rootView
+        return if (root != null && root.width > 0 && root.height > 0) {
+            root.width > root.height
+        } else {
+            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        }
+    }
+
+    private fun applyAutoOrientationForSize(w: Int, h: Int) {
+        if (!isHandheldPhone()) return
+        val targetLandscape = w >= h
+        val desired = if (targetLandscape) {
+            ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+        } else {
+            ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+        }
+        if (isCurrentlyLandscape() != targetLandscape || requestedOrientation != desired) {
+            requestedOrientation = desired
+        }
     }
 
     /** 旋转屏幕 (OBSERVED: three steps): landscape → the other landscape → portrait → landscape. */
     private fun rotate() {
+        manualOrientationThisEpisode = true
+        deferredAutoOrientSize = null
         @Suppress("DEPRECATION")
         val rotation = windowManager.defaultDisplay.rotation
         requestedOrientation = when (rotation) {
@@ -890,29 +1010,34 @@ class NativePlayerActivity : AppCompatActivity() {
     private fun reloadWith(c: PlayerController, next: PlaybackConfig) {
         c.updatePlayback(next)
         val request = c.reloadRequest(next)
-        NativePlayerHost.restart(request, c.currentSpeed)
+        val carriedSize = lastVideoSize
+            ?: c.kernel.mediaInfo()?.takeIf { it.width > 0 && it.height > 0 }?.let { it.width to it.height }
+        NativePlayerHost.restart(request, c.currentSpeed, isCurrentlyLandscape(), carriedSize, manualOrientationThisEpisode)
         c.detach()
         if (NativePlayerHost.controller === c) NativePlayerHost.controller = null
         controller = null
         recreate()
     }
 
+    private fun currentPipRatio(): Rational {
+        val info = controller?.kernel?.mediaInfo()
+        val decoded = if (info != null && info.width > 0 && info.height > 0) info.width to info.height else null
+        val (num, den) = computePipAspectRatio(decoded, lastVideoSize)
+        return Rational(num, den)
+    }
+
+    private fun syncPipAspectRatio() {
+        if (Build.VERSION.SDK_INT < 26) return
+        try {
+            setPictureInPictureParams(PictureInPictureParams.Builder().setAspectRatio(currentPipRatio()).build())
+        } catch (_: Throwable) {}
+    }
+
     private fun enterPip() {
         if (Build.VERSION.SDK_INT < 26) { notice(PlayerUiText.t("画中画需要 Android 8.0 及以上", "Picture-in-picture needs Android 8.0")); return }
         controls?.hide()
         try {
-            val info = controller?.kernel?.mediaInfo()
-            val ratio = if (info != null && info.width > 0 && info.height > 0) {
-                val r = info.width.toDouble() / info.height.toDouble()
-                when {
-                    r < 100.0 / 239.0 -> Rational(100, 239)
-                    r > 239.0 / 100.0 -> Rational(239, 100)
-                    else -> Rational(info.width, info.height)
-                }
-            } else {
-                Rational(16, 9)
-            }
-            val entered = enterPictureInPictureMode(PictureInPictureParams.Builder().setAspectRatio(ratio).build())
+            val entered = enterPictureInPictureMode(PictureInPictureParams.Builder().setAspectRatio(currentPipRatio()).build())
             if (entered) {
                 inPip = true
                 wasInPip = true
@@ -983,13 +1108,57 @@ class NativePlayerActivity : AppCompatActivity() {
         }
     }
 
+    private fun syncOrientationForCurrentWindowMode() {
+        if (isFinishing || isDestroyed) return
+        val c = controller ?: return
+        val mode = PlayerUiText.effectiveOrientationMode(c.playbackConfig)
+        val inNonPipMultiWindow = Build.VERSION.SDK_INT >= 24 &&
+            isInMultiWindowMode &&
+            !inPip &&
+            !(Build.VERSION.SDK_INT >= 26 && isInPictureInPictureMode)
+        if (inNonPipMultiWindow) {
+            if (mode == "auto" && requestedOrientation != ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED) {
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED
+            }
+            return
+        }
+        if (!isHandheldPhone()) return
+        when (mode) {
+            "landscape" -> if (requestedOrientation != ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE) {
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+            }
+            "portrait" -> if (requestedOrientation != ActivityInfo.SCREEN_ORIENTATION_PORTRAIT) {
+                requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_PORTRAIT
+            }
+            else -> {
+                if (manualOrientationThisEpisode) return
+                val size = lastVideoSize
+                    ?: c.kernel.mediaInfo()?.takeIf { it.width > 0 && it.height > 0 }?.let { it.width to it.height }
+                if (controls?.menuOpen == true || controls?.panelOpen == true) {
+                    if (size != null) deferredAutoOrientSize = size
+                    return
+                }
+                if (size != null) {
+                    applyAutoOrientationForSize(size.first, size.second)
+                } else if (requestedOrientation != ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE) {
+                    requestedOrientation = ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                }
+            }
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         ensureKeepScreenOn()
         if (Build.VERSION.SDK_INT < 26 || !isInPictureInPictureMode) {
+            val exitingPip = inPip || wasInPip
             inPip = false
             wasInPip = false
             controls?.setPipMode(false)
+            if (exitingPip) {
+                syncOrientationForCurrentWindowMode()
+                mainHandler.post { syncOrientationForCurrentWindowMode() }
+            }
         }
     }
 
@@ -1005,7 +1174,18 @@ class NativePlayerActivity : AppCompatActivity() {
             PlaybackNotificationService.stop(this)
             finish()
         } else {
+            wasInPip = false
             ensureKeepScreenOn()
+            syncOrientationForCurrentWindowMode()
+            mainHandler.post { syncOrientationForCurrentWindowMode() }
+        }
+    }
+
+    override fun onMultiWindowModeChanged(isInMultiWindowMode: Boolean, newConfig: Configuration) {
+        super.onMultiWindowModeChanged(isInMultiWindowMode, newConfig)
+        syncOrientationForCurrentWindowMode()
+        if (!isInMultiWindowMode) {
+            mainHandler.post { syncOrientationForCurrentWindowMode() }
         }
     }
 
@@ -1043,10 +1223,30 @@ class NativePlayerActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        mainHandler.removeCallbacksAndMessages(null)
         rootView = null
         controller?.close()
         if (NativePlayerHost.controller === controller) NativePlayerHost.controller = null
+        controller = null
         PlaybackNotificationService.stop(this)
         super.onDestroy()
+    }
+}
+
+internal fun resolveEpisodeResetLandscape(prevVideoSize: Pair<Int, Int>?): Boolean =
+    prevVideoSize?.takeIf { it.first > 0 && it.second > 0 }?.let { it.first >= it.second } ?: true
+
+internal fun computePipAspectRatio(
+    decodedSize: Pair<Int, Int>?,
+    fallbackSize: Pair<Int, Int>?,
+): Pair<Int, Int> {
+    val size = decodedSize?.takeIf { it.first > 0 && it.second > 0 }
+        ?: fallbackSize?.takeIf { it.first > 0 && it.second > 0 }
+        ?: return 16 to 9
+    val r = size.first.toDouble() / size.second.toDouble()
+    return when {
+        r < 100.0 / 239.0 -> 100 to 239
+        r > 239.0 / 100.0 -> 239 to 100
+        else -> size
     }
 }

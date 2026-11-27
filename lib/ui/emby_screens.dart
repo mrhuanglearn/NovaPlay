@@ -338,6 +338,7 @@ class _EmbyDetailScreenState extends ConsumerState<EmbyDetailScreen> {
   late final Future<({MediaItem item, List<MediaItem> episodes})> _load = _fetch();
   int _season = 1;
   bool? _favorite;
+  bool _opening = false;
 
   Future<({MediaItem item, List<MediaItem> episodes})> _fetch() async {
     // first evaluated from build(), so the localized message can be read before the first await
@@ -350,15 +351,23 @@ class _EmbyDetailScreenState extends ConsumerState<EmbyDetailScreen> {
   }
 
   Future<void> _play(MediaServerClient client, MediaItem item, List<MediaItem> all, int startIndex) async {
+    if (_opening) return;
+    setState(() => _opening = true);
     try {
       await ref.read(playerLauncherProvider).playSource(
             MediaServerPlaybackSource(
                 client: client, title: item.name, items: all, cover: client.imageUrl(item.id), memoryId: item.id),
-            episode: startIndex,
+            episode: startIndex < 0 ? 0 : startIndex,
+            isCancelled: () => !mounted,
+            onOpened: () {
+              if (mounted) setState(() => _opening = false);
+            },
           );
       ref.invalidate(embyHomeProvider);
     } catch (e) {
       showToast('$e');
+    } finally {
+      if (mounted && _opening) setState(() => _opening = false);
     }
   }
 

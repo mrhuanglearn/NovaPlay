@@ -27,9 +27,11 @@ class _LiveScreenState extends ConsumerState<LiveScreen> {
   String? _group;
   String _query = '';
   bool _searching = false;
+  bool _opening = false;
 
   Future<void> _play(
       LiveSource source, List<LiveChannel> all, Set<String> blocked, LiveChannel tapped, XmltvGuide? guide) async {
+    if (_opening) return;
     final groups = liveGroups(all, blocked: blocked);
     final lines = [
       for (final g in groups)
@@ -51,14 +53,21 @@ class _LiveScreenState extends ConsumerState<LiveScreen> {
                 description: e.description,
               ),
           ];
+    setState(() => _opening = true);
     try {
       await ref.read(playerLauncherProvider).playSource(
             DirectPlaybackSource(title: source.name, lines: lines, epg: programmes ?? const <EpgProgramme>[]),
             line: line,
             episode: episode < 0 ? 0 : episode,
+            isCancelled: () => !mounted,
+            onOpened: () {
+              if (mounted) setState(() => _opening = false);
+            },
           );
     } catch (e) {
       showToast('$e');
+    } finally {
+      if (mounted && _opening) setState(() => _opening = false);
     }
   }
 

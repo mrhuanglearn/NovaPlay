@@ -49,6 +49,12 @@ class _MemorySubscriptionInstaller extends SubscriptionInstaller {
   Future<InstalledScript?> installedScript(Subscription sub) async => _installed[sub.key];
 
   @override
+  Future<String?> remoteMd5(Subscription sub) async {
+    final body = sub.indexJsUrl == null ? null : _remoteScripts[sub.indexJsUrl!];
+    return body == null ? null : md5Of(body);
+  }
+
+  @override
   Future<InstalledScript> install(Subscription sub, {Future<bool> Function()? confirmConfigMismatch}) async {
     if (installGate != null) await installGate;
     final url = sub.indexJsUrl;
@@ -581,6 +587,80 @@ void main() {
       expect(await container.read(activeSubscriptionKeyProvider.future), added.key);
       await container.read(catpawRuntimeProvider.future);
       expect(activeRuntimeKey, added.key);
+    });
+
+    testWidgets('HomeScreen error retry triggers retryPendingSubscriptionAutoUpdates after startup failure',
+        (tester) async {
+      const subUrl = 'http://127.0.0.1:3006/auto/index.js.md5';
+      const scriptV1 = 'module.exports = { v: 1 };';
+      const scriptV2 = 'module.exports = { v: 2 };';
+      const site = SpiderSite(key: 'demo', name: '演示站', api: '/spider/demo/3');
+
+      final remoteScripts = <String, String>{subUrl: scriptV1};
+      final repo = SubscriptionRepository(store: _MemoryStore('subscriptions.json'));
+      final installer = _MemorySubscriptionInstaller(remoteScripts);
+      final service = SubscriptionService(repository: repo, installer: installer);
+      final sub = await service.addNetwork(url: subUrl, name: 'AutoSub', autoUpdate: true);
+
+      // Simulate offline/unreachable subscription host at app start, while old V1 home feed fails to load.
+      remoteScripts.remove(subUrl);
+      final container = ProviderContainer(overrides: [
+        settingsStoreProvider.overrideWithValue(_MemoryStore('settings.json', <String, dynamic>{
+          'activeSubscription': sub.key,
+        })),
+        initialAppPreferencesProvider.overrideWithValue(const AppPreferences()),
+        subscriptionRepositoryProvider.overrideWithValue(repo),
+        subscriptionInstallerProvider.overrideWithValue(installer),
+        subscriptionServiceProvider.overrideWithValue(service),
+        nodeBridgeProvider.overrideWithValue(_NoopNodeBridge()),
+        catpawRuntimeProvider.overrideWith((ref) async {
+          final subs = await ref.watch(subscriptionsProvider.future);
+          return SpiderRuntime(
+            subscription: subs.first,
+            api: SpiderApi(9321, baseUrl: 'http://127.0.0.1:9321'),
+            sites: const [site],
+          );
+        }),
+        videoFeedProvider.overrideWith((ref) async {
+          await ref.watch(catpawRuntimeProvider.future);
+          final installed = await installer.installedScript(sub);
+          if (installed?.md5 != _MemorySubscriptionInstaller.md5Of(scriptV2)) {
+            throw StateError('stale V1 script cannot load site');
+          }
+          return const HomeData(categories: [VodCategory(id: 'movie', name: '电影')], featured: []);
+        }),
+        videoCategoryFeedProvider.overrideWithValue(
+          (q) async => PagedVods(items: const [VodItem(id: 'ok1', name: '恢复后影片')], page: q.page, pageCount: 1),
+        ),
+      ]);
+      addTearDown(container.dispose);
+
+      // Startup auto-update fails while offline -> must record pending retry without locking out a retry <15s later.
+      await runStartupSubscriptionAutoUpdate(container);
+      expect((await repo.all()).single.installedMd5, _MemorySubscriptionInstaller.md5Of(scriptV1));
+
+      await tester.pumpWidget(UncontrolledProviderScope(
+        container: container,
+        child: MaterialApp(
+          locale: const Locale('zh'),
+          localizationsDelegates: AppLocalizations.localizationsDelegates,
+          supportedLocales: AppLocalizations.supportedLocales,
+          theme: buildAppTheme(Brightness.dark),
+          scaffoldMessengerKey: rootMessengerKey,
+          home: const HomeScreen(),
+        ),
+      ));
+      await tester.pumpAndSettle();
+      expect(find.text('加载失败'), findsOneWidget);
+      expect(find.text('重新加载'), findsOneWidget);
+
+      // Network recovers and hosts V2; tapping 重新加载 on HomeScreen retries pending auto-update and recovers!
+      remoteScripts[subUrl] = scriptV2;
+      await tester.tap(find.text('重新加载'));
+      await tester.pumpAndSettle();
+
+      expect((await repo.all()).single.installedMd5, _MemorySubscriptionInstaller.md5Of(scriptV2));
+      expect(find.text('恢复后影片'), findsOneWidget);
     });
   });
 }

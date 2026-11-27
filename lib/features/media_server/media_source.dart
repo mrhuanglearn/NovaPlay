@@ -4,6 +4,7 @@ import '../../core/json_store.dart';
 import '../../models/vod.dart';
 import '../../services/media_server_client.dart';
 import '../player/playback_source.dart';
+import '../player/video_format_probe.dart';
 
 /// Emby / Jellyfin accounts (`emby_accounts.json`; file name and layout are this project's choice). The password is
 /// never stored, only the access token returned by the login.
@@ -53,8 +54,25 @@ class MediaServerPlaybackSource extends PlaybackSource {
 
   @override
   Future<PlayResult> resolve(int lineIndex, int episodeIndex) async {
-    final r = await client.playbackUrl(items[episodeIndex].id);
-    return PlayResult(url: r.url, headers: r.headers);
+    final item = items[episodeIndex];
+    final r = await client.playbackUrl(item.id);
+    return PlayResult(
+      url: r.url,
+      headers: r.headers,
+      videoWidth: r.width ?? item.videoWidth,
+      videoHeight: r.height ?? item.videoHeight,
+    );
+  }
+
+  @override
+  Future<VideoDimensions?> fallbackDimensions(int lineIndex, int episodeIndex) async {
+    if (episodeIndex >= 0 && episodeIndex < items.length) {
+      final it = items[episodeIndex];
+      if (it.videoWidth != null && it.videoHeight != null && it.videoWidth! > 0 && it.videoHeight! > 0) {
+        return (width: it.videoWidth!, height: it.videoHeight!);
+      }
+    }
+    return VideoFormatProbe.shared.cachedVod(memoryKey);
   }
 
   @override

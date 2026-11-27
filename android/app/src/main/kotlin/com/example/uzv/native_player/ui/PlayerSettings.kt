@@ -56,6 +56,7 @@ object PlayerSettings {
 
     const val KERNEL = "kernel"
     const val FIT = "fitMode"
+    const val ORIENTATION = "orientationMode"
 
     private fun t(zh: String, en: String) = PlayerUiText.t(zh, en)
 
@@ -66,6 +67,9 @@ object PlayerSettings {
 
     private fun fit(mode: String, icon: Int, rotate: Boolean = false) = Item.Option("$FIT:$mode", PlayerUiText.fitModePanel(mode), icon, rotate,
         { (it.fitMode.takeIf { m -> m in PlayerUiText.fitModes } ?: "fit") == mode }, { it.copy(fitMode = mode) })
+
+    private fun orientation(mode: String) = Item.Option("$ORIENTATION:$mode", PlayerUiText.orientationModePanel(mode), Ic.ROTATE, false,
+        { PlayerUiText.effectiveOrientationMode(it) == mode }, { it.copy(orientationMode = mode, isPriorityLandscape = mode != "portrait") })
 
     private fun kernel(id: String) = Item.Option("$KERNEL:$id", PlayerUiText.kernelName(id), Ic.MEMORY, false,
         { PlayerUiText.kernelName(it.kernel.lowercase(Locale.ROOT)) == PlayerUiText.kernelName(id) }, { it.copy(kernel = id) })
@@ -78,6 +82,9 @@ object PlayerSettings {
 
         Item.Section(t("画面比例", "Aspect")),
         fit("fit", Ic.ASPECT), fit("zoom", Ic.FIT), fit("fill", Ic.HEIGHT, rotate = true),
+
+        Item.Section(t("屏幕方向", "Orientation")),
+        orientation("auto"), orientation("landscape"), orientation("portrait"),
 
         Item.Section(t("播放内核", "Player kernel")),
         kernel("mpv"), kernel("mdk"), kernel("exo"),
@@ -105,8 +112,6 @@ object PlayerSettings {
         Item.Toggle("episodeSwitchNotice", t("切集提示", "Episode switch notice"),
             t("切集时显示「正在切换至 第X集」轻提示", "Show “Switching to episode X” when the episode changes"), Ic.DOUBLE_RIGHT,
             { it.isShowEpisodeSwitchNotice }, { c, v -> c.copy(isShowEpisodeSwitchNotice = v) }),
-        Item.Toggle("priorityLandscape", t("优先横屏", "Prefer landscape"), null, Ic.ROTATE,
-            { it.isPriorityLandscape }, { c, v -> c.copy(isPriorityLandscape = v) }),
         Item.Toggle("longPressSpeedAdjust", t("长按滑动调节倍速", "Slide to adjust the long-press speed"),
             t("关闭后长按仅使用固定倍速", "Off: a long press always uses the fixed speed"), Ic.TUNE,
             { it.isLongPressSpeedAdjustEnabled != false }, { c, v -> c.copy(isLongPressSpeedAdjustEnabled = v) }),

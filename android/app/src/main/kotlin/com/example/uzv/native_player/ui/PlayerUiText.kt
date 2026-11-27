@@ -1,5 +1,6 @@
 package com.example.uzv.native_player.ui
 
+import com.example.uzv.native_player.PlaybackConfig
 import com.example.uzv.native_player.kernel.MediaInfo
 import java.util.Locale
 
@@ -214,6 +215,18 @@ object PlayerUiText {
         "fill" -> t("拉伸填充", "Stretch")
         "zoom" -> t("裁剪填充", "Crop")
         else -> t("适应（留黑边）", "Fit (letterbox)")
+    }
+
+    val orientationModes = listOf("auto", "landscape", "portrait")
+
+    fun effectiveOrientationMode(cfg: PlaybackConfig): String =
+        cfg.orientationMode?.takeIf { it in orientationModes }
+            ?: if (cfg.isPriorityLandscape) "auto" else "portrait"
+
+    fun orientationModePanel(mode: String) = when (mode) {
+        "landscape" -> t("始终横屏", "Always landscape")
+        "portrait" -> t("始终竖屏", "Always portrait")
+        else -> t("自适应（按视频比例）", "Auto (by video aspect)")
     }
 
     /** OBSERVED picker order and labels in the original: MPV (MPV) / MDK (MDK) / EXO (SYSTEM). */

@@ -4,6 +4,7 @@ import android.content.Context
 import android.graphics.Color
 import android.graphics.Typeface
 import android.net.Uri
+import android.view.LayoutInflater
 import android.view.View
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -12,6 +13,7 @@ import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.TrackSelectionOverride
 import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
 import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.exoplayer.DefaultLoadControl
@@ -24,11 +26,13 @@ import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.PlayerView
 import androidx.media3.ui.SubtitleView
+import com.example.uzv.R
 import com.example.uzv.native_player.SubtitleOption
 
 /** What the activity needs from a decoding back end. The shipped app has two: Exo and MPV (changelog 1.1.11). */
 interface PlayerKernel {
     val view: View
+    fun attachActivity(activityContext: Context): View = view
     val positionMs: Long
     val durationMs: Long
     var speed: Float
@@ -36,7 +40,14 @@ interface PlayerKernel {
     /** 'fit' | 'fill' | 'zoom' (PlaybackConfig.fitMode). */
     var fitMode: String
     val isPlaying: Boolean
-    fun load(url: String, audioUrl: String?, headers: Map<String, String>, startMs: Long, subtitles: List<SubtitleOption> = emptyList())
+    fun load(
+        url: String,
+        audioUrl: String?,
+        headers: Map<String, String>,
+        startMs: Long,
+        subtitles: List<SubtitleOption> = emptyList(),
+        autoPlay: Boolean = true,
+    )
 
     /** Text tracks of the current media (embedded and sidecar), in the order [selectSubtitle] indexes them. */
     fun subtitleTracks(): List<TrackOption>
@@ -82,11 +93,32 @@ interface PlayerKernel {
     interface Listener {
         fun onState(state: String) // idle | buffering | playing | paused | ended
         fun onError(message: String, code: Int?)
+        fun onVideoSizeChanged(width: Int, height: Int) {}
     }
 }
 
-class ExoKernel(private val context: Context) : PlayerKernel {
-    private val bandwidth = DefaultBandwidthMeter.Builder(context).build()
+internal fun resolveVideoDisplaySize(
+    width: Int,
+    height: Int,
+    pixelWidthHeightRatio: Float = 1f,
+    rotationDegrees: Int = 0,
+): Pair<Int, Int>? {
+    if (width <= 0 || height <= 0) return null
+    val ratio = if (pixelWidthHeightRatio > 0f && pixelWidthHeightRatio.isFinite()) pixelWidthHeightRatio else 1f
+    var w = Math.round(width * ratio).coerceAtLeast(1)
+    var h = height
+    val unapplied = ((rotationDegrees % 180) + 180) % 180
+    if (unapplied == 90) {
+        val tmp = w
+        w = h
+        h = tmp
+    }
+    return w to h
+}
+
+class ExoKernel(context: Context) : PlayerKernel {
+    private val appContext = context.applicationContext
+    private val bandwidth = DefaultBandwidthMeter.Builder(appContext).build()
     private val loadControl = DefaultLoadControl.Builder()
         .setBufferDurationsMs(
             /* minBufferMs = */ 15_000,
@@ -95,7 +127,7 @@ class ExoKernel(private val context: Context) : PlayerKernel {
             /* bufferForPlaybackAfterRebufferMs = */ 1_500,
         )
         .build()
-    private val player = ExoPlayer.Builder(context)
+    private val player = ExoPlayer.Builder(appContext)
         .setLoadControl(loadControl)
         .setBandwidthMeter(bandwidth)
         .setWakeMode(C.WAKE_MODE_NETWORK)
@@ -104,12 +136,27 @@ class ExoKernel(private val context: Context) : PlayerKernel {
     /** Last load, so an extension-less URL that turned out to be HLS can be opened again as HLS. */
     private var lastLoadArgs: (() -> Unit)? = null
     private var forceHls = false
-    private val playerView = PlayerView(context).also {
-        it.player = player
-        it.useController = false
-        it.keepScreenOn = true
+    private var desiredAutoPlay = true
+    private var displayW = 0
+    private var displayH = 0
+    private var hasCurrentMediaFormat = false
+    private var playerView: PlayerView? = null
+    private var subtitleFontFamily: String? = null
+    private var subtitleFontsDir: String? = null
+
+    override fun attachActivity(activityContext: Context): View {
+        playerView?.let { return it }
+        return (LayoutInflater.from(activityContext).inflate(R.layout.uzv_exo_player_view, null) as PlayerView).also {
+            it.player = player
+            it.useController = false
+            it.keepScreenOn = true
+            applyFitMode(it, fitMode)
+            applySubtitleStyle(it)
+            playerView = it
+        }
     }
-    override val view: View get() = playerView
+
+    override val view: View get() = playerView ?: attachActivity(appContext)
     override var listener: PlayerKernel.Listener? = null
 
     private var preferredTextLanguage: String? = null
@@ -149,11 +196,17 @@ class ExoKernel(private val context: Context) : PlayerKernel {
                         return
                     }
                 }
+                if (tracks.groups.any { it.type == C.TRACK_TYPE_VIDEO }) hasCurrentMediaFormat = true
                 applyDefaultTextOnce()
                 applyPreferredAudioOnce()
+                emitFormatVideoSizeIfUnset()
             }
 
             override fun onPlaybackStateChanged(state: Int) {
+                if (state == Player.STATE_READY) {
+                    hasCurrentMediaFormat = true
+                    emitFormatVideoSizeIfUnset()
+                }
                 syncState()
             }
 
@@ -163,6 +216,18 @@ class ExoKernel(private val context: Context) : PlayerKernel {
 
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 if (player.playbackState == Player.STATE_READY) syncState()
+            }
+
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                @Suppress("DEPRECATION")
+                val size = resolveVideoDisplaySize(
+                    videoSize.width,
+                    videoSize.height,
+                    videoSize.pixelWidthHeightRatio,
+                    videoSize.unappliedRotationDegrees,
+                ) ?: return
+                hasCurrentMediaFormat = true
+                emitVideoSize(size.first, size.second)
             }
 
             override fun onPlayerError(error: PlaybackException) {
@@ -180,6 +245,35 @@ class ExoKernel(private val context: Context) : PlayerKernel {
         })
     }
 
+    private fun emitVideoSize(w: Int, h: Int) {
+        if (w == displayW && h == displayH) return
+        displayW = w
+        displayH = h
+        listener?.onVideoSizeChanged(w, h)
+    }
+
+    private fun emitFormatVideoSizeIfUnset() {
+        if (displayW > 0 && displayH > 0) return
+        val f = player.videoFormat ?: selectedVideoTrackFormat() ?: return
+        val size = resolveVideoDisplaySize(f.width, f.height, f.pixelWidthHeightRatio, f.rotationDegrees) ?: return
+        emitVideoSize(size.first, size.second)
+    }
+
+    private fun selectedVideoTrackFormat(): androidx.media3.common.Format? {
+        var fallback: androidx.media3.common.Format? = null
+        for (g in player.currentTracks.groups) {
+            if (g.type != C.TRACK_TYPE_VIDEO) continue
+            for (i in 0 until g.length) {
+                if (!g.isTrackSupported(i)) continue
+                val f = g.getTrackFormat(i)
+                if (f.width <= 0 || f.height <= 0) continue
+                if (g.isTrackSelected(i)) return f
+                if (fallback == null) fallback = f
+            }
+        }
+        return fallback
+    }
+
     private fun syncState() {
         listener?.onState(
             when (player.playbackState) {
@@ -192,10 +286,15 @@ class ExoKernel(private val context: Context) : PlayerKernel {
     }
 
     override fun mediaInfo(): MediaInfo? {
-        val f = player.videoFormat ?: return null
-        if (f.width <= 0 || f.height <= 0) return null
-        val codec = f.sampleMimeType ?: f.codecs // PlayerUiText.codecName turns it into H.264 / HEVC / …
-        return MediaInfo(f.width, f.height, if (f.frameRate > 0) f.frameRate.toDouble() else 0.0, codec)
+        val f = if (hasCurrentMediaFormat) player.videoFormat else null
+        val (w, h) = when {
+            displayW > 0 && displayH > 0 -> displayW to displayH
+            f != null -> resolveVideoDisplaySize(f.width, f.height, f.pixelWidthHeightRatio, f.rotationDegrees) ?: return null
+            else -> return null
+        }
+        val fps = f?.frameRate?.takeIf { it > 0 }?.toDouble() ?: 0.0
+        val codec = f?.let { it.sampleMimeType ?: it.codecs } // PlayerUiText.codecName turns it into H.264 / HEVC / …
+        return MediaInfo(w, h, fps, codec)
     }
 
     override fun downloadSpeed(): Long? {
@@ -212,19 +311,24 @@ class ExoKernel(private val context: Context) : PlayerKernel {
         get() = player.playbackParameters.speed
         set(v) = player.setPlaybackSpeed(v)
     override val isPlaying get() = player.isPlaying
+    private fun applyFitMode(pv: PlayerView, mode: String) {
+        pv.resizeMode = when (mode) {
+            "fill" -> AspectRatioFrameLayout.RESIZE_MODE_FILL
+            "zoom" -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+            else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
+        }
+    }
+
     override var fitMode: String = "fit"
         set(v) {
             field = v
-            playerView.resizeMode = when (v) {
-                "fill" -> AspectRatioFrameLayout.RESIZE_MODE_FILL
-                "zoom" -> AspectRatioFrameLayout.RESIZE_MODE_ZOOM
-                else -> AspectRatioFrameLayout.RESIZE_MODE_FIT
-            }
+            playerView?.let { applyFitMode(it, v) }
         }
 
-    override fun load(url: String, audioUrl: String?, headers: Map<String, String>, startMs: Long, subtitles: List<SubtitleOption>) {
+    override fun load(url: String, audioUrl: String?, headers: Map<String, String>, startMs: Long, subtitles: List<SubtitleOption>, autoPlay: Boolean) {
         if (url != currentUrl) forceHls = false
-        lastLoadArgs = { load(url, audioUrl, headers, startMs, subtitles) }
+        desiredAutoPlay = autoPlay
+        lastLoadArgs = { load(url, audioUrl, headers, startMs, subtitles, desiredAutoPlay) }
         // Overrides outlive the media item. Drop them so "auto" really is the state of the new item; the "text off"
         // switch (setTrackTypeDisabled) is kept on purpose: someone who turned subtitles off wants them off next episode too.
         player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
@@ -235,6 +339,9 @@ class ExoKernel(private val context: Context) : PlayerKernel {
         textAutoApplied = false
         audioAutoApplied = false
         reportedUnsupportedTrack = false
+        hasCurrentMediaFormat = false
+        displayW = 0
+        displayH = 0
         currentUrl = url
 
         val http = DefaultHttpDataSource.Factory()
@@ -244,7 +351,7 @@ class ExoKernel(private val context: Context) : PlayerKernel {
             .setDefaultRequestProperties(headers)
             .setTransferListener(bandwidth)
         // DefaultDataSource also reads file:// (downloaded episodes) and content:// besides http(s).
-        val factory = DefaultMediaSourceFactory(DefaultDataSource.Factory(context, http).setTransferListener(bandwidth))
+        val factory = DefaultMediaSourceFactory(DefaultDataSource.Factory(appContext, http).setTransferListener(bandwidth))
         var first = true
         val sidecars = subtitles.mapNotNull { s ->
             val mime = TrackLabels.subtitleMime(s.url, s.mimeType, s.name)
@@ -265,7 +372,7 @@ class ExoKernel(private val context: Context) : PlayerKernel {
         val source = if (audioUrl.isNullOrEmpty()) video else MergingMediaSource(video, factory.createMediaSource(MediaItem.fromUri(audioUrl)))
         player.setMediaSource(source, startMs)
         player.prepare()
-        player.playWhenReady = true
+        player.playWhenReady = autoPlay
     }
 
     // -- subtitles ----------------------------------------------------------------------------
@@ -322,19 +429,25 @@ class ExoKernel(private val context: Context) : PlayerKernel {
         if (pick >= 0) applyText(pick)
     }
 
-    override fun applySubtitlePreferences(language: String?, fontFamily: String?, fontsDir: String?) {
-        preferredTextLanguage = language?.takeIf { it.isNotBlank() }
-        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
-            .setPreferredTextLanguage(preferredTextLanguage)
-            .build()
-        val typeface = TrackLabels.findFont(fontsDir, fontFamily)?.let { runCatching { Typeface.createFromFile(it) }.getOrNull() }
-            ?: fontFamily?.takeIf { it.isNotBlank() }?.let { Typeface.create(it, Typeface.NORMAL) }
-        playerView.subtitleView?.apply {
+    private fun applySubtitleStyle(pv: PlayerView) {
+        val typeface = TrackLabels.findFont(subtitleFontsDir, subtitleFontFamily)?.let { runCatching { Typeface.createFromFile(it) }.getOrNull() }
+            ?: subtitleFontFamily?.takeIf { it.isNotBlank() }?.let { Typeface.create(it, Typeface.NORMAL) }
+        pv.subtitleView?.apply {
             setStyle(CaptionStyleCompat(Color.WHITE, Color.TRANSPARENT, Color.TRANSPARENT, CaptionStyleCompat.EDGE_TYPE_OUTLINE, Color.BLACK, typeface))
             setApplyEmbeddedStyles(true) // Exo's SSA/ASS parser is basic (no libass): colours and simple positions only
             setApplyEmbeddedFontSizes(true)
             setFractionalTextSize(SubtitleView.DEFAULT_TEXT_SIZE_FRACTION)
         }
+    }
+
+    override fun applySubtitlePreferences(language: String?, fontFamily: String?, fontsDir: String?) {
+        preferredTextLanguage = language?.takeIf { it.isNotBlank() }
+        subtitleFontFamily = fontFamily
+        subtitleFontsDir = fontsDir
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setPreferredTextLanguage(preferredTextLanguage)
+            .build()
+        playerView?.let { applySubtitleStyle(it) }
     }
 
     // -- audio tracks -------------------------------------------------------------------------
@@ -413,11 +526,15 @@ class ExoKernel(private val context: Context) : PlayerKernel {
         player.trackSelectionParameters = b.build()
     }
 
-    override fun play() { player.play() }
-    override fun pause() { player.pause() }
+    override fun play() { desiredAutoPlay = true; player.play() }
+    override fun pause() { desiredAutoPlay = false; player.pause() }
     override fun seekTo(ms: Long) {
         listener?.onState("buffering")
         player.seekTo(ms)
     }
-    override fun release() { player.release() }
+    override fun release() {
+        playerView?.player = null
+        playerView = null
+        player.release()
+    }
 }

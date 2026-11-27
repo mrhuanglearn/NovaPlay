@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
@@ -134,7 +136,13 @@ class HomeScreen extends ConsumerWidget {
             icon: Icons.cloud_off_rounded,
             title: l.homeCatpawUnavailable,
             subtitle: '$e',
-            action: OutlinedButton(onPressed: () => ref.invalidate(catpawRuntimeProvider), child: Text(l.retry)),
+            action: OutlinedButton(
+              onPressed: () {
+                unawaited(retryPendingSubscriptionAutoUpdates(ProviderScope.containerOf(context, listen: false)));
+                ref.invalidate(catpawRuntimeProvider);
+              },
+              child: Text(l.retry),
+            ),
           ),
           data: (rt) => rt == null
               ? EmptyState(
@@ -355,6 +363,7 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
       };
 
   void _reload() {
+    unawaited(retryPendingSubscriptionAutoUpdates(ProviderScope.containerOf(context, listen: false)));
     setState(_restart);
     _loadMore();
   }
@@ -422,7 +431,10 @@ class _HomeBodyState extends ConsumerState<_HomeBody> {
         site: site,
         subscriptionUrl: subUrl,
         bottomInset: bottom,
-        onRetry: () => ref.invalidate(videoFeedProvider),
+        onRetry: () {
+          unawaited(retryPendingSubscriptionAutoUpdates(ProviderScope.containerOf(context, listen: false)));
+          ref.invalidate(videoFeedProvider);
+        },
       ),
       data: (home) {
         if (home == null || site == null) return const SizedBox.shrink();

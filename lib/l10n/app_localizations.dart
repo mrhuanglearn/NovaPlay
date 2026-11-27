@@ -506,6 +506,36 @@ abstract class AppLocalizations {
   /// **'Prefer landscape'**
   String get playerPreferLandscape;
 
+  /// No description provided for @playerOrientationMode.
+  ///
+  /// In en, this message translates to:
+  /// **'Screen orientation'**
+  String get playerOrientationMode;
+
+  /// No description provided for @playerOrientationAuto.
+  ///
+  /// In en, this message translates to:
+  /// **'Auto (by video aspect)'**
+  String get playerOrientationAuto;
+
+  /// No description provided for @playerOrientationAutoShort.
+  ///
+  /// In en, this message translates to:
+  /// **'Auto'**
+  String get playerOrientationAutoShort;
+
+  /// No description provided for @playerOrientationLandscape.
+  ///
+  /// In en, this message translates to:
+  /// **'Always landscape'**
+  String get playerOrientationLandscape;
+
+  /// No description provided for @playerOrientationPortrait.
+  ///
+  /// In en, this message translates to:
+  /// **'Always portrait'**
+  String get playerOrientationPortrait;
+
   /// No description provided for @playerAutoPip.
   ///
   /// In en, this message translates to:
@@ -1921,6 +1951,12 @@ abstract class AppLocalizations {
   /// In en, this message translates to:
   /// **'Play'**
   String get detailPlayNow;
+
+  /// No description provided for @detailLoading.
+  ///
+  /// In en, this message translates to:
+  /// **'Loading…'**
+  String get detailLoading;
 
   /// No description provided for @detailEpisodes.
   ///

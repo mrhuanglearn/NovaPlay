@@ -258,12 +258,16 @@ class SubscriptionService {
     Future<bool> Function()? confirmConfigMismatch,
     bool background = false,
     CancelToken? cancelToken,
+    void Function(Object error)? onBackgroundError,
   }) async {
     if (sub.cloudUrl != null) {
       try {
         await installer.probeCloud(sub.cloudUrl!, cancelToken: cancelToken);
-      } on DioException {
-        if (background) return null;
+      } on DioException catch (e) {
+        if (background) {
+          onBackgroundError?.call(e);
+          return null;
+        }
         rethrow;
       }
       if (cancelToken?.isCancelled == true) return null;
@@ -276,13 +280,17 @@ class SubscriptionService {
     final ({String? scriptMd5, String? configMd5, bool probed}) probed;
     try {
       probed = await installer.probeRemoteMd5s(sub, cancelToken: cancelToken);
-    } on DioException {
-      if (background && installed != null) return null;
+    } on DioException catch (e) {
+      if (background && installed != null) {
+        onBackgroundError?.call(e);
+        return null;
+      }
       rethrow;
     }
     if (cancelToken?.isCancelled == true) return null;
     if (background && probed.scriptMd5 == null && ScriptUrls.parse(url).md5Given) {
       // Offline or unreachable checksum during silent startup autoUpdate: keep cached script untouched.
+      onBackgroundError?.call(StateError('no 32-hex md5 found at ${redactUrl(ScriptUrls.parse(url).md5)}'));
       return null;
     }
     if (installed != null && probed.scriptMd5 != null && probed.scriptMd5 == installed.md5) {
@@ -310,8 +318,11 @@ class SubscriptionService {
               cancelToken: cancelToken,
             )
           : await installer.install(sub, confirmConfigMismatch: confirmConfigMismatch);
-    } on DioException {
-      if (background && installed != null) return null;
+    } on DioException catch (e) {
+      if (background && installed != null) {
+        onBackgroundError?.call(e);
+        return null;
+      }
       rethrow;
     }
     if (cancelToken?.isCancelled == true) return null;
@@ -392,7 +403,30 @@ class SubscriptionInstaller {
   /// Written last by [install]; an install without it (interrupted, or from before 2026-11-09) is not reused.
   static const _markerName = 'installed.json';
   static const _format = 1;
+  static int _tmpSeq = 0;
+  static final Map<String, Future<void>> _commitChains = {};
   static final _md5Pattern = RegExp(r'\b[0-9a-fA-F]{32}\b');
+
+  static Future<void> _deleteQuietly(File file) async {
+    try {
+      if (await file.exists()) await file.delete();
+    } catch (_) {}
+  }
+
+  Future<T> _withCommitLock<T>(String key, Future<T> Function() action) async {
+    final prev = _commitChains[key];
+    final gate = Completer<void>();
+    _commitChains[key] = gate.future;
+    if (prev != null) await prev;
+    try {
+      return await action();
+    } finally {
+      if (identical(_commitChains[key], gate.future)) {
+        _commitChains.remove(key);
+      }
+      gate.complete();
+    }
+  }
 
   Future<Directory> _dir(Subscription sub) async =>
       Directory(p.join((_root ?? await getApplicationSupportDirectory()).path, 'subscriptions', sub.key));
@@ -463,11 +497,13 @@ class SubscriptionInstaller {
     if (url == null) throw ArgumentError('subscription ${sub.key} has no index.js url');
     final dir = await _dir(sub);
     await dir.create(recursive: true);
-    final tmpScriptFile = File(p.join(dir.path, 'index.js.tmp'));
+    final seq = ++_tmpSeq;
+    final tmpScriptFile = File(p.join(dir.path, 'index.js.$seq.tmp'));
     final scriptFile = File(p.join(dir.path, 'index.js'));
     final marker = File(p.join(dir.path, _markerName));
+    final tmpMarkerFile = File(p.join(dir.path, '$_markerName.$seq.tmp'));
     final configFile = File(p.join(dir.path, 'config.js'));
-    final tmpConfigFile = File(p.join(dir.path, 'config.js.tmp'));
+    final tmpConfigFile = File(p.join(dir.path, 'config.js.$seq.tmp'));
 
     // Download & checksum-verify script and companion config concurrently into staging files so a failure leaves any
     // existing installation intact while avoiding sequential overseas round-trips.
@@ -493,6 +529,7 @@ class SubscriptionInstaller {
 
     final ({String path, String md5}) staged;
     final String? stagedConfigPath;
+    Future<String?>? configTask;
     try {
       final scriptTask = downloadScript(
         url,
@@ -501,29 +538,37 @@ class SubscriptionInstaller {
         skipMd5Fetch: expectedScriptMd5 != null || skipConfigMd5Fetch,
         cancelToken: cancelToken,
       );
-      final configTask = fetchConfigStage();
+      configTask = fetchConfigStage();
       staged = await scriptTask;
       stagedConfigPath = await configTask;
       if (cancelToken?.isCancelled == true) {
         throw DioException.requestCancelled(requestOptions: RequestOptions(path: url), reason: 'cancelled');
       }
     } catch (_) {
-      if (await tmpScriptFile.exists()) await tmpScriptFile.delete();
-      if (await tmpConfigFile.exists()) await tmpConfigFile.delete();
+      await configTask?.catchError((Object _) => null);
+      await _deleteQuietly(tmpScriptFile);
+      await _deleteQuietly(tmpConfigFile);
       rethrow;
     }
 
-    if (await marker.exists()) await marker.delete();
-    await tmpScriptFile.rename(scriptFile.path);
-    String? configPath;
-    if (stagedConfigPath != null) {
-      await tmpConfigFile.rename(configFile.path);
-      configPath = configFile.path;
-    } else if (await configFile.exists()) {
-      await configFile.delete();
-    }
-    await marker.writeAsString(jsonEncode({'format': _format, 'md5': staged.md5}), flush: true);
-    return InstalledScript(scriptPath: scriptFile.path, configPath: configPath, md5: staged.md5);
+    return _withCommitLock(sub.key, () async {
+      await tmpScriptFile.rename(scriptFile.path);
+      String? configPath;
+      if (stagedConfigPath != null) {
+        await tmpConfigFile.rename(configFile.path);
+        configPath = configFile.path;
+      } else {
+        await _deleteQuietly(configFile);
+      }
+      try {
+        await tmpMarkerFile.writeAsString(jsonEncode({'format': _format, 'md5': staged.md5}), flush: true);
+        await tmpMarkerFile.rename(marker.path);
+      } catch (_) {
+        await _deleteQuietly(tmpMarkerFile);
+        rethrow;
+      }
+      return InstalledScript(scriptPath: scriptFile.path, configPath: configPath, md5: staged.md5);
+    });
   }
 
   /// OBSERVED: a config that cannot be downloaded is not an error ("index.config.js 下载失败（将以空 config 启动）").
@@ -634,7 +679,7 @@ class SubscriptionInstaller {
       final localMd5 = md5.convert(await configFile.readAsBytes()).toString();
       if (localMd5 == knownConfigMd5) return false;
     }
-    final tmpConfigFile = File(p.join(dir.path, 'config.js.tmp'));
+    final tmpConfigFile = File(p.join(dir.path, 'config.js.${++_tmpSeq}.tmp'));
     try {
       String? stagedPath;
       if (sub.configUrl != null) {
@@ -653,21 +698,23 @@ class SubscriptionInstaller {
         );
       }
       if (stagedPath == null || cancelToken?.isCancelled == true) {
-        if (await tmpConfigFile.exists()) await tmpConfigFile.delete();
+        await _deleteQuietly(tmpConfigFile);
         return false;
       }
       final nextBytes = await tmpConfigFile.readAsBytes();
-      if (await configFile.exists()) {
-        final prevBytes = await configFile.readAsBytes();
-        if (md5.convert(prevBytes) == md5.convert(nextBytes)) {
-          await tmpConfigFile.delete();
-          return false;
+      return await _withCommitLock(sub.key, () async {
+        if (await configFile.exists()) {
+          final prevBytes = await configFile.readAsBytes();
+          if (md5.convert(prevBytes) == md5.convert(nextBytes)) {
+            await _deleteQuietly(tmpConfigFile);
+            return false;
+          }
         }
-      }
-      await tmpConfigFile.rename(configFile.path);
-      return true;
+        await tmpConfigFile.rename(configFile.path);
+        return true;
+      });
     } catch (_) {
-      if (await tmpConfigFile.exists()) await tmpConfigFile.delete();
+      await _deleteQuietly(tmpConfigFile);
       return false;
     }
   }

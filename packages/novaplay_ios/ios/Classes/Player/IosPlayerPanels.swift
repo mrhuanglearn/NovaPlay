@@ -344,6 +344,7 @@ final class IosPlayerOverlayHost {
     onPanelClosed = nil
     if wasOpen {
       cb?()
+      onDidCloseMenu()
     }
   }
 
@@ -499,7 +500,7 @@ final class IosPlayerPanels {
   private let host: IosPlayerOverlayHost
   private let onHaptic: () -> Void
   private let onShowToast: (String, Bool) -> Void
-  private let onOrientationPreferenceChanged: (Bool) -> Void
+  private let onOrientationModeChanged: (String) -> Void
 
   // Episode panel state
   private var episodesReversed = false
@@ -524,14 +525,14 @@ final class IosPlayerPanels {
     host: IosPlayerOverlayHost,
     onHaptic: @escaping () -> Void,
     onShowToast: @escaping (String, Bool) -> Void,
-    onOrientationPreferenceChanged: @escaping (Bool) -> Void
+    onOrientationModeChanged: @escaping (String) -> Void
   ) {
     self.controller = controller
     self.ui = ui
     self.host = host
     self.onHaptic = onHaptic
     self.onShowToast = onShowToast
-    self.onOrientationPreferenceChanged = onOrientationPreferenceChanged
+    self.onOrientationModeChanged = onOrientationModeChanged
 
     controller.danmakuSearchListener = { [weak self] results in
       self?.handleDanmakuSearchResults(results)
@@ -2099,6 +2100,31 @@ final class IosPlayerPanels {
       }
       list.addArrangedSubview(fitCard)
 
+      // Group 2b: 屏幕方向
+      list.addArrangedSubview(self.ui.sectionLabel(IosPlayerUiText.t("屏幕方向", "Screen orientation")))
+      let orientCard = self.ui.card()
+      let curOrient = IosPlayerUiText.effectiveOrientationMode(self.controller.playbackConfig)
+      for mode in IosPlayerUiText.orientationModes {
+        addOption(
+          card: orientCard,
+          icon: IosPlayerIcon.ROTATE,
+          title: IosPlayerUiText.orientationModePanelLabel(mode),
+          selected: curOrient == mode
+        ) { [weak self] in
+          guard let self = self else { return }
+          let y = scrollRef?.contentOffset.y ?? 0
+          var next = self.controller.playbackConfig
+          next.orientationMode = mode
+          next.isPriorityLandscape = (mode != "portrait")
+          self.controller.updatePlayback(next)
+          self.onOrientationModeChanged(mode)
+          if self.host.isPanelOpen {
+            self.showSettings(scrollY: y)
+          }
+        }
+      }
+      list.addArrangedSubview(orientCard)
+
       // Group 3: 播放内核 (`AVPlayer (SYSTEM)`, `MPV (MPV)`, `VLC (FFmpeg)`)
       list.addArrangedSubview(self.ui.sectionLabel(IosPlayerUiText.t("播放内核", "Player kernel")))
       let kernelCard = self.ui.card()
@@ -2239,14 +2265,6 @@ final class IosPlayerPanels {
         subtitle: IosPlayerUiText.t("切集时显示「正在切换至 第X集」轻提示", "Show “Switching to episode X” when episode changes"),
         get: { $0.isShowEpisodeSwitchNotice },
         mutate: { $0.isShowEpisodeSwitchNotice = $1 }
-      )
-      addToggle(
-        card: playCard,
-        icon: IosPlayerIcon.ROTATE,
-        title: IosPlayerUiText.t("优先横屏", "Prefer landscape"),
-        get: { $0.isPriorityLandscape },
-        mutate: { $0.isPriorityLandscape = $1 },
-        extra: { [weak self] on in self?.onOrientationPreferenceChanged(on) }
       )
       addToggle(
         card: playCard,

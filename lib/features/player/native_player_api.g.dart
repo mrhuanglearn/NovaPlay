@@ -291,6 +291,7 @@ class PlaybackConfig {
     this.accentColorHex,
     this.audioLang,
     this.isLongPressSpeedAdjustEnabled,
+    this.orientationMode,
   });
 
   bool hwDecode;
@@ -342,6 +343,9 @@ class PlaybackConfig {
   /// original only turns it off for an explicit false). Added last so files saved before it still load.
   bool? isLongPressSpeedAdjustEnabled;
 
+  /// 屏幕方向: auto|landscape|portrait. null = derive from isPriorityLandscape (true->auto, false->portrait).
+  String? orientationMode;
+
   Object encode() {
     return <Object?>[
       hwDecode,
@@ -367,6 +371,7 @@ class PlaybackConfig {
       accentColorHex,
       audioLang,
       isLongPressSpeedAdjustEnabled,
+      orientationMode,
     ];
   }
 
@@ -396,6 +401,7 @@ class PlaybackConfig {
       accentColorHex: result[20] as String?,
       audioLang: result[21] as String?,
       isLongPressSpeedAdjustEnabled: result[22] as bool?,
+      orientationMode: result[23] as String?,
     );
   }
 }
@@ -445,6 +451,10 @@ class OpenPlayerRequest {
     this.epgProgrammes,
     this.headTailSectionsJson,
     this.startQualityIndex,
+    this.initialSource,
+    this.initialVideoWidth,
+    this.initialVideoHeight,
+    this.probeBudgetMs,
   });
 
   String sessionId;
@@ -482,6 +492,20 @@ class OpenPlayerRequest {
   /// `SourcePayload.qualities`), so 立即播放 / the history continue with the quality picked last time.
   int? startQualityIndex;
 
+  /// Scheme A: the source already resolved on the Dart side while the detail page was still showing (null = the
+  /// native side asks via onEpisodeRequest as before; a failed payload is fed to the normal error path).
+  SourcePayload? initialSource;
+
+  /// Known display dimensions of this specific video/item when [initialSource] is still resolving (e.g. from previous
+  /// playback of the same VOD or media server metadata). Null for unknown items, which open in landscape first.
+  int? initialVideoWidth;
+
+  int? initialVideoHeight;
+
+  /// Remaining milliseconds of the unified click-to-open fast budget available for native handheld `auto` mode to
+  /// header-probe [initialSource.url] when dimensions are not yet cached. <= 0 skips pre-open waiting.
+  int? probeBudgetMs;
+
   Object encode() {
     return <Object?>[
       sessionId,
@@ -500,6 +524,10 @@ class OpenPlayerRequest {
       epgProgrammes,
       headTailSectionsJson,
       startQualityIndex,
+      initialSource,
+      initialVideoWidth,
+      initialVideoHeight,
+      probeBudgetMs,
     ];
   }
 
@@ -522,6 +550,10 @@ class OpenPlayerRequest {
       epgProgrammes: (result[13] as List<Object?>?)?.cast<EpgProgramme>(),
       headTailSectionsJson: result[14] as String?,
       startQualityIndex: result[15] as int?,
+      initialSource: result[16] as SourcePayload?,
+      initialVideoWidth: result[17] as int?,
+      initialVideoHeight: result[18] as int?,
+      probeBudgetMs: result[19] as int?,
     );
   }
 }
@@ -574,6 +606,8 @@ class SourcePayload {
     this.qualities,
     this.subtitles,
     this.errorMessage,
+    this.videoWidth,
+    this.videoHeight,
   });
 
   int requestId;
@@ -592,6 +626,11 @@ class SourcePayload {
 
   String? errorMessage;
 
+  /// Fast-probed display dimensions of the stream, when already known before or alongside playback startup.
+  int? videoWidth;
+
+  int? videoHeight;
+
   Object encode() {
     return <Object?>[
       requestId,
@@ -602,6 +641,8 @@ class SourcePayload {
       qualities,
       subtitles,
       errorMessage,
+      videoWidth,
+      videoHeight,
     ];
   }
 
@@ -616,6 +657,8 @@ class SourcePayload {
       qualities: (result[5] as List<Object?>?)?.cast<QualityOption>(),
       subtitles: (result[6] as List<Object?>?)?.cast<SubtitleOption>(),
       errorMessage: result[7] as String?,
+      videoWidth: result[8] as int?,
+      videoHeight: result[9] as int?,
     );
   }
 }
@@ -714,6 +757,32 @@ class DanmakuPromptInfo {
     return DanmakuPromptInfo(
       keyword: result[0]! as String,
       episodeNumber: result[1] as int?,
+    );
+  }
+}
+
+class ProbedVideoSize {
+  ProbedVideoSize({
+    required this.width,
+    required this.height,
+  });
+
+  int width;
+
+  int height;
+
+  Object encode() {
+    return <Object?>[
+      width,
+      height,
+    ];
+  }
+
+  static ProbedVideoSize decode(Object result) {
+    result as List<Object?>;
+    return ProbedVideoSize(
+      width: result[0]! as int,
+      height: result[1]! as int,
     );
   }
 }
@@ -1021,29 +1090,32 @@ class _PigeonCodec extends StandardMessageCodec {
     }    else if (value is DanmakuPromptInfo) {
       buffer.putUint8(142);
       writeValue(buffer, value.encode());
-    }    else if (value is Heartbeat) {
+    }    else if (value is ProbedVideoSize) {
       buffer.putUint8(143);
       writeValue(buffer, value.encode());
-    }    else if (value is StateEvent) {
+    }    else if (value is Heartbeat) {
       buffer.putUint8(144);
       writeValue(buffer, value.encode());
-    }    else if (value is ErrorReport) {
+    }    else if (value is StateEvent) {
       buffer.putUint8(145);
       writeValue(buffer, value.encode());
-    }    else if (value is PreferenceReport) {
+    }    else if (value is ErrorReport) {
       buffer.putUint8(146);
       writeValue(buffer, value.encode());
-    }    else if (value is PageClosedEvent) {
+    }    else if (value is PreferenceReport) {
       buffer.putUint8(147);
       writeValue(buffer, value.encode());
-    }    else if (value is EpisodeRequest) {
+    }    else if (value is PageClosedEvent) {
       buffer.putUint8(148);
       writeValue(buffer, value.encode());
-    }    else if (value is DanmakuRequest) {
+    }    else if (value is EpisodeRequest) {
       buffer.putUint8(149);
       writeValue(buffer, value.encode());
-    }    else if (value is DanmakuSearchRequest) {
+    }    else if (value is DanmakuRequest) {
       buffer.putUint8(150);
+      writeValue(buffer, value.encode());
+    }    else if (value is DanmakuSearchRequest) {
+      buffer.putUint8(151);
       writeValue(buffer, value.encode());
     } else {
       super.writeValue(buffer, value);
@@ -1082,20 +1154,22 @@ class _PigeonCodec extends StandardMessageCodec {
       case 142: 
         return DanmakuPromptInfo.decode(readValue(buffer)!);
       case 143: 
-        return Heartbeat.decode(readValue(buffer)!);
+        return ProbedVideoSize.decode(readValue(buffer)!);
       case 144: 
-        return StateEvent.decode(readValue(buffer)!);
+        return Heartbeat.decode(readValue(buffer)!);
       case 145: 
-        return ErrorReport.decode(readValue(buffer)!);
+        return StateEvent.decode(readValue(buffer)!);
       case 146: 
-        return PreferenceReport.decode(readValue(buffer)!);
+        return ErrorReport.decode(readValue(buffer)!);
       case 147: 
-        return PageClosedEvent.decode(readValue(buffer)!);
+        return PreferenceReport.decode(readValue(buffer)!);
       case 148: 
-        return EpisodeRequest.decode(readValue(buffer)!);
+        return PageClosedEvent.decode(readValue(buffer)!);
       case 149: 
-        return DanmakuRequest.decode(readValue(buffer)!);
+        return EpisodeRequest.decode(readValue(buffer)!);
       case 150: 
+        return DanmakuRequest.decode(readValue(buffer)!);
+      case 151: 
         return DanmakuSearchRequest.decode(readValue(buffer)!);
       default:
         return super.readValueOfType(type, buffer);
@@ -1148,6 +1222,28 @@ class NativePlayerHostApi {
     );
     final List<Object?>? pigeonVar_replyList =
         await pigeonVar_channel.send(<Object?>[payload]) as List<Object?>?;
+    if (pigeonVar_replyList == null) {
+      throw _createConnectionError(pigeonVar_channelName);
+    } else if (pigeonVar_replyList.length > 1) {
+      throw PlatformException(
+        code: pigeonVar_replyList[0]! as String,
+        message: pigeonVar_replyList[1] as String?,
+        details: pigeonVar_replyList[2],
+      );
+    } else {
+      return;
+    }
+  }
+
+  Future<void> updateVideoSize(String sessionId, int lineIndex, int episodeIndex, int width, int height) async {
+    final String pigeonVar_channelName = 'dev.flutter.pigeon.uzv_reimpl.NativePlayerHostApi.updateVideoSize$pigeonVar_messageChannelSuffix';
+    final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
+      pigeonVar_channelName,
+      pigeonChannelCodec,
+      binaryMessenger: pigeonVar_binaryMessenger,
+    );
+    final List<Object?>? pigeonVar_replyList =
+        await pigeonVar_channel.send(<Object?>[sessionId, lineIndex, episodeIndex, width, height]) as List<Object?>?;
     if (pigeonVar_replyList == null) {
       throw _createConnectionError(pigeonVar_channelName);
     } else if (pigeonVar_replyList.length > 1) {
@@ -1308,6 +1404,10 @@ abstract class NativePlayerFlutterApi {
 
   Future<void> onEpisodeRequest(EpisodeRequest request);
 
+  Future<ProbedVideoSize?> onProbeVideoSize(String sessionId, int lineIndex, int episodeIndex, String url, Map<String, String> headers, int budgetMs);
+
+  Future<void> onVideoSizeDetected(String sessionId, int lineIndex, int episodeIndex, int width, int height);
+
   Future<void> onDanmakuRequest(DanmakuRequest request);
 
   Future<void> onDanmakuSearchRequest(DanmakuSearchRequest request);
@@ -1349,6 +1449,83 @@ abstract class NativePlayerFlutterApi {
               'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onEpisodeRequest was null, expected non-null EpisodeRequest.');
           try {
             await api.onEpisodeRequest(arg_request!);
+            return wrapResponse(empty: true);
+          } on PlatformException catch (e) {
+            return wrapResponse(error: e);
+          }          catch (e) {
+            return wrapResponse(error: PlatformException(code: 'error', message: e.toString()));
+          }
+        });
+      }
+    }
+    {
+      final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
+          'dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onProbeVideoSize$messageChannelSuffix', pigeonChannelCodec,
+          binaryMessenger: binaryMessenger);
+      if (api == null) {
+        pigeonVar_channel.setMessageHandler(null);
+      } else {
+        pigeonVar_channel.setMessageHandler((Object? message) async {
+          assert(message != null,
+          'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onProbeVideoSize was null.');
+          final List<Object?> args = (message as List<Object?>?)!;
+          final String? arg_sessionId = (args[0] as String?);
+          assert(arg_sessionId != null,
+              'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onProbeVideoSize was null, expected non-null String.');
+          final int? arg_lineIndex = (args[1] as int?);
+          assert(arg_lineIndex != null,
+              'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onProbeVideoSize was null, expected non-null int.');
+          final int? arg_episodeIndex = (args[2] as int?);
+          assert(arg_episodeIndex != null,
+              'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onProbeVideoSize was null, expected non-null int.');
+          final String? arg_url = (args[3] as String?);
+          assert(arg_url != null,
+              'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onProbeVideoSize was null, expected non-null String.');
+          final Map<String, String>? arg_headers = (args[4] as Map<Object?, Object?>?)?.cast<String, String>();
+          assert(arg_headers != null,
+              'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onProbeVideoSize was null, expected non-null Map<String, String>.');
+          final int? arg_budgetMs = (args[5] as int?);
+          assert(arg_budgetMs != null,
+              'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onProbeVideoSize was null, expected non-null int.');
+          try {
+            final ProbedVideoSize? output = await api.onProbeVideoSize(arg_sessionId!, arg_lineIndex!, arg_episodeIndex!, arg_url!, arg_headers!, arg_budgetMs!);
+            return wrapResponse(result: output);
+          } on PlatformException catch (e) {
+            return wrapResponse(error: e);
+          }          catch (e) {
+            return wrapResponse(error: PlatformException(code: 'error', message: e.toString()));
+          }
+        });
+      }
+    }
+    {
+      final BasicMessageChannel<Object?> pigeonVar_channel = BasicMessageChannel<Object?>(
+          'dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onVideoSizeDetected$messageChannelSuffix', pigeonChannelCodec,
+          binaryMessenger: binaryMessenger);
+      if (api == null) {
+        pigeonVar_channel.setMessageHandler(null);
+      } else {
+        pigeonVar_channel.setMessageHandler((Object? message) async {
+          assert(message != null,
+          'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onVideoSizeDetected was null.');
+          final List<Object?> args = (message as List<Object?>?)!;
+          final String? arg_sessionId = (args[0] as String?);
+          assert(arg_sessionId != null,
+              'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onVideoSizeDetected was null, expected non-null String.');
+          final int? arg_lineIndex = (args[1] as int?);
+          assert(arg_lineIndex != null,
+              'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onVideoSizeDetected was null, expected non-null int.');
+          final int? arg_episodeIndex = (args[2] as int?);
+          assert(arg_episodeIndex != null,
+              'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onVideoSizeDetected was null, expected non-null int.');
+          final int? arg_width = (args[3] as int?);
+          assert(arg_width != null,
+              'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onVideoSizeDetected was null, expected non-null int.');
+          final int? arg_height = (args[4] as int?);
+          assert(arg_height != null,
+              'Argument for dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onVideoSizeDetected was null, expected non-null int.');
+          try {
+            await api.onVideoSizeDetected(arg_sessionId!, arg_lineIndex!, arg_episodeIndex!, arg_width!, arg_height!);
             return wrapResponse(empty: true);
           } on PlatformException catch (e) {
             return wrapResponse(error: e);

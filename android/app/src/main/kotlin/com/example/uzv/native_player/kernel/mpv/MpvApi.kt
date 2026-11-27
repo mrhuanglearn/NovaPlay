@@ -15,6 +15,7 @@ object MpvEvent {
     const val START_FILE = 6
     const val END_FILE = 7
     const val FILE_LOADED = 8
+    const val VIDEO_RECONFIG = 17
     const val SEEK = 20
     const val PLAYBACK_RESTART = 21
     const val PROPERTY_CHANGE = 22

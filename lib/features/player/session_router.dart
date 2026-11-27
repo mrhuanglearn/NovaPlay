@@ -35,6 +35,27 @@ class PlayerSessionRouter implements NativePlayerFlutterApi {
   Future<void> onEpisodeRequest(EpisodeRequest request) async => _sessions[request.sessionId]?.onEpisodeRequest(request);
 
   @override
+  Future<ProbedVideoSize?> onProbeVideoSize(
+    String sessionId,
+    int lineIndex,
+    int episodeIndex,
+    String url,
+    Map<String, String> headers,
+    int budgetMs,
+  ) async =>
+      _sessions[sessionId]?.onProbeVideoSize(sessionId, lineIndex, episodeIndex, url, headers, budgetMs);
+
+  @override
+  Future<void> onVideoSizeDetected(
+    String sessionId,
+    int lineIndex,
+    int episodeIndex,
+    int width,
+    int height,
+  ) async =>
+      _sessions[sessionId]?.onVideoSizeDetected(sessionId, lineIndex, episodeIndex, width, height);
+
+  @override
   Future<void> onDanmakuRequest(DanmakuRequest request) async => _sessions[request.sessionId]?.onDanmakuRequest(request);
 
   @override

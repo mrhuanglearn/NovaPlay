@@ -82,11 +82,26 @@ class PlayerControlsView(
     private var landscape = true
     private var built = false
     private var cutoutInset = 0
+    private var cutoutTop = 0
+    private var bottomInset = 0
     private var inPip = false
     private var seekWaitUntilMs = 0L
     private var lastRxBytes = android.net.TrafficStats.getUidRxBytes(android.os.Process.myUid())
     private var lastRxTimeMs = android.os.SystemClock.elapsedRealtime()
     private var liveRxSpeed = 0L
+    private val clockFormat = SimpleDateFormat("HH:mm", Locale.ROOT)
+    private val clockDate = Date()
+    private val batteryFilter = IntentFilter(Intent.ACTION_BATTERY_CHANGED)
+    private var cachedBattery: Float? = null
+    private var lastBatteryMs = 0L
+    private var rebuildPosted = false
+    private val rebuildTask = Runnable { rebuildPosted = false; rebuild() }
+
+    private fun postRebuild() {
+        if (rebuildPosted) return
+        rebuildPosted = true
+        post(rebuildTask)
+    }
 
     private val controls = FrameLayout(context).apply { visibility = GONE }
     private var topBar: View? = null
@@ -165,8 +180,20 @@ class PlayerControlsView(
             }
         }
     }
-    private val menuHost = FrameLayout(context).apply { visibility = GONE }
-    private val panelHost = FrameLayout(context).apply { visibility = GONE }
+    private val menuHost = object : FrameLayout(context) {
+        override fun setVisibility(visibility: Int) {
+            val wasVisible = this.visibility == VISIBLE
+            super.setVisibility(visibility)
+            if (wasVisible && visibility != VISIBLE) onOverlayClosed?.invoke()
+        }
+    }.apply { visibility = GONE }
+    private val panelHost = object : FrameLayout(context) {
+        override fun setVisibility(visibility: Int) {
+            val wasVisible = this.visibility == VISIBLE
+            super.setVisibility(visibility)
+            if (wasVisible && visibility != VISIBLE) onOverlayClosed?.invoke()
+        }
+    }.apply { visibility = GONE }
 
     /** The error layer (OBSERVED in 1.1.13, i2.P0): ⚠️ title, the message in a scroll box, 取消 / 复制错误信息 / 重试. */
     private val errorTitle = ui.text("", 17f, bold = true).apply { gravity = Gravity.CENTER }
@@ -234,16 +261,40 @@ class PlayerControlsView(
         addView(errorLayer.apply { addView(errorBox(), LayoutParams(-2, -2, Gravity.CENTER)) }, LayoutParams(-1, -1))
         addView(panelHost, LayoutParams(-1, -1))
         addView(menuHost, LayoutParams(-1, -1))
-        if (android.os.Build.VERSION.SDK_INT >= 28) {
-            setOnApplyWindowInsetsListener { _, insets ->
+        setOnApplyWindowInsetsListener { _, insets ->
+            val nextInset: Int
+            val nextTop: Int
+            val nextBottom: Int
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
                 val dc = insets.displayCutout
-                val nextInset = if (dc != null) maxOf(dc.safeInsetLeft, dc.safeInsetRight) else 0
-                if (nextInset != cutoutInset) {
-                    cutoutInset = nextInset
-                    if (built) post { rebuild() }
-                }
-                insets
+                nextInset = if (dc != null) maxOf(dc.safeInsetLeft, dc.safeInsetRight) else 0
+                val barsOrCutout = insets.getInsets(
+                    android.view.WindowInsets.Type.systemBars() or android.view.WindowInsets.Type.displayCutout(),
+                )
+                nextTop = barsOrCutout.top
+                nextBottom = maxOf(
+                    barsOrCutout.bottom,
+                    insets.getInsets(android.view.WindowInsets.Type.mandatorySystemGestures()).bottom,
+                )
+            } else if (android.os.Build.VERSION.SDK_INT >= 28) {
+                val dc = insets.displayCutout
+                nextInset = if (dc != null) maxOf(dc.safeInsetLeft, dc.safeInsetRight) else 0
+                nextTop = dc?.safeInsetTop ?: 0
+                @Suppress("DEPRECATION")
+                nextBottom = insets.systemWindowInsetBottom
+            } else {
+                nextInset = 0
+                nextTop = 0
+                @Suppress("DEPRECATION")
+                nextBottom = insets.systemWindowInsetBottom
             }
+            if (nextInset != cutoutInset || nextTop != cutoutTop || nextBottom != bottomInset) {
+                cutoutInset = nextInset
+                cutoutTop = nextTop
+                bottomInset = nextBottom
+                if (built) postRebuild()
+            }
+            insets
         }
         post(tick)
     }
@@ -253,8 +304,21 @@ class PlayerControlsView(
         val nowLandscape = w > h
         if (!built || nowLandscape != landscape) {
             landscape = nowLandscape
-            post { rebuild() }
+            postRebuild()
         }
+    }
+
+    override fun onDetachedFromWindow() {
+        removeCallbacks(tick)
+        removeCallbacks(hideTask)
+        removeCallbacks(hideNotice)
+        removeCallbacks(hideHint)
+        removeCallbacks(hideLock)
+        removeCallbacks(hideFlash)
+        removeCallbacks(skipTick)
+        removeCallbacks(rebuildTask)
+        rebuildPosted = false
+        super.onDetachedFromWindow()
     }
 
     // -- layout ---------------------------------------------------------------------------------------------------------
@@ -281,6 +345,19 @@ class PlayerControlsView(
             addView(forward, LinearLayout.LayoutParams(dp(44), dp(44)))
         }, LayoutParams(-2, -2, Gravity.CENTER))
         bottomBar = buildBottomBar().also { controls.addView(it, LayoutParams(-1, -2, Gravity.BOTTOM)) }
+        val topShift = if (landscape) 0 else cutoutTop
+        fun shiftTopMargin(v: View, baseDp: Int) {
+            (v.layoutParams as? LayoutParams)?.let { lp ->
+                val target = dp(baseDp) + topShift
+                if (lp.topMargin != target) {
+                    lp.topMargin = target
+                    v.layoutParams = lp
+                }
+            }
+        }
+        shiftTopMargin(notice, 64)
+        shiftTopMargin(cornerSpeed, 8)
+        shiftTopMargin(hint, 36)
         (seekHintBar.layoutParams as? LayoutParams)?.let { lp ->
             lp.leftMargin = dp(16) + cutoutInset
             lp.rightMargin = dp(16) + cutoutInset
@@ -293,7 +370,8 @@ class PlayerControlsView(
     private fun buildTopBar() = LinearLayout(context).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
-        setPadding(dp(16) + cutoutInset, dp(10), dp(16) + cutoutInset, dp(14))
+        val topPad = if (landscape) dp(10) else maxOf(dp(10), cutoutTop + dp(4))
+        setPadding(dp(16) + cutoutInset, topPad, dp(16) + cutoutInset, dp(14))
         background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(0x59000000, 0x00000000))
         addView(ui.circleButton(Ic.BACK, 38f, 20f).also { it.setOnClickListener { actions.onClose() } })
         addView(LinearLayout(context).apply {
@@ -354,7 +432,8 @@ class PlayerControlsView(
     private fun buildBottomBar() = LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
         background = GradientDrawable(GradientDrawable.Orientation.BOTTOM_TOP, intArrayOf(0x73000000, 0x00000000))
-        setPadding(dp(16) + cutoutInset, dp(26), dp(16) + cutoutInset, dp(12))
+        val bottomPad = if (landscape) dp(12) else maxOf(dp(12), bottomInset + dp(4))
+        setPadding(dp(16) + cutoutInset, dp(26), dp(16) + cutoutInset, bottomPad)
         statsLine = ui.chip().apply { visibility = GONE }
         addView(statsLine, LinearLayout.LayoutParams(LayoutParams.WRAP_CONTENT, LayoutParams.WRAP_CONTENT).apply {
             gravity = Gravity.END
@@ -696,6 +775,17 @@ class PlayerControlsView(
     fun refresh() {
         refreshInfo()
         if (!built) return
+        val lockVisible = lockLayer.visibility == VISIBLE
+        if (!visibleNow && !lockVisible) return
+        val pos = kernel.positionMs
+        val dur = kernel.durationMs
+        clockDate.time = System.currentTimeMillis()
+        val now = clockFormat.format(clockDate)
+        if (lockVisible) {
+            lockInfo?.text = "$now  |  ${PlayerUiText.clock(pos)} / ${PlayerUiText.clock(dur)}"
+            lockBar?.fraction = if (dur > 0) pos.toFloat() / dur else 0f
+        }
+        if (!visibleNow) return
         val cfg = controller.playbackConfig
         val playing = kernel.isPlaying
         if (playingShown != playing) {
@@ -737,8 +827,6 @@ class PlayerControlsView(
             c.text = res.orEmpty()
             c.visibility = if (res == null) GONE else VISIBLE
         }
-        val pos = kernel.positionMs
-        val dur = kernel.durationMs
         // INFERRED window: 记片头 in the first five minutes, 记片尾 in the last five (only 记片头 was seen, up to 04:16)
         val mark = PlayerUiText.markButton(pos, dur, controller.canMarkHeadTail)
         markButton?.let { b ->
@@ -753,21 +841,24 @@ class PlayerControlsView(
                 rightTimeView?.text = PlayerUiText.rightTime(pos, dur, cfg.isShowAllDuration)
             }
         }
-        val now = SimpleDateFormat("HH:mm", Locale.ROOT).format(Date())
         clockView?.text = now
         if (batteryText != null) batteryLevel()?.let { level ->
             batteryText?.text = "${Math.round(level * 100)}%"
             batteryView?.level = level
         }
-        lockInfo?.text = "$now  |  ${PlayerUiText.clock(pos)} / ${PlayerUiText.clock(dur)}"
-        lockBar?.fraction = if (dur > 0) pos.toFloat() / dur else 0f
     }
 
     private fun batteryLevel(): Float? {
-        val i: Intent = context.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return null
+        val nowMs = android.os.SystemClock.elapsedRealtime()
+        if (cachedBattery != null && nowMs - lastBatteryMs < 15_000L) return cachedBattery
+        val i: Intent = context.registerReceiver(null, batteryFilter) ?: return cachedBattery
         val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
         val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, -1)
-        return if (level < 0 || scale <= 0) null else level.toFloat() / scale
+        if (level >= 0 && scale > 0) {
+            cachedBattery = level.toFloat() / scale
+            lastBatteryMs = nowMs
+        }
+        return cachedBattery
     }
 
     private fun currentDownloadSpeed(): Long? {
@@ -789,31 +880,34 @@ class PlayerControlsView(
         }
         val kSpeed = kernel.downloadSpeed() ?: 0L
         val best = maxOf(kSpeed, liveRxSpeed)
-        return if (best > 0L) best else kernel.downloadSpeed()
+        return if (best > 0L) best else null
     }
 
     /** Buffering speed, 始终显示网速 and 显示帧率与编码, from the kernel (OBSERVED in the original, B3.d case 4). */
     private fun refreshInfo() {
         val cfg = controller.playbackConfig
-        val speed = currentDownloadSpeed()
-        val bitrate = kernel.videoBitrate()
         refreshError()
         val nowMs = android.os.SystemClock.elapsedRealtime()
         val buffering = ((controller.state == "buffering" || controller.state == "idle" || nowMs < seekWaitUntilMs) && !controller.failed && !inPip)
+        val showStats = visibleNow && (cfg.isShowStatsBar || cfg.showNetSpeed)
+        val showCorner = cfg.showNetSpeed && !visibleNow && !buffering && !inPip
+        val speed = if (buffering || showStats || showCorner) currentDownloadSpeed() else null
+        val bitrate = if (showStats || showCorner) kernel.videoBitrate() else null
         val wasVisible = loading.visibility == VISIBLE
         loading.visibility = if (buffering) VISIBLE else GONE
-        loadingSpeed.text = PlayerUiText.bufferingSpeed(speed)
+        if (buffering) loadingSpeed.text = PlayerUiText.bufferingSpeed(speed)
         if (wasVisible != buffering && built) {
             val hideSeek = cfg.isHiddenFastSeekBtn || buffering
             rewind?.visibility = if (hideSeek) GONE else VISIBLE
             forward?.visibility = if (hideSeek) GONE else VISIBLE
         }
-        val line = if (cfg.isShowStatsBar || cfg.showNetSpeed)
-            PlayerUiText.statsLine(cfg.isShowStatsBar, kernel.mediaInfo(), speed, bitrate) else null
-        statsLine?.let { it.text = line.orEmpty(); it.visibility = if (line != null) VISIBLE else GONE }
-        val persistent = if (cfg.showNetSpeed) PlayerUiText.persistentSpeed(speed, bitrate) else null
+        if (visibleNow) {
+            val line = if (showStats) PlayerUiText.statsLine(cfg.isShowStatsBar, kernel.mediaInfo(), speed, bitrate) else null
+            statsLine?.let { it.text = line.orEmpty(); it.visibility = if (line != null) VISIBLE else GONE }
+        }
+        val persistent = if (showCorner) PlayerUiText.persistentSpeed(speed, bitrate) else null
         cornerSpeed.text = persistent.orEmpty()
-        cornerSpeed.visibility = if (persistent != null && !visibleNow && !buffering && !inPip) VISIBLE else GONE
+        cornerSpeed.visibility = if (persistent != null) VISIBLE else GONE
     }
 
     private fun step(forward: Boolean) {
@@ -845,6 +939,7 @@ class PlayerControlsView(
 
     val menuOpen get() = overlays.menuOpen
     val panelOpen get() = overlays.panelOpen
+    var onOverlayClosed: (() -> Unit)? = null
     var onPanelClosed: (() -> Unit)?
         get() = overlays.onPanelClosed
         set(v) { overlays.onPanelClosed = v }

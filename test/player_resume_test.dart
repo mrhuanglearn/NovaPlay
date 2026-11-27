@@ -224,6 +224,64 @@ void main() {
     await reqFuture;
     expect(host.sources.single.url, 'http://v/prefetched.mp4');
   });
+
+  test('initialSource is resolved once, passed to open, and onEpisodeRequest is not needed', () async {
+    var calls = 0;
+    final countingSource = VodPlaybackSource(
+      site: _site,
+      api: _CountingApi(() async {
+        calls++;
+        return const PlayResult(url: 'http://v/pre.mp4');
+      }),
+      detail: detail,
+      history: history,
+    );
+    final host = _Host();
+    final s = session(host, countingSource);
+    final initial = await s.preResolveInitialSource(line: 0, episode: 1, quality: 0);
+    expect(initial?.success, isTrue);
+    expect(initial?.url, 'http://v/pre.mp4');
+    await s.open(playback: _playback(), danmaku: _danmaku(), line: 0, episode: 1, initialSource: initial);
+    expect(host.opened.single.initialSource?.url, 'http://v/pre.mp4');
+    expect(calls, 1);
+  });
+
+  test('pre-resolve timeout returns null and onEpisodeRequest still reuses the in-flight resolve', () async {
+    var calls = 0;
+    final gate = Completer<PlayResult>();
+    final countingSource = VodPlaybackSource(
+      site: _site,
+      api: _CountingApi(() {
+        calls++;
+        return gate.future;
+      }),
+      detail: detail,
+      history: history,
+    );
+    final host = _Host();
+    final s = session(host, countingSource);
+    final initial = await s.preResolveInitialSource(
+        line: 0, episode: 1, quality: 0, timeout: const Duration(milliseconds: 20));
+    expect(initial, isNull);
+    await s.open(playback: _playback(), danmaku: _danmaku(), line: 0, episode: 1);
+    expect(host.opened.single.initialSource, isNull);
+    final req = s.onEpisodeRequest(
+        EpisodeRequest(sessionId: s.sessionId, requestId: 7, lineIndex: 0, episodeIndex: 1, qualityIndex: 0));
+    gate.complete(const PlayResult(url: 'http://v/slow.mp4'));
+    await req;
+    expect(calls, 1, reason: 'no duplicate play()');
+    expect(host.sources.single.url, 'http://v/slow.mp4');
+    expect(host.sources.single.requestId, 7);
+  });
+
+  test('HeadTailRepository.sectionsJsonFrom encodes non-empty marks and omits empty', () {
+    expect(HeadTailRepository.sectionsJsonFrom(null), isNull);
+    expect(HeadTailRepository.sectionsJsonFrom((intro: 0.0, outro: 0.0, ranges: const [])), isNull);
+    expect(
+      HeadTailRepository.sectionsJsonFrom((intro: 12.5, outro: 30.0, ranges: const [(60.0, 75.5)])),
+      '[{"type":"intro","endMs":12500},{"type":"outro","beforeEndMs":30000},{"type":"range","startMs":60000,"endMs":75500}]',
+    );
+  });
 }
 
 class _CountingApi extends SpiderApi {

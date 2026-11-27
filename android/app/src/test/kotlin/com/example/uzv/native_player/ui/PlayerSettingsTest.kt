@@ -29,14 +29,16 @@ class PlayerSettingsTest {
         val titles = PlayerSettings.items().filter { it !is PlayerSettings.Item.Section }.map { it.title }
         assertEquals(
             listOf(
-                "硬件加速", "适应（留黑边）", "裁剪填充", "拉伸填充", "MPV", "MDK", "EXO", "快进快退秒数",
-                "进度条显示总时长", "隐藏中央快进快退", "进入后台暂停", "进入后台自动画中画", "跳过提示", "切集提示", "优先横屏",
+                "硬件加速", "适应（留黑边）", "裁剪填充", "拉伸填充",
+                "自适应（按视频比例）", "始终横屏", "始终竖屏",
+                "MPV", "MDK", "EXO", "快进快退秒数",
+                "进度条显示总时长", "隐藏中央快进快退", "进入后台暂停", "进入后台自动画中画", "跳过提示", "切集提示",
                 "长按滑动调节倍速", "显示帧率与编码", "始终显示网速",
             ),
             titles,
         )
         val sections = PlayerSettings.items().filterIsInstance<PlayerSettings.Item.Section>().map { it.title }
-        assertEquals(listOf("解码", "画面比例", "播放内核", "快进快退秒数", "播放", "信息显示"), sections)
+        assertEquals(listOf("解码", "画面比例", "屏幕方向", "播放内核", "快进快退秒数", "播放", "信息显示"), sections)
     }
 
     @Test
@@ -47,12 +49,35 @@ class PlayerSettingsTest {
         assertEquals("zoom", option("裁剪填充").select(base).fitMode)
         assertEquals("fill", option("拉伸填充").select(base).fitMode)
         assertTrue(option("适应（留黑边）").selected(base.copy(fitMode = "nonsense")))
+        assertTrue(option("自适应（按视频比例）").selected(base))
+        assertTrue(option("始终竖屏").selected(base.copy(isPriorityLandscape = false)))
+        val pickedLandscape = option("始终横屏").select(base)
+        assertEquals("landscape", pickedLandscape.orientationMode)
+        assertTrue(pickedLandscape.isPriorityLandscape)
+        val pickedPortrait = option("始终竖屏").select(base)
+        assertEquals("portrait", pickedPortrait.orientationMode)
+        assertFalse(pickedPortrait.isPriorityLandscape)
+        val pickedAuto = option("自适应（按视频比例）").select(pickedPortrait)
+        assertEquals("auto", pickedAuto.orientationMode)
+        assertTrue(pickedAuto.isPriorityLandscape)
         assertTrue(option("MPV").selected(base))
         assertTrue(option("MPV").selected(base.copy(kernel = "MPV")))
         assertEquals("exo", option("EXO").select(base).kernel)
         assertTrue(option("EXO").selected(base.copy(kernel = "whatever")))
         assertTrue(PlayerSettings.needsReload(base, option("MDK").select(base)))
         assertFalse(PlayerSettings.needsReload(base, option("裁剪填充").select(base)))
+        assertFalse(PlayerSettings.needsReload(base, pickedPortrait))
+    }
+
+    @Test
+    fun effectiveOrientationModeFallsBackToPriorityLandscape() {
+        assertEquals("auto", PlayerUiText.effectiveOrientationMode(base.copy(orientationMode = null, isPriorityLandscape = true)))
+        assertEquals("portrait", PlayerUiText.effectiveOrientationMode(base.copy(orientationMode = null, isPriorityLandscape = false)))
+        assertEquals("auto", PlayerUiText.effectiveOrientationMode(base.copy(orientationMode = "bogus", isPriorityLandscape = true)))
+        assertEquals("portrait", PlayerUiText.effectiveOrientationMode(base.copy(orientationMode = "bogus", isPriorityLandscape = false)))
+        assertEquals("landscape", PlayerUiText.effectiveOrientationMode(base.copy(orientationMode = "landscape", isPriorityLandscape = false)))
+        assertEquals("portrait", PlayerUiText.effectiveOrientationMode(base.copy(orientationMode = "portrait", isPriorityLandscape = true)))
+        assertEquals(listOf("auto", "landscape", "portrait"), PlayerUiText.orientationModes)
     }
 
     @Test
@@ -61,7 +86,6 @@ class PlayerSettingsTest {
         assertFalse(toggle("硬件加速").set(base, false).hwDecode)
         assertTrue(toggle("隐藏中央快进快退").set(base, true).isHiddenFastSeekBtn)
         assertTrue(toggle("进度条显示总时长").set(base, true).isShowAllDuration)
-        assertFalse(toggle("优先横屏").set(base, false).isPriorityLandscape)
         // null = on (the original only turns it off for an explicit false)
         assertTrue(toggle("长按滑动调节倍速").get(base))
         assertEquals(false, toggle("长按滑动调节倍速").set(base, false).isLongPressSpeedAdjustEnabled)

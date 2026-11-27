@@ -18,6 +18,7 @@ final class MpvMetalView: UIView {
   }
 
   var onLayoutReady: (() -> Void)?
+  var onDrawableSizeChanged: ((CGSize) -> Void)?
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -39,6 +40,7 @@ final class MpvMetalView: UIView {
     metalLayer.isOpaque = true
     metalLayer.backgroundColor = UIColor.black.cgColor
     metalLayer.contentsScale = scale
+    metalLayer.contentsGravity = .resizeAspect
     let screenBounds = UIScreen.main.bounds
     metalLayer.drawableSize = CGSize(
       width: max(64, screenBounds.width * scale),
@@ -57,6 +59,7 @@ final class MpvMetalView: UIView {
       )
       if metalLayer.drawableSize != target {
         metalLayer.drawableSize = target
+        onDrawableSizeChanged?(target)
       }
       if let cb = onLayoutReady {
         onLayoutReady = nil
@@ -161,6 +164,7 @@ final class IosMpvEngine {
   private static let obsCacheStall: UInt64 = 4
   private static let obsVideoW: UInt64 = 5
   private static let obsVideoH: UInt64 = 6
+  private static let obsVideoRotate: UInt64 = 7
   private var bgObserver: NSObjectProtocol?
 
   init(metalView: MpvMetalView, hwDecode: Bool, fitMode: String, speed: Float) {
@@ -168,6 +172,9 @@ final class IosMpvEngine {
     self.hwDecode = hwDecode
     self.fitMode = fitMode
     self.speed = speed
+    metalView.onDrawableSizeChanged = { [weak self] _ in
+      self?.applyFitMode()
+    }
     self.bgObserver = NotificationCenter.default.addObserver(
       forName: UIApplication.didEnterBackgroundNotification,
       object: nil,
@@ -275,6 +282,7 @@ final class IosMpvEngine {
     _ = uzv_ios_mpv_observe_property(inst, Self.obsCacheStall, "paused-for-cache", 3)
     _ = uzv_ios_mpv_observe_property(inst, Self.obsVideoW, "video-params/w", 4)
     _ = uzv_ios_mpv_observe_property(inst, Self.obsVideoH, "video-params/h", 4)
+    _ = uzv_ios_mpv_observe_property(inst, Self.obsVideoRotate, "video-params/rotate", 4)
 
     lock.lock()
     isRunningEvents = true
@@ -746,7 +754,7 @@ final class IosMpvEngine {
       case Self.obsCacheStall:
         pausedForCache = uzv_ios_mpv_get_property_flag(inst, "paused-for-cache", false)
         publishStateIfNeeded()
-      case Self.obsVideoW, Self.obsVideoH:
+      case Self.obsVideoW, Self.obsVideoH, Self.obsVideoRotate:
         refreshVideoMetadata(inst: inst)
         delegate?.mpvEngineDidUpdateMetrics()
       default:
@@ -757,10 +765,25 @@ final class IosMpvEngine {
     }
   }
 
+  private func rotatedMpvDims(_ inst: OpaquePointer, _ wProp: String, _ hProp: String, _ rotProps: [String]) -> (Int64, Int64)? {
+    var w = uzv_ios_mpv_get_property_int64(inst, wProp, 0)
+    var h = uzv_ios_mpv_get_property_int64(inst, hProp, 0)
+    guard w > 0 && h > 0 else { return nil }
+    for prop in rotProps {
+      let rot = uzv_ios_mpv_get_property_int64(inst, prop, Int64.min)
+      if rot != Int64.min {
+        if rot % 180 != 0 { swap(&w, &h) }
+        break
+      }
+    }
+    return (w, h)
+  }
+
   private func refreshVideoMetadata(inst: OpaquePointer) {
-    let w = uzv_ios_mpv_get_property_int64(inst, "video-params/w", 0)
-    let h = uzv_ios_mpv_get_property_int64(inst, "video-params/h", 0)
-    if w > 0 && h > 0 {
+    let dims = rotatedMpvDims(inst, "video-out-params/dw", "video-out-params/dh", ["video-out-params/rotate"])
+      ?? rotatedMpvDims(inst, "video-params/dw", "video-params/dh", ["video-params/rotate"])
+      ?? rotatedMpvDims(inst, "video-params/w", "video-params/h", ["video-params/rotate", "current-tracks/video/demux-rotation", "track-list/0/demux-rotation"])
+    if let (w, h) = dims {
       videoSize = CGSize(width: CGFloat(w), height: CGFloat(h))
     }
     let fpsEst = uzv_ios_mpv_get_property_double(inst, "estimated-vf-fps", 0)

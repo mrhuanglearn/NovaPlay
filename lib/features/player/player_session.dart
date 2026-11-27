@@ -8,6 +8,7 @@ import 'head_tail.dart';
 import 'native_player_api.g.dart';
 import 'playback_source.dart';
 import 'session_router.dart';
+import 'video_format_probe.dart';
 
 /// What the error layer says when a site's play route answers without a URL.
 const emptyPlayUrlMessage = '该线路未返回播放地址，请换一条线路或稍后重试';
@@ -37,14 +38,18 @@ class PlayerSession implements NativePlayerFlutterApi {
     this.preferVideoDanmu,
     this.refs,
     this.headTail,
+    VideoFormatProbe? formatProbe,
     required this.onPreferences,
     this.describeError = _plainError,
-  });
+    this.isCancelled,
+  }) : formatProbe = formatProbe ?? VideoFormatProbe.shared;
 
   final String sessionId;
   final PlaybackSource source;
   final NativePlayerHostApi host;
   final SnifferService sniffer;
+  final VideoFormatProbe formatProbe;
+  final bool Function()? isCancelled;
 
   /// Resolves the configured danmaku server on first use (starting it if it is a local service). Null = no danmaku.
   final Future<DanmuClient?> Function()? danmu;
@@ -76,11 +81,24 @@ class PlayerSession implements NativePlayerFlutterApi {
   Completer<void>? _episodeResolved;
   bool _resolvingEpisode = false;
   (int, int, Future<PlayResult>)? _prefetchedEpisode;
+  (int, int, String)? _resolvedEpisodeUrl;
+  (int, int, Future<VideoDimensions?>)? _initialProbe;
+  (int, int, VideoDimensions)? _pendingProbedDims;
+  bool _opened = false;
+  bool _fastProbeDelivered = false;
   final Map<int, String> _searchTitles = {};
   final _closed = Completer<PageClosedEvent>();
+  bool _disposed = false;
 
   /// Completes when the player page closes.
   Future<PageClosedEvent> get closed => _closed.future;
+
+  void cancelBeforeOpen() {
+    _disposed = true;
+    if (!_closed.isCompleted) {
+      _closed.complete(PageClosedEvent(sessionId: sessionId, positionSeconds: 0, completed: false));
+    }
+  }
 
   int get line => _line;
   int get episode => _episode;
@@ -98,6 +116,47 @@ class PlayerSession implements NativePlayerFlutterApi {
     _prefetchedEpisode = (lineIndex, episodeIndex, fut);
   }
 
+  /// Starts probing the initial stream immediately on the Dart side so [PlayerLauncher] can await any remaining
+  /// fast-launch budget without a `Dart -> Native -> Dart` round-trip, while slower streams still push the result in the
+  /// background once [open] completes.
+  void startInitialProbe({
+    required int lineIndex,
+    required int episodeIndex,
+    required String url,
+    required Map<String, String> headers,
+  }) {
+    final trimmed = url.trim();
+    if (_disposed || _closed.isCompleted || source.epg != null || trimmed.isEmpty || VideoFormatProbe.shouldSkipProbe(trimmed)) {
+      return;
+    }
+    final existing = _initialProbe;
+    if (existing != null && existing.$1 == lineIndex && existing.$2 == episodeIndex) return;
+    final fut = formatProbe.probe(trimmed, headers: headers, timeout: const Duration(milliseconds: 1500));
+    _initialProbe = (lineIndex, episodeIndex, fut);
+    unawaited(fut.then((dims) {
+      if (dims == null || _disposed || _closed.isCompleted) return;
+      source.onVideoDimensionsKnown(dims.width, dims.height);
+      if (_fastProbeDelivered) return;
+      if (_opened) {
+        pushProbedVideoSize(lineIndex, episodeIndex, dims);
+      } else {
+        _pendingProbedDims = (lineIndex, episodeIndex, dims);
+      }
+    }));
+  }
+
+  /// Waits up to [timeout] for an already-started initial probe without cancelling its background completion push.
+  Future<VideoDimensions?> waitForInitialProbe(Duration timeout) {
+    final existing = _initialProbe;
+    if (existing == null || timeout <= Duration.zero) return Future<VideoDimensions?>.value(null);
+    return existing.$3.timeout(timeout, onTimeout: () => null);
+  }
+
+  void markInitialProbeDelivered() {
+    _fastProbeDelivered = true;
+    _pendingProbedDims = null;
+  }
+
   Future<void> open({
     required PlaybackConfig playback,
     required DanmakuConfig danmaku,
@@ -106,10 +165,29 @@ class PlayerSession implements NativePlayerFlutterApi {
     double startSeconds = 0,
     int quality = 0,
     String? headTailJson,
+    SourcePayload? initialSource,
+    VideoDimensions? fallbackVideoSize,
+    int? probeBudgetMs,
   }) async {
     _line = line;
     _episode = episode;
     _quality = quality;
+    if (initialSource?.videoWidth != null && initialSource?.videoHeight != null) {
+      _fastProbeDelivered = true;
+      _pendingProbedDims = null;
+    } else if (_initialProbe == null &&
+        source.epg == null &&
+        (playback.orientationMode == 'auto' || (playback.orientationMode == null && playback.isPriorityLandscape)) &&
+        initialSource != null &&
+        initialSource.success &&
+        (initialSource.url?.trim().isNotEmpty ?? false)) {
+      startInitialProbe(
+        lineIndex: line,
+        episodeIndex: episode,
+        url: initialSource.url!,
+        headers: initialSource.headers ?? const {},
+      );
+    }
     final lines = source.lines;
     List<EpisodeItem> episodesOf(PlayLine l) =>
         [for (var j = 0; j < l.episodes.length; j++) EpisodeItem(episodeIndex: j, episodeName: l.episodes[j].name)];
@@ -131,7 +209,17 @@ class PlayerSession implements NativePlayerFlutterApi {
       epgProgrammes: source.epg,
       headTailSectionsJson: headTailJson,
       startQualityIndex: quality,
+      initialSource: initialSource,
+      initialVideoWidth: fallbackVideoSize?.width,
+      initialVideoHeight: fallbackVideoSize?.height,
+      probeBudgetMs: probeBudgetMs,
     ));
+    _opened = true;
+    final pending = _pendingProbedDims;
+    _pendingProbedDims = null;
+    if (!_fastProbeDelivered && pending != null) {
+      pushProbedVideoSize(pending.$1, pending.$2, pending.$3);
+    }
   }
 
   // -- Kotlin -> Dart ---------------------------------------------------------------------------
@@ -149,14 +237,177 @@ class PlayerSession implements NativePlayerFlutterApi {
     _resolvingEpisode = true;
     _line = request.lineIndex;
     _episode = request.episodeIndex;
-    final prefetched = _prefetchedEpisode;
-    _prefetchedEpisode = null;
     try {
-      var result = (prefetched != null && prefetched.$1 == request.lineIndex && prefetched.$2 == request.episodeIndex)
+      // Scheme A: a pre-resolve that timed out may still be running (or have finished); reuse it instead of calling
+      // spider.play a second time.
+      final pre = _preResolve;
+      final SourcePayload payload;
+      if (pre != null && pre.$1 == request.lineIndex && pre.$2 == request.episodeIndex && pre.$3 == request.qualityIndex) {
+        _preResolve = null;
+        final r = await pre.$4;
+        payload = _withRequestId(r, request.requestId);
+      } else {
+        payload = await resolveEpisodeSource(
+            requestId: request.requestId,
+            lineIndex: request.lineIndex,
+            episodeIndex: request.episodeIndex,
+            qualityIndex: request.qualityIndex);
+      }
+      _resolvingEpisode = false;
+      if (!gate.isCompleted) gate.complete();
+      final url = payload.url?.trim() ?? '';
+      if (payload.success && url.isNotEmpty && (payload.videoWidth == null || payload.videoHeight == null)) {
+        final hit = formatProbe.cached(url);
+        if (hit != null) {
+          payload.videoWidth = hit.width;
+          payload.videoHeight = hit.height;
+        }
+      }
+      await host.provideSource(payload);
+      if (payload.success && url.isNotEmpty && (payload.videoWidth == null || payload.videoHeight == null)) {
+        probeAndPushVideoSize(
+          lineIndex: request.lineIndex,
+          episodeIndex: request.episodeIndex,
+          url: url,
+          headers: payload.headers ?? const {},
+        );
+      }
+    } catch (e) {
+      _resolvingEpisode = false;
+      if (!gate.isCompleted) gate.complete();
+      await host.provideSource(SourcePayload(requestId: request.requestId, success: false, errorMessage: describeError(e)));
+    }
+  }
+
+  void pushProbedVideoSize(int lineIndex, int episodeIndex, VideoDimensions dims) {
+    source.onVideoDimensionsKnown(dims.width, dims.height);
+    if (_disposed || _closed.isCompleted || _line != lineIndex || _episode != episodeIndex) return;
+    unawaited(Future<void>.sync(
+      () => host.updateVideoSize(sessionId, lineIndex, episodeIndex, dims.width, dims.height),
+    ).catchError((Object _) {}));
+  }
+
+  @override
+  Future<ProbedVideoSize?> onProbeVideoSize(
+    String sessionId,
+    int lineIndex,
+    int episodeIndex,
+    String url,
+    Map<String, String> headers,
+    int budgetMs,
+  ) async {
+    if (isCancelled?.call() == true) {
+      cancelBeforeOpen();
+      return ProbedVideoSize(width: -1, height: -1);
+    }
+    if (_disposed || _closed.isCompleted || source.epg != null) return null;
+    final trimmed = url.trim();
+    if (trimmed.isEmpty || VideoFormatProbe.shouldSkipProbe(trimmed)) return null;
+    final hit = formatProbe.cached(trimmed);
+    if (hit != null) {
+      markInitialProbeDelivered();
+      source.onVideoDimensionsKnown(hit.width, hit.height);
+      return ProbedVideoSize(width: hit.width, height: hit.height);
+    }
+
+    final existingInitial = _initialProbe;
+    final managedByInitial =
+        existingInitial != null && existingInitial.$1 == lineIndex && existingInitial.$2 == episodeIndex;
+    final probeFut = managedByInitial
+        ? existingInitial.$3
+        : formatProbe.probe(
+            trimmed,
+            headers: headers,
+            timeout: const Duration(milliseconds: 1500),
+          );
+    final budget = Duration(milliseconds: budgetMs.clamp(0, 600));
+    final fast = budget > Duration.zero ? await probeFut.timeout(budget, onTimeout: () => null) : null;
+    if (isCancelled?.call() == true) {
+      cancelBeforeOpen();
+      return ProbedVideoSize(width: -1, height: -1);
+    }
+    if (fast != null) {
+      markInitialProbeDelivered();
+      source.onVideoDimensionsKnown(fast.width, fast.height);
+      return ProbedVideoSize(width: fast.width, height: fast.height);
+    }
+    if (!managedByInitial) {
+      unawaited(probeFut.then((lateDims) {
+        if (lateDims != null) pushProbedVideoSize(lineIndex, episodeIndex, lateDims);
+      }));
+    }
+    return null;
+  }
+
+  @override
+  Future<void> onVideoSizeDetected(
+    String sessionId,
+    int lineIndex,
+    int episodeIndex,
+    int width,
+    int height,
+  ) async {
+    if (width <= 0 || height <= 0) return;
+    final dims = (width: width, height: height);
+    final resolved = _resolvedEpisodeUrl;
+    if (resolved != null && resolved.$1 == lineIndex && resolved.$2 == episodeIndex && resolved.$3.isNotEmpty) {
+      formatProbe.remember(resolved.$3, dims);
+    }
+    source.onVideoDimensionsKnown(width, height);
+  }
+
+  void probeAndPushVideoSize({
+    required int lineIndex,
+    required int episodeIndex,
+    required String url,
+    required Map<String, String> headers,
+  }) {
+    if (_disposed || _closed.isCompleted || source.epg != null || url.trim().isEmpty) return;
+    final hit = formatProbe.cached(url);
+    if (hit != null) {
+      pushProbedVideoSize(lineIndex, episodeIndex, hit);
+      return;
+    }
+    unawaited(
+      formatProbe
+          .probe(url, headers: headers, timeout: const Duration(milliseconds: 1500))
+          .then((dims) {
+        if (dims != null) pushProbedVideoSize(lineIndex, episodeIndex, dims);
+      }),
+    );
+  }
+
+  static SourcePayload _withRequestId(SourcePayload p, int requestId) => SourcePayload(
+        requestId: requestId,
+        success: p.success,
+        url: p.url,
+        audioUrl: p.audioUrl,
+        headers: p.headers,
+        qualities: p.qualities,
+        subtitles: p.subtitles,
+        errorMessage: p.errorMessage,
+        videoWidth: p.videoWidth,
+        videoHeight: p.videoHeight,
+      );
+
+  (int, int, int, Future<SourcePayload>)? _preResolve;
+
+  /// Resolves (and, for `parse: 1` pages, sniffs) one episode into the payload the native side plays. Failures become
+  /// `SourcePayload(success: false, errorMessage: ...)`; this never throws. Reuses [_prefetchedEpisode] when it matches.
+  Future<SourcePayload> resolveEpisodeSource({
+    required int requestId,
+    required int lineIndex,
+    required int episodeIndex,
+    required int qualityIndex,
+  }) async {
+    final prefetched = _prefetchedEpisode;
+    if (prefetched != null && prefetched.$1 == lineIndex && prefetched.$2 == episodeIndex) _prefetchedEpisode = null;
+    try {
+      var result = (prefetched != null && prefetched.$1 == lineIndex && prefetched.$2 == episodeIndex)
           ? await prefetched.$3
-          : await source.resolve(request.lineIndex, request.episodeIndex);
+          : await source.resolve(lineIndex, episodeIndex);
       // The native side remembers the quality index across episodes; this episode may offer fewer, so clamp.
-      final choice = result.qualities.isEmpty ? 0 : request.qualityIndex.clamp(0, result.qualities.length - 1);
+      final choice = result.qualities.isEmpty ? 0 : qualityIndex.clamp(0, result.qualities.length - 1);
       _quality = choice;
       result = result.withQuality(choice);
       // OBSERVED (2026-11-11): some lines answer `{"parse":0,"url":""}`. Handing that to a kernel made ExoPlayer report
@@ -179,10 +430,22 @@ class PlayerSession implements NativePlayerFlutterApi {
       _episodeDanmuUrl = result.videoDanmuUrl;
       _episodeDanmuComments = result.videoDanmuComments;
       _episodeHeaders = result.effectiveHeaders;
-      _resolvingEpisode = false;
-      if (!gate.isCompleted) gate.complete();
-      await host.provideSource(SourcePayload(
-        requestId: request.requestId,
+      _resolvedEpisodeUrl = (lineIndex, episodeIndex, result.url.trim());
+      var vw = result.videoWidth;
+      var vh = result.videoHeight;
+      if (vw != null && vh != null && vw > 0 && vh > 0) {
+        formatProbe.remember(result.url, (width: vw, height: vh));
+        source.onVideoDimensionsKnown(vw, vh);
+      } else {
+        final cachedDims = formatProbe.cached(result.url);
+        if (cachedDims != null) {
+          vw = cachedDims.width;
+          vh = cachedDims.height;
+          source.onVideoDimensionsKnown(vw, vh);
+        }
+      }
+      return SourcePayload(
+        requestId: requestId,
         success: true,
         url: result.url,
         audioUrl: result.audioUrl,
@@ -195,12 +458,34 @@ class PlayerSession implements NativePlayerFlutterApi {
           for (final s in result.subtitles)
             SubtitleOption(url: s.url, name: s.name, language: s.language, mimeType: s.mimeType),
         ],
-      ));
+        videoWidth: vw,
+        videoHeight: vh,
+      );
     } catch (e) {
-      _resolvingEpisode = false;
-      if (!gate.isCompleted) gate.complete();
-      await host.provideSource(SourcePayload(requestId: request.requestId, success: false, errorMessage: describeError(e)));
+      return SourcePayload(requestId: requestId, success: false, errorMessage: describeError(e));
     }
+  }
+
+  /// Scheme A: resolves the initial episode while the detail page is still showing so the native side can open already
+  /// playing. Returns null on timeout; the still-running resolve is kept so [onEpisodeRequest] reuses it.
+  Future<SourcePayload?> preResolveInitialSource({
+    required int line,
+    required int episode,
+    required int quality,
+    Duration timeout = const Duration(seconds: 5),
+  }) async {
+    if (line < 0 || line >= source.lines.length) return null;
+    final eps = source.lines[line].episodes;
+    if (episode < 0 || episode >= eps.length) return null;
+    _line = line;
+    _episode = episode;
+    final fut = resolveEpisodeSource(requestId: 0, lineIndex: line, episodeIndex: episode, qualityIndex: quality);
+    _preResolve = (line, episode, quality, fut);
+    final r = await fut.timeout(timeout, onTimeout: () => SourcePayload(requestId: -1, success: false));
+    if (r.requestId == -1) return null;
+    // Delivered inside the open request: the native side will not ask again, so drop the cached copy.
+    _preResolve = null;
+    return r;
   }
 
   /// Cached as a future (not a flag): a search issued while the first resolve is still starting a local service must
@@ -326,6 +611,7 @@ class PlayerSession implements NativePlayerFlutterApi {
 
   @override
   Future<void> onPageClosed(PageClosedEvent event) async {
+    _disposed = true;
     // The close event has no duration; keep the last one seen so the history progress bar does not reset to 0.
     await source.saveProgress(_line, _episode, event.positionSeconds, _lastDuration, quality: _quality, flush: true);
     await source.finish(_line, _episode, event.positionSeconds);
@@ -345,5 +631,7 @@ class PlayerSession implements NativePlayerFlutterApi {
   Future<void> onStateChanged(StateEvent event) async {}
 
   @override
-  Future<void> onErrorReported(ErrorReport report) async {}
+  Future<void> onErrorReported(ErrorReport report) async {
+    source.invalidateEpisodeCache(_line, _episode);
+  }
 }

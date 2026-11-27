@@ -25,10 +25,16 @@ bash "${SCRIPT_DIR}/fetch_nodemobile.sh"
 echo "[package_ipa] Step 2/6: Preparing NovaMpv.xcframework (NOVAPLAY_WITH_MPV=${NOVAPLAY_WITH_MPV})..."
 bash "${SCRIPT_DIR}/fetch_mpvkit.sh"
 
+BUILD_NUM_ARGS=()
+RESOLVED_BUILD_NUMBER="${NOVAPLAY_BUILD_NUMBER:-${GITHUB_RUN_NUMBER:-}}"
+if [[ -n "${RESOLVED_BUILD_NUMBER}" ]]; then
+  BUILD_NUM_ARGS=(--build-number="${RESOLVED_BUILD_NUMBER}")
+fi
+
 echo "[package_ipa] Step 3/6: Resolving Dart packages, l10n & iOS Flutter config..."
 flutter pub get
 flutter gen-l10n
-flutter build ios --config-only --release --no-codesign
+flutter build ios --config-only --release --no-codesign ${BUILD_NUM_ARGS[@]+"${BUILD_NUM_ARGS[@]}"}
 
 echo "[package_ipa] Step 4/6: Installing CocoaPods (VLC=${NOVAPLAY_WITH_VLC}, MPV=${NOVAPLAY_WITH_MPV})..."
 pushd ios >/dev/null
@@ -36,7 +42,7 @@ pod install || pod install --repo-update
 popd >/dev/null
 
 echo "[package_ipa] Step 5/6: Building Release Runner.app (--no-codesign, iOS 15.0+)..."
-flutter build ios --release --no-codesign
+flutter build ios --release --no-codesign ${BUILD_NUM_ARGS[@]+"${BUILD_NUM_ARGS[@]}"}
 
 APP_BUNDLE="${FLUTTER_APP_DIR}/build/ios/iphoneos/Runner.app"
 if [[ ! -d "${APP_BUNDLE}" ]]; then
@@ -123,6 +129,12 @@ if [[ -d "${PAYLOAD_APP}/Frameworks" ]]; then
   for dylib in "${PAYLOAD_APP}/Frameworks"/*.dylib; do
     [[ -e "${dylib}" ]] || continue
     sign_target "${dylib}"
+  done
+fi
+if [[ -d "${PAYLOAD_APP}/PlugIns" ]]; then
+  for appex in "${PAYLOAD_APP}/PlugIns"/*.appex; do
+    [[ -e "${appex}" ]] || continue
+    sign_target "${appex}"
   done
 fi
 sign_target "${PAYLOAD_APP}"

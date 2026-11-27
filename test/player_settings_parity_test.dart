@@ -15,7 +15,7 @@ import 'package:uzv_reimpl/ui/widgets.dart';
 // android/.../ui/PlayerSettings.kt and checked by PlayerSettingsTest.theStepsMatchThePlayerSettingsPage against this
 // same list; change both together.
 const playerSettingTitles = [
-  '硬件加速', '播放内核', '画面填充', '默认倍速', '快进快退秒数', '长按倍速', '长按滑动调节倍速', '优先横屏', //
+  '硬件加速', '播放内核', '画面填充', '默认倍速', '快进快退秒数', '长按倍速', '长按滑动调节倍速', '屏幕方向', //
   '进度条显示总时长', '隐藏中央快进快退', '进入后台暂停', '进入后台自动画中画', '跳过提示', '切集提示', //
   '显示帧率与编码', '始终显示网速', '首选字幕语言', '字幕字体', '字体目录（可选）', '首选音轨语言',
 ];
@@ -85,6 +85,32 @@ void main() {
     for (final t in ['裁剪铺满', '拉伸铺满']) {
       expect(find.text(t), findsWidgets, reason: t);
     }
+  });
+
+  testWidgets('屏幕方向 defaults to 自适应', (tester) async {
+    await pump(tester);
+    final row = find.widgetWithText(SettingsTile, '屏幕方向');
+    expect(find.descendant(of: row, matching: find.text('自适应')), findsOneWidget);
+  });
+
+  testWidgets('picking 始终竖屏 is saved', (tester) async {
+    await pump(tester);
+    await tester.tap(find.text('屏幕方向'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('始终竖屏'));
+    await tester.pumpAndSettle();
+    final (p, _) = await repo.load();
+    expect(p.orientationMode, 'portrait');
+    expect(p.isPriorityLandscape, isFalse);
+  });
+
+  test('a legacy list without orientationMode derives it', () async {
+    final legacy = (defaultPlaybackConfig()..isPriorityLandscape = false).encode() as List<Object?>;
+    final store = _MemoryStore('player_config.json');
+    await store.write({'playback': legacy.sublist(0, legacy.length - 1), 'danmaku': defaultDanmakuConfig().encode()});
+    final (p, _) = await PlayerConfigRepository(store: store).load();
+    expect(p.orientationMode, isNull);
+    expect(effectiveOrientationMode(p), 'portrait');
   });
 }
 

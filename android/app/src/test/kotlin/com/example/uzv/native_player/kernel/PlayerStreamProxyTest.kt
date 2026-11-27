@@ -177,4 +177,29 @@ class PlayerStreamProxyTest {
         assertEquals("http://127.0.0.1:2333/proxy/x", local.url)
         assertEquals("1", local.forwardedHeaders["X-Test"])
     }
+
+    @Test
+    fun sanitizePercentEncodingPreservesReservedAndEncodesUnsafeBytes() {
+        assertEquals(
+            "https://example.com/a%20b/%25zz/%E4%B8%AD%E6%96%87?x=1&y=2#frag",
+            PlayerStreamProxy.sanitizePercentEncoding(" https://example.com/a b/%zz/中文?x=1&y=2#frag "),
+        )
+        assertEquals(
+            "https://example.com/%20%25%2F?k=[1,2]",
+            PlayerStreamProxy.sanitizePercentEncoding("https://example.com/%20%%2F?k=[1,2]"),
+        )
+    }
+
+    @Test
+    fun dropRemovesSessionAndReturns404() {
+        routes["/dropped.mp4"] = "video/mp4" to "ok".toByteArray()
+        val wrapped = PlayerStreamProxy.wrap("http://127.000.000.001:$upstreamPort/dropped.mp4", emptyMap())
+        val token = requireNotNull(wrapped.token)
+        assertEquals("ok", URL(wrapped.url).readText())
+        PlayerStreamProxy.drop(token)
+        PlayerStreamProxy.drop(null)
+        val conn = URL(wrapped.url).openConnection() as HttpURLConnection
+        assertEquals(404, conn.responseCode)
+        conn.disconnect()
+    }
 }

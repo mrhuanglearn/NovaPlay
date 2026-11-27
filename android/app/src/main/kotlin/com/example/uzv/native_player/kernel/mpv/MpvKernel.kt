@@ -29,8 +29,17 @@ class MpvKernel(context: Context, hwDecode: Boolean) : PlayerKernel {
         NativeMpvApi,
         object : MpvCore.Events {
             // PlayerController calls Flutter from these, which must happen on the main thread.
-            override fun onState(state: String) { main.post { if (!released) listener?.onState(state) } }
+            override fun onState(state: String) {
+                main.post {
+                    if (!released) listener?.onState(state)
+                }
+            }
             override fun onError(message: String, code: Int?) { main.post { if (!released) listener?.onError(PlayerUiText.kernelFailed("MPV", message), code) } }
+            override fun onVideoSizeChanged(width: Int, height: Int) {
+                main.post {
+                    if (!released) listener?.onVideoSizeChanged(width, height)
+                }
+            }
         },
         requestRedraw = { if (::surface.isInitialized) surface.requestRender() },
     )
@@ -70,9 +79,12 @@ class MpvKernel(context: Context, hwDecode: Boolean) : PlayerKernel {
         }
     override val isPlaying: Boolean get() = core.isPlaying
 
-    override fun load(url: String, audioUrl: String?, headers: Map<String, String>, startMs: Long, subtitles: List<SubtitleOption>) {
+    override fun load(url: String, audioUrl: String?, headers: Map<String, String>, startMs: Long, subtitles: List<SubtitleOption>, autoPlay: Boolean) {
         val sidecars = subtitles.map { MpvSidecar(it.url, it.name, it.language) }
-        val start = { core.load(url, audioUrl, headers, startMs, sidecars) }
+        val start = {
+            core.load(url, audioUrl, headers, startMs, sidecars)
+            if (!autoPlay) core.setPaused(true)
+        }
         if (renderReady) start() else pendingLoad = start
     }
 
@@ -100,14 +112,20 @@ class MpvKernel(context: Context, hwDecode: Boolean) : PlayerKernel {
     override fun pause() = core.setPaused(true)
     override fun seekTo(ms: Long) = core.seekTo(ms)
 
-    /** Order matters: stop reading events, free the render context on the GL thread, only then destroy the core. */
+    /** Order matters: signal shutdown on main thread, then free GL context and destroy the core off the UI thread. */
     override fun release() {
         if (released) return
         released = true
         MpvNative.setRenderUpdateListener(null)
         pendingLoad = null
-        core.stopEvents()
-        surface.releaseRenderContext(1000)
-        core.destroy()
+        core.requestStop()
+        Thread({
+            surface.releaseRenderContext(800)
+            core.stopEvents()
+            core.destroy(background = false)
+        }, "mpv-release").apply {
+            isDaemon = true
+            start()
+        }
     }
 }

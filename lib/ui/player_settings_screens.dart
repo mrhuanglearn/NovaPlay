@@ -12,6 +12,7 @@ import '../core/haptics.dart';
 import '../features/catpaw/catpaw_protocol.dart';
 import '../features/danmaku/danmu_service.dart';
 import '../features/player/native_player_api.g.dart';
+import '../features/player/player_launcher.dart' show effectiveOrientationMode, setOrientationMode;
 import '../l10n/l10n.dart';
 import 'form_widgets.dart';
 import 'widgets.dart';
@@ -84,6 +85,12 @@ class _PlayerSettingsScreenState extends ConsumerState<PlayerSettingsScreen> {
     final p = _p!;
     setState(() => edit(p));
     ref.read(playerConfigRepositoryProvider).save(p, _d!);
+    final active = ref.read(activePlayerSessionProvider);
+    if (active != null) {
+      unawaited(active.host
+          .updateRuntimeConfig(active.sessionId, RuntimeConfigPatch(playbackConfig: p))
+          .catchError((Object _) {}));
+    }
   }
 
   Future<void> _pick<T>(
@@ -133,6 +140,16 @@ class _PlayerSettingsScreenState extends ConsumerState<PlayerSettingsScreen> {
         ? const {'avplayer': 'AVPlayer', 'mpv': 'MPV', 'vlc': 'VLC'}
         : const {'mpv': 'MPV', 'mdk': 'MDK', 'exo': 'EXO'};
     final effectiveKernel = p == null ? '' : (isIos ? _normalizeIosKernel(p.kernel) : p.kernel);
+    final orientations = {
+      'auto': l.playerOrientationAuto,
+      'landscape': l.playerOrientationLandscape,
+      'portrait': l.playerOrientationPortrait,
+    };
+    final orientationShort = {
+      'auto': l.playerOrientationAutoShort,
+      'landscape': l.playerOrientationLandscape,
+      'portrait': l.playerOrientationPortrait,
+    };
     final fits = {'fit': l.playerFitFit, 'zoom': l.playerFitZoom, 'fill': l.playerFitFill};
     // OBSERVED (播放器): 解码 / 画面与内核 / 播放 / 信息显示, steppers for the speeds and the seek step. 字幕与音频 is this
     // project's own section (the original has 字幕样式 colours there). The player page's gear shows these same rows in the
@@ -214,11 +231,13 @@ class _PlayerSettingsScreenState extends ConsumerState<PlayerSettingsScreen> {
                   value: p.isLongPressSpeedAdjustEnabled != false,
                   onChanged: (v) => _change((p) => p.isLongPressSpeedAdjustEnabled = v),
                 ),
-                SwitchRow(
-                    icon: Icons.crop_landscape,
-                    title: l.playerPreferLandscape,
-                    value: p.isPriorityLandscape,
-                    onChanged: (v) => _change((p) => p.isPriorityLandscape = v)),
+                SettingsTile(
+                  icon: Icons.screen_rotation_outlined,
+                  title: l.playerOrientationMode,
+                  subtitle: orientationShort[effectiveOrientationMode(p)],
+                  onTap: () => _pick<String>(l.playerOrientationMode, effectiveOrientationMode(p), orientations,
+                      (p, v) => setOrientationMode(p, v)),
+                ),
                 SwitchRow(
                   icon: Icons.timer_outlined,
                   title: l.playerShowTotalDuration,
@@ -379,6 +398,12 @@ class _DanmuSettingsScreenState extends ConsumerState<DanmuSettingsScreen> {
   void _appearance(void Function(DanmakuConfig d) edit) {
     setState(() => edit(_d!));
     ref.read(playerConfigRepositoryProvider).save(_p!, _d!);
+    final active = ref.read(activePlayerSessionProvider);
+    if (active != null) {
+      unawaited(active.host
+          .updateRuntimeConfig(active.sessionId, RuntimeConfigPatch(danmakuConfig: _d))
+          .catchError((Object _) {}));
+    }
   }
 
   Future<void> _run(Future<String?> Function() job) async {

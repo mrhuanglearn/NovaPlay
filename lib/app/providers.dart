@@ -265,6 +265,7 @@ class SpiderRuntime {
 /// entering the home screen so the initial page never double-refreshes; falls back to local cache on timeout.
 final iosStartupGateEnabledProvider = Provider<bool>((_) => Platform.isIOS);
 final iosStartupGateTimeoutProvider = Provider<Duration>((_) => const Duration(seconds: 4));
+final autoUpdateTimeoutProvider = Provider<Duration>((_) => const Duration(seconds: 45));
 
 /// Container-scoped tracker for the currently running local CatPaw worker key and in-flight background auto-updates.
 class _CatpawRuntimeState {
@@ -272,19 +273,39 @@ class _CatpawRuntimeState {
   bool disposed = false;
   bool iosStartupGateCompleted = false;
   final Set<String> checkingAutoUpdate = {};
+  final Map<String, CancelToken> activeAutoUpdateTokens = {};
+  final Set<String> pendingAutoUpdateRetry = {};
+  final Set<String> autoCheckedOkThisSession = {};
   final Map<String, int> lastAutoCheckedMs = {};
 }
 
 final _catpawRuntimeStateProvider = Provider((ref) {
   final s = _CatpawRuntimeState();
-  ref.onDispose(() => s.disposed = true);
+  ref.onDispose(() {
+    s.disposed = true;
+    for (final t in s.activeAutoUpdateTokens.values) {
+      if (!t.isCancelled) t.cancel('container disposed');
+    }
+    s.activeAutoUpdateTokens.clear();
+  });
   return s;
 });
+
+/// Cancels any in-flight background `autoUpdate` for [subKey] so a manual refresh or edit can proceed immediately.
+void cancelBackgroundAutoUpdate(ProviderContainer container, String subKey) {
+  final tracker = container.read(_catpawRuntimeStateProvider);
+  final token = tracker.activeAutoUpdateTokens.remove(subKey);
+  if (token != null && !token.isCancelled) {
+    token.cancel('preempted by manual refresh');
+  }
+  tracker.checkingAutoUpdate.remove(subKey);
+}
 
 Future<void> _autoUpdateSubscription(
   ProviderContainer container,
   Subscription sub, {
   bool reloadRuntimeOnUpdate = true,
+  bool Function()? shouldReloadRuntime,
   CancelToken? cancelToken,
 }) async {
   final tracker = container.read(_catpawRuntimeStateProvider);
@@ -292,19 +313,32 @@ Future<void> _autoUpdateSubscription(
   final prevMs = tracker.lastAutoCheckedMs[sub.key];
   if (tracker.disposed || (prevMs != null && nowMs - prevMs < 15000)) return;
   if (!tracker.checkingAutoUpdate.add(sub.key)) return;
+  final token = cancelToken ?? CancelToken();
+  tracker.activeAutoUpdateTokens[sub.key] = token;
+  var timedOut = false;
+  var failed = false;
+  final timer = Timer(container.read(autoUpdateTimeoutProvider), () {
+    timedOut = true;
+    if (!token.isCancelled) token.cancel('background autoUpdate timeout');
+  });
   try {
     final updated = await container.read(subscriptionServiceProvider).refresh(
           sub,
           background: true,
-          cancelToken: cancelToken,
-          confirmConfigMismatch: () => confirmConfigChecksumMismatch(rootNavigatorKey),
+          cancelToken: token,
+          confirmConfigMismatch: null,
+          onBackgroundError: (_) {
+            if (!token.isCancelled) failed = true;
+          },
         );
-    if (tracker.disposed || cancelToken?.isCancelled == true) return;
+    if (timedOut) failed = true;
+    if (tracker.disposed || token.isCancelled || failed) return;
     container.invalidate(subscriptionsProvider);
-    if (updated != null && reloadRuntimeOnUpdate) {
+    final reload = shouldReloadRuntime != null ? shouldReloadRuntime() : reloadRuntimeOnUpdate;
+    if (updated != null && reload) {
       final subs = await container.read(subscriptionsProvider.future);
-      if (tracker.disposed || cancelToken?.isCancelled == true) return;
-      final selected = container.read(activeSubscriptionKeyProvider).valueOrNull;
+      if (tracker.disposed || token.isCancelled) return;
+      final selected = await container.read(activeSubscriptionKeyProvider.future);
       final activeKey = subs.any((s) => s.key == selected) ? selected : subs.firstOrNull?.key;
       if (activeKey == sub.key) {
         container.invalidate(catpawRuntimeProvider);
@@ -316,10 +350,24 @@ Future<void> _autoUpdateSubscription(
       }
     }
   } catch (e) {
+    if (timedOut || !token.isCancelled) failed = true;
     debugPrint('background autoUpdate failed for ${sub.key}: $e');
   } finally {
-    if (!tracker.disposed) tracker.lastAutoCheckedMs[sub.key] = DateTime.now().millisecondsSinceEpoch;
-    tracker.checkingAutoUpdate.remove(sub.key);
+    timer.cancel();
+    if (timedOut) failed = true;
+    if (!tracker.disposed) {
+      if (!failed && !token.isCancelled) {
+        tracker.pendingAutoUpdateRetry.remove(sub.key);
+        tracker.autoCheckedOkThisSession.add(sub.key);
+        tracker.lastAutoCheckedMs[sub.key] = DateTime.now().millisecondsSinceEpoch;
+      } else if (failed) {
+        tracker.pendingAutoUpdateRetry.add(sub.key);
+      }
+    }
+    if (identical(tracker.activeAutoUpdateTokens[sub.key], token)) {
+      tracker.activeAutoUpdateTokens.remove(sub.key);
+      tracker.checkingAutoUpdate.remove(sub.key);
+    }
   }
 }
 
@@ -336,42 +384,61 @@ Future<void> runStartupSubscriptionAutoUpdate(ProviderContainer container) async
   }
 }
 
+/// Retries background `autoUpdate` checks that failed earlier (plus the active `autoUpdate` subscription if it has
+/// not completed a remote check yet this session).
+Future<void> retryPendingSubscriptionAutoUpdates(ProviderContainer container) async {
+  final tracker = container.read(_catpawRuntimeStateProvider);
+  if (tracker.disposed) return;
+  try {
+    final subs = await container.read(subscriptionsProvider.future);
+    if (tracker.disposed || subs.isEmpty) return;
+    final selected = await container.read(activeSubscriptionKeyProvider.future);
+    final activeKey = subs.any((s) => s.key == selected) ? selected : subs.first.key;
+    final targets = subs.where((s) {
+      if (!s.autoUpdate || s.local || (s.indexJsUrl == null && s.cloudUrl == null)) return false;
+      return tracker.pendingAutoUpdateRetry.contains(s.key) ||
+          (s.key == activeKey && !tracker.autoCheckedOkThisSession.contains(s.key));
+    }).toList();
+    if (targets.isEmpty) return;
+    await Future.wait(targets.map((s) => _autoUpdateSubscription(container, s)));
+  } catch (e) {
+    debugPrint('retry pending autoUpdate failed: $e');
+  }
+}
+
 /// iOS cold-start subscription gate: waits up to [iosStartupGateTimeoutProvider] for `autoUpdate` subscriptions to
-/// finish checking/downloading before entering the home page; on timeout, cancels in-flight HTTP requests immediately
-/// so the home page loads the local cache once without a late double-refresh.
+/// finish checking/downloading before entering the home page; on timeout, lets in-flight downloads continue in the
+/// background and hot-reload the runtime once ready.
 final iosStartupSubscriptionGateProvider = FutureProvider<void>((ref) async {
   if (!ref.watch(iosStartupGateEnabledProvider)) return;
   final runtimeState = ref.read(_catpawRuntimeStateProvider);
   if (runtimeState.iosStartupGateCompleted) return;
   final timeout = ref.read(iosStartupGateTimeoutProvider);
-  final cancelToken = CancelToken();
+  Timer? timer;
   try {
     final subs = await ref.read(subscriptionsProvider.future);
     final targets = subs.where((s) => s.autoUpdate && !s.local && (s.indexJsUrl != null || s.cloudUrl != null)).toList();
     if (targets.isEmpty) return;
-    var timedOut = false;
+    final gateTimeout = Completer<void>();
+    timer = Timer(timeout, () {
+      runtimeState.iosStartupGateCompleted = true;
+      if (!gateTimeout.isCompleted) gateTimeout.complete();
+    });
     await Future.any<void>([
       Future.wait(targets.map((s) => _autoUpdateSubscription(
             ref.container,
             s,
-            reloadRuntimeOnUpdate: false,
-            cancelToken: cancelToken,
+            shouldReloadRuntime: () => runtimeState.iosStartupGateCompleted,
           ))),
-      Future<void>.delayed(timeout, () {
-        timedOut = true;
-        if (!cancelToken.isCancelled) cancelToken.cancel('ios startup gate timeout');
-      }),
+      gateTimeout.future,
     ]);
-    final stamp = DateTime.now().millisecondsSinceEpoch;
-    for (final s in targets) {
-      runtimeState.lastAutoCheckedMs[s.key] = stamp;
-    }
-    if (timedOut) {
-      debugPrint('iOS startup subscription sync timed out after ${timeout.inMilliseconds}ms; using local cache');
+    if (gateTimeout.isCompleted) {
+      debugPrint('iOS startup subscription sync timed out after ${timeout.inMilliseconds}ms; continuing in background');
     }
   } catch (e) {
     debugPrint('iOS startup subscription gate failed: $e');
   } finally {
+    timer?.cancel();
     runtimeState.iosStartupGateCompleted = true;
   }
 });

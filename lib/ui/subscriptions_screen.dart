@@ -88,6 +88,7 @@ Future<bool> deleteSubscriptionsAndRefresh(
   final doomedKeys = {for (final s in doomed) s.key};
   final deletedActive = currentActive != null && doomedKeys.contains(currentActive);
   for (final s in doomed) {
+    cancelBackgroundAutoUpdate(container, s.key);
     try {
       await container.read(catpawClientProvider).uninstall(s.key);
     } catch (e) {
@@ -109,6 +110,7 @@ Future<bool> deleteSubscriptionsAndRefresh(
 Future<void> _refreshOne(BuildContext context, WidgetRef ref, Subscription s) async {
   final l = context.l10n;
   final container = ProviderScope.containerOf(context, listen: false);
+  cancelBackgroundAutoUpdate(container, s.key);
   try {
     final updated = await container.read(subscriptionServiceProvider).refresh(
           s,
@@ -155,6 +157,9 @@ class _SubscriptionsScreenState extends ConsumerState<SubscriptionsScreen> {
     if (targets.isEmpty) {
       showToast(l.subscriptionAllUpToDate);
       return;
+    }
+    for (final s in targets) {
+      cancelBackgroundAutoUpdate(container, s.key);
     }
     setState(() {
       _refreshingAll = true;

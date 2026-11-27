@@ -22,6 +22,7 @@ class MpvCore(
     interface Events {
         fun onState(state: String) // idle | buffering | playing | paused | ended
         fun onError(message: String, code: Int?)
+        fun onVideoSizeChanged(width: Int, height: Int) {}
     }
 
     @Volatile
@@ -47,6 +48,7 @@ class MpvCore(
     @Volatile private var awaitingStart = false
     @Volatile private var running = false
     private var lastState = "idle"
+    private var lastVideoSize: Pair<Int, Int>? = null
     private var thread: Thread? = null
 
     private var sidecars: List<MpvSidecar> = emptyList()
@@ -114,6 +116,7 @@ class MpvCore(
         eof = false
         cacheStall = false
         seeking = false
+        lastVideoSize = null
         userPaused = false // a new file always starts playing (Exo: playWhenReady = true); `pause` is a sticky option in mpv
         positionSec = startMs.coerceAtLeast(0) / 1000.0
         durationSec = 0.0
@@ -170,16 +173,43 @@ class MpvCore(
         return rc
     }
 
-    /** `video-params` of the playing file plus mpv's frame-rate estimate; null until mpv knows the video size. */
+    private fun readDimPair(h: Long, wProp: String, hProp: String): Pair<Int, Int>? {
+        val w = api.getProperty(h, wProp, MpvFormat.INT64)
+        val ht = api.getProperty(h, hProp, MpvFormat.INT64)
+        if (w.isNaN() || ht.isNaN() || w <= 0 || ht <= 0) return null
+        return w.toInt() to ht.toInt()
+    }
+
+    private fun rotatedDimPair(h: Long, wProp: String, hProp: String, vararg rotProps: String): Pair<Int, Int>? {
+        val (w, ht) = readDimPair(h, wProp, hProp) ?: return null
+        for (prop in rotProps) {
+            val rot = api.getProperty(h, prop, MpvFormat.INT64)
+            if (!rot.isNaN()) return if (rot.toInt() % 180 != 0) ht to w else w to ht
+        }
+        return w to ht
+    }
+
+    /** `video-out-params` / `video-params` display size (with rotation) plus frame-rate; null until known. */
     fun mediaInfo(): MediaInfo? {
         val h = handle
         if (h == 0L || !loaded) return null
-        val w = api.getProperty(h, "video-params/w", MpvFormat.INT64)
-        val ht = api.getProperty(h, "video-params/h", MpvFormat.INT64)
-        if (w.isNaN() || ht.isNaN() || w <= 0 || ht <= 0) return null
+        // libmpv's `dwidth`/`dheight` stays unrotated under vo=libmpv; apply explicit `*/rotate` (or demux-rotation before reconfig).
+        val (w, ht) = rotatedDimPair(h, "video-out-params/dw", "video-out-params/dh", "video-out-params/rotate")
+            ?: rotatedDimPair(h, "video-params/dw", "video-params/dh", "video-params/rotate")
+            ?: rotatedDimPair(h, "video-params/w", "video-params/h", "video-params/rotate", "current-tracks/video/demux-rotation", "track-list/0/demux-rotation")
+            ?: return null
         val fps = api.getProperty(h, "estimated-vf-fps", MpvFormat.DOUBLE).takeUnless { it.isNaN() }
             ?: api.getProperty(h, "container-fps", MpvFormat.DOUBLE).takeUnless { it.isNaN() } ?: 0.0
-        return MediaInfo(w.toInt(), ht.toInt(), fps, api.getPropertyString(h, "video-format"))
+        return MediaInfo(w, ht, fps, api.getPropertyString(h, "video-format"))
+    }
+
+    private fun emitVideoSizeIfChanged() {
+        val info = mediaInfo() ?: return
+        val size = info.width to info.height
+        if (size != lastVideoSize) {
+            lastVideoSize = size
+            events.onVideoSizeChanged(info.width, info.height)
+        }
     }
 
     /** `cache-speed` in bytes/s (OBSERVED in the original, g2.g.m); also readable while initial `loading` buffers. */
@@ -360,8 +390,10 @@ class MpvCore(
                 loaded = true
                 loading = false
                 onFileLoaded()
+                emitVideoSizeIfChanged()
                 publishState()
             }
+            MpvEvent.VIDEO_RECONFIG -> emitVideoSizeIfChanged()
             MpvEvent.END_FILE -> onEndFile(ev[1], ev[3])
             MpvEvent.SEEK -> {
                 seeking = true
@@ -438,6 +470,13 @@ class MpvCore(
 
     // -- teardown --------------------------------------------------------------------------------------------------------
 
+    /** Non-blocking wake-up for UI-thread teardown before background thread join/destroy. */
+    fun requestStop() {
+        running = false
+        val h = handle
+        if (h != 0L) api.wakeup(h)
+    }
+
     /** Step 1 of teardown: no more events are read after this returns. */
     fun stopEvents() {
         val h = handle
@@ -476,10 +515,91 @@ class MpvCore(
     /** Recent warnings / errors from mpv ("[prefix] text" lines), for the message when rendering cannot start. */
     fun recentLog(): String = api.lastLogMessages().trim()
 
-    private companion object {
-        const val OBS_TIME_POS = 1L
-        const val OBS_DURATION = 2L
-        const val OBS_PAUSE = 3L
-        const val OBS_CACHE_STALL = 4L
+    companion object {
+        private const val OBS_TIME_POS = 1L
+        private const val OBS_DURATION = 2L
+        private const val OBS_PAUSE = 3L
+        private const val OBS_CACHE_STALL = 4L
+
+        /**
+         * Probes effective display dimensions (after SAR and rotation) with a short-lived headless core so HLS `.m3u8`
+         * and container streams launch directly in the right orientation. Waits briefly after initial size if
+         * `video-out-params/dw` is not populated yet so `VIDEO_RECONFIG` SAR updates are not missed.
+         */
+        fun probeVideoSize(
+            api: MpvApi,
+            url: String,
+            headers: Map<String, String>,
+            timeoutMs: Long = 2_000L,
+            settleMs: Long = 150L,
+            nowNs: () -> Long = System::nanoTime,
+            isCancelled: () -> Boolean = { false },
+            registerCancel: (() -> Unit) -> Unit = {},
+        ): Pair<Int, Int>? {
+            if (isCancelled()) return null
+            var size: Pair<Int, Int>? = null
+            var settleDeadlineNs = 0L
+            var done = false
+            val lock = Any()
+            var cancelled = false
+            var activeHandle = 0L
+            lateinit var core: MpvCore
+            core = MpvCore(api, object : Events {
+                override fun onState(state: String) {
+                    if (state == "ended") done = true
+                }
+
+                override fun onError(message: String, code: Int?) {
+                    done = true
+                }
+
+                override fun onVideoSizeChanged(width: Int, height: Int) {
+                    if (width <= 0 || height <= 0) return
+                    size = width to height
+                    val h = core.handle
+                    val outDw = if (h != 0L) api.getProperty(h, "video-out-params/dw", MpvFormat.INT64) else Double.NaN
+                    if (!outDw.isNaN() && outDw > 0) {
+                        done = true
+                    } else if (settleDeadlineNs == 0L) {
+                        settleDeadlineNs = nowNs() + settleMs * 1_000_000L
+                    }
+                }
+            })
+            registerCancel {
+                synchronized(lock) {
+                    cancelled = true
+                    if (activeHandle != 0L) api.wakeup(activeHandle)
+                }
+            }
+            if (cancelled || isCancelled()) return null
+            if (core.start(MpvOptions.probeOptions(), startThread = false) != null) return null
+            val started = synchronized(lock) {
+                if (cancelled || isCancelled()) {
+                    false
+                } else {
+                    activeHandle = core.handle
+                    true
+                }
+            }
+            if (!started) {
+                core.destroy(background = true)
+                return null
+            }
+            return try {
+                core.load(url, null, headers, 0L, emptyList())
+                val hardDeadlineNs = nowNs() + timeoutMs * 1_000_000L
+                while (!done && !cancelled && !isCancelled()) {
+                    val now = nowNs()
+                    val deadline = if (settleDeadlineNs in 1 until hardDeadlineNs) settleDeadlineNs else hardDeadlineNs
+                    val remainingNs = deadline - now
+                    if (remainingNs <= 0L) break
+                    if (!core.pump((remainingNs / 1_000_000_000.0).coerceAtLeast(0.01))) break
+                }
+                size
+            } finally {
+                synchronized(lock) { activeHandle = 0L }
+                core.destroy(background = true)
+            }
+        }
     }
 }

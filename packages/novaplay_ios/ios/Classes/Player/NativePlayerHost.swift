@@ -1,5 +1,8 @@
 import Flutter
+import os
 import UIKit
+
+private let hostOrientLog = Logger(subsystem: "app.novaplay.player", category: "orient")
 
 /// Singleton bridge implementing Pigeon `NativePlayerHostApi` (Dart -> Swift) on iOS 15+.
 final class NativePlayerHost: NativePlayerHostApi {
@@ -11,6 +14,7 @@ final class NativePlayerHost: NativePlayerHostApi {
   private weak var pendingForegroundDismissVC: UIViewController?
   private var pipWindowHostView: UIView?
   private var lifecycleObservers: [NSObjectProtocol] = []
+  private var openSerial = 0
 
   private init() {
     let nc = NotificationCenter.default
@@ -133,13 +137,19 @@ final class NativePlayerHost: NativePlayerHostApi {
     }
   }
 
-  func openPlayerPage(request: OpenPlayerRequest) throws {
+  func openPlayerPage(request: OpenPlayerRequest, completion: @escaping (Result<Void, Error>) -> Void) {
     guard let api = flutterApi else {
-      throw PigeonError(code: "not_registered", message: "NativePlayerFlutterApi not initialized", details: nil)
+      completion(.failure(PigeonError(code: "not_registered", message: "NativePlayerFlutterApi not initialized", details: nil)))
+      return
     }
     DispatchQueue.main.async { [weak self] in
-      guard let self = self else { return }
-      // Cleanly close any existing session (e.g. a leftover PiP session) before presenting the new one
+      guard let self = self else {
+        completion(.success(()))
+        return
+      }
+      self.openSerial += 1
+      let serial = self.openSerial
+      // Cleanly close any existing session (e.g. a leftover PiP session) before opening the new one
       if let prevVC = self.activeViewController, prevVC.presentingViewController != nil {
         prevVC.dismiss(animated: false)
       }
@@ -176,30 +186,135 @@ final class NativePlayerHost: NativePlayerHostApi {
           }
         }
       )
-
-      let playerVC = NativePlayerViewController(controller: controller)
-      playerVC.modalPresentationStyle = .fullScreen
-      playerVC.modalTransitionStyle = .crossDissolve
-      vcWeakRef = playerVC
-
       self.activeController = controller
-      self.activeViewController = playerVC
+      self.activeViewController = nil
 
-      guard let presenter = Self.topViewController() else {
-        controller.close(completed: false, dismissVC: false)
+      let mode = IosPlayerUiText.effectiveOrientationMode(request.playbackConfig)
+      let isPhone = UIDevice.current.userInterfaceIdiom == .phone
+      let initialSource = request.initialSource
+      let knownSize: CGSize? = {
+        if let w = initialSource?.videoWidth, let h = initialSource?.videoHeight, w > 0, h > 0 {
+          return CGSize(width: CGFloat(w), height: CGFloat(h))
+        }
+        if let w = request.initialVideoWidth, let h = request.initialVideoHeight, w > 0, h > 0 {
+          return CGSize(width: CGFloat(w), height: CGFloat(h))
+        }
+        return nil
+      }()
+
+      var launched = false
+      func presentWith(size: CGSize?, aborted: Bool = false) {
+        guard !launched else { return }
+        launched = true
+        guard !aborted, serial == self.openSerial, !controller.isClosed else {
+          if aborted && !controller.isClosed {
+            controller.close(completed: false, dismissVC: false)
+          }
+          completion(.success(()))
+          return
+        }
+        let initialLandscape: Bool
+        switch mode {
+        case "landscape": initialLandscape = true
+        case "portrait": initialLandscape = false
+        default: initialLandscape = !isPhone ? true : (size.map { $0.width >= $0.height } ?? true)
+        }
+        var effectiveSource = initialSource
+        if let s = size {
+          controller.seedInitialProbedSize(s)
+          if var src = effectiveSource, src.videoWidth == nil {
+            src.videoWidth = Int64(s.width)
+            src.videoHeight = Int64(s.height)
+            effectiveSource = src
+          }
+        }
+        let sizeDesc = size.map { "\(Int($0.width))x\(Int($0.height))" } ?? "nil"
+        hostOrientLog.notice(
+          "[NovaPlay][Orient] open mode=\(mode, privacy: .public) initialLandscape=\(initialLandscape, privacy: .public) size=\(sizeDesc, privacy: .public) hasInitialSource=\(effectiveSource != nil, privacy: .public)"
+        )
+
+        let playerVC = NativePlayerViewController(
+          controller: controller,
+          initialLandscape: initialLandscape
+        )
+        playerVC.modalPresentationStyle = .fullScreen
+        playerVC.modalTransitionStyle = .crossDissolve
+        vcWeakRef = playerVC
+        self.activeViewController = playerVC
+
+        guard let presenter = Self.topViewController() else {
+          controller.close(completed: false, dismissVC: false)
+          completion(.success(()))
+          return
+        }
+        presenter.present(playerVC, animated: true) { [weak self] in
+          self?.syncIdleTimer(forceReassert: true)
+        }
+        if let src = effectiveSource {
+          controller.start(withInitialSource: src)
+        } else {
+          controller.start()
+        }
+        self.syncIdleTimer()
+        completion(.success(()))
+      }
+
+      let budgetMs = min(max(Int64(0), request.probeBudgetMs ?? 0), 260)
+      let trimmedUrl = initialSource?.url?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+      let canFastProbe = mode == "auto"
+        && isPhone
+        && budgetMs > 0
+        && request.epgProgrammes == nil
+        && knownSize == nil
+        && initialSource?.success == true
+        && !trimmedUrl.isEmpty
+
+      guard canFastProbe else {
+        presentWith(size: knownSize)
         return
       }
-      // request the source while the present animation runs instead of after it (~0.3 s earlier first frame)
-      presenter.present(playerVC, animated: true) { [weak self] in
-        self?.syncIdleTimer(forceReassert: true)
+
+      let forwardedHeaders = initialSource?.headers ?? [:]
+      DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(Int(budgetMs) + 30)) {
+        presentWith(size: nil)
       }
-      controller.start()
-      self.syncIdleTimer()
+      api.onProbeVideoSize(
+        sessionId: request.sessionId,
+        lineIndex: request.startLineIndex,
+        episodeIndex: request.startEpisodeIndex,
+        url: trimmedUrl,
+        headers: forwardedHeaders,
+        budgetMs: budgetMs
+      ) { res in
+        DispatchQueue.main.async {
+          if case .success(let maybeSize) = res, let p = maybeSize {
+            if p.width < 0 {
+              presentWith(size: nil, aborted: true)
+            } else if p.width > 0 && p.height > 0 {
+              presentWith(size: CGSize(width: CGFloat(p.width), height: CGFloat(p.height)))
+            } else {
+              presentWith(size: nil)
+            }
+          } else {
+            presentWith(size: nil)
+          }
+        }
+      }
     }
   }
 
   func provideSource(payload: SourcePayload) throws {
     activeController?.onSource(payload)
+  }
+
+  func updateVideoSize(sessionId: String, lineIndex: Int64, episodeIndex: Int64, width: Int64, height: Int64) throws {
+    activeController?.onProbedVideoSize(
+      sessionId: sessionId,
+      lineIndex: Int(lineIndex),
+      episodeIndex: Int(episodeIndex),
+      width: Int(width),
+      height: Int(height)
+    )
   }
 
   func updateDanmaku(payload: DanmakuPayload) throws {

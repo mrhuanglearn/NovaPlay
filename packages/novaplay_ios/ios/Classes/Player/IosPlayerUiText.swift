@@ -195,6 +195,23 @@ enum IosPlayerUiText {
     }
   }
 
+  static let orientationModes: [String] = ["auto", "landscape", "portrait"]
+
+  static func effectiveOrientationMode(_ cfg: PlaybackConfig) -> String {
+    if let m = cfg.orientationMode, orientationModes.contains(m) {
+      return m
+    }
+    return cfg.isPriorityLandscape ? "auto" : "portrait"
+  }
+
+  static func orientationModePanelLabel(_ mode: String) -> String {
+    switch mode {
+    case "landscape": return t("始终横屏", "Always landscape")
+    case "portrait": return t("始终竖屏", "Always portrait")
+    default: return t("自适应（按视频比例）", "Auto (by video aspect)")
+    }
+  }
+
   static func nextFitMode(_ mode: String) -> String {
     let ids = fitModes.map { $0.0 }
     let idx = ids.firstIndex(of: mode) ?? 0

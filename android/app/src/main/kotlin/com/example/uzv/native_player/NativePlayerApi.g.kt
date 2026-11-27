@@ -255,7 +255,9 @@ data class PlaybackConfig (
    * 长按滑动调节倍速 (OBSERVED in the original's PlaybackConfig as `isLongPressSpeedAdjustEnabled`; null = on, as the
    * original only turns it off for an explicit false). Added last so files saved before it still load.
    */
-  val isLongPressSpeedAdjustEnabled: Boolean? = null
+  val isLongPressSpeedAdjustEnabled: Boolean? = null,
+  /** 屏幕方向: auto|landscape|portrait. null = derive from isPriorityLandscape (true->auto, false->portrait). */
+  val orientationMode: String? = null
 )
  {
   companion object {
@@ -283,7 +285,8 @@ data class PlaybackConfig (
       val accentColorHex = pigeonVar_list[20] as String?
       val audioLang = pigeonVar_list[21] as String?
       val isLongPressSpeedAdjustEnabled = pigeonVar_list[22] as Boolean?
-      return PlaybackConfig(hwDecode, fitMode, speed, longPressSpeed, fastForwardSeconds, autoPictureInPicture, pauseOnBackground, isPriorityLandscape, isHiddenFastSeekBtn, isShowStatsBar, isShowAllDuration, isShowEpisodeSwitchNotice, showNetSpeed, hapticEnabled, skipNotice, kernel, subtitleFontFamily, subtitleFontsDir, subtitleLang, uiLocale, accentColorHex, audioLang, isLongPressSpeedAdjustEnabled)
+      val orientationMode = pigeonVar_list[23] as String?
+      return PlaybackConfig(hwDecode, fitMode, speed, longPressSpeed, fastForwardSeconds, autoPictureInPicture, pauseOnBackground, isPriorityLandscape, isHiddenFastSeekBtn, isShowStatsBar, isShowAllDuration, isShowEpisodeSwitchNotice, showNetSpeed, hapticEnabled, skipNotice, kernel, subtitleFontFamily, subtitleFontsDir, subtitleLang, uiLocale, accentColorHex, audioLang, isLongPressSpeedAdjustEnabled, orientationMode)
     }
   }
   fun toList(): List<Any?> {
@@ -311,6 +314,7 @@ data class PlaybackConfig (
       accentColorHex,
       audioLang,
       isLongPressSpeedAdjustEnabled,
+      orientationMode,
     )
   }
 }
@@ -362,7 +366,23 @@ data class OpenPlayerRequest (
    * DEVIATION: this project's addition. The source quality the watch history remembers for this video (the index into
    * `SourcePayload.qualities`), so 立即播放 / the history continue with the quality picked last time.
    */
-  val startQualityIndex: Long? = null
+  val startQualityIndex: Long? = null,
+  /**
+   * Scheme A: the source already resolved on the Dart side while the detail page was still showing (null = the
+   * native side asks via onEpisodeRequest as before; a failed payload is fed to the normal error path).
+   */
+  val initialSource: SourcePayload? = null,
+  /**
+   * Known display dimensions of this specific video/item when [initialSource] is still resolving (e.g. from previous
+   * playback of the same VOD or media server metadata). Null for unknown items, which open in landscape first.
+   */
+  val initialVideoWidth: Long? = null,
+  val initialVideoHeight: Long? = null,
+  /**
+   * Remaining milliseconds of the unified click-to-open fast budget available for native handheld `auto` mode to
+   * header-probe [initialSource.url] when dimensions are not yet cached. <= 0 skips pre-open waiting.
+   */
+  val probeBudgetMs: Long? = null
 )
  {
   companion object {
@@ -383,7 +403,11 @@ data class OpenPlayerRequest (
       val epgProgrammes = pigeonVar_list[13] as List<EpgProgramme>?
       val headTailSectionsJson = pigeonVar_list[14] as String?
       val startQualityIndex = pigeonVar_list[15] as Long?
-      return OpenPlayerRequest(sessionId, title, isMovie, lines, episodes, playbackConfig, danmakuConfig, startPositionSeconds, startLineIndex, startEpisodeIndex, coverUrl, tmdbEpisodes, currentTmdbEpisodeNumber, epgProgrammes, headTailSectionsJson, startQualityIndex)
+      val initialSource = pigeonVar_list[16] as SourcePayload?
+      val initialVideoWidth = pigeonVar_list[17] as Long?
+      val initialVideoHeight = pigeonVar_list[18] as Long?
+      val probeBudgetMs = pigeonVar_list[19] as Long?
+      return OpenPlayerRequest(sessionId, title, isMovie, lines, episodes, playbackConfig, danmakuConfig, startPositionSeconds, startLineIndex, startEpisodeIndex, coverUrl, tmdbEpisodes, currentTmdbEpisodeNumber, epgProgrammes, headTailSectionsJson, startQualityIndex, initialSource, initialVideoWidth, initialVideoHeight, probeBudgetMs)
     }
   }
   fun toList(): List<Any?> {
@@ -404,6 +428,10 @@ data class OpenPlayerRequest (
       epgProgrammes,
       headTailSectionsJson,
       startQualityIndex,
+      initialSource,
+      initialVideoWidth,
+      initialVideoHeight,
+      probeBudgetMs,
     )
   }
 }
@@ -452,7 +480,10 @@ data class SourcePayload (
   val headers: Map<String, String>? = null,
   val qualities: List<QualityOption>? = null,
   val subtitles: List<SubtitleOption>? = null,
-  val errorMessage: String? = null
+  val errorMessage: String? = null,
+  /** Fast-probed display dimensions of the stream, when already known before or alongside playback startup. */
+  val videoWidth: Long? = null,
+  val videoHeight: Long? = null
 )
  {
   companion object {
@@ -465,7 +496,9 @@ data class SourcePayload (
       val qualities = pigeonVar_list[5] as List<QualityOption>?
       val subtitles = pigeonVar_list[6] as List<SubtitleOption>?
       val errorMessage = pigeonVar_list[7] as String?
-      return SourcePayload(requestId, success, url, audioUrl, headers, qualities, subtitles, errorMessage)
+      val videoWidth = pigeonVar_list[8] as Long?
+      val videoHeight = pigeonVar_list[9] as Long?
+      return SourcePayload(requestId, success, url, audioUrl, headers, qualities, subtitles, errorMessage, videoWidth, videoHeight)
     }
   }
   fun toList(): List<Any?> {
@@ -478,6 +511,8 @@ data class SourcePayload (
       qualities,
       subtitles,
       errorMessage,
+      videoWidth,
+      videoHeight,
     )
   }
 }
@@ -553,6 +588,27 @@ data class DanmakuPromptInfo (
     return listOf(
       keyword,
       episodeNumber,
+    )
+  }
+}
+
+/** Generated class from Pigeon that represents data sent in messages. */
+data class ProbedVideoSize (
+  val width: Long,
+  val height: Long
+)
+ {
+  companion object {
+    fun fromList(pigeonVar_list: List<Any?>): ProbedVideoSize {
+      val width = pigeonVar_list[0] as Long
+      val height = pigeonVar_list[1] as Long
+      return ProbedVideoSize(width, height)
+    }
+  }
+  fun toList(): List<Any?> {
+    return listOf(
+      width,
+      height,
     )
   }
 }
@@ -826,40 +882,45 @@ private open class NativePlayerApiPigeonCodec : StandardMessageCodec() {
       }
       143.toByte() -> {
         return (readValue(buffer) as? List<Any?>)?.let {
-          Heartbeat.fromList(it)
+          ProbedVideoSize.fromList(it)
         }
       }
       144.toByte() -> {
         return (readValue(buffer) as? List<Any?>)?.let {
-          StateEvent.fromList(it)
+          Heartbeat.fromList(it)
         }
       }
       145.toByte() -> {
         return (readValue(buffer) as? List<Any?>)?.let {
-          ErrorReport.fromList(it)
+          StateEvent.fromList(it)
         }
       }
       146.toByte() -> {
         return (readValue(buffer) as? List<Any?>)?.let {
-          PreferenceReport.fromList(it)
+          ErrorReport.fromList(it)
         }
       }
       147.toByte() -> {
         return (readValue(buffer) as? List<Any?>)?.let {
-          PageClosedEvent.fromList(it)
+          PreferenceReport.fromList(it)
         }
       }
       148.toByte() -> {
         return (readValue(buffer) as? List<Any?>)?.let {
-          EpisodeRequest.fromList(it)
+          PageClosedEvent.fromList(it)
         }
       }
       149.toByte() -> {
         return (readValue(buffer) as? List<Any?>)?.let {
-          DanmakuRequest.fromList(it)
+          EpisodeRequest.fromList(it)
         }
       }
       150.toByte() -> {
+        return (readValue(buffer) as? List<Any?>)?.let {
+          DanmakuRequest.fromList(it)
+        }
+      }
+      151.toByte() -> {
         return (readValue(buffer) as? List<Any?>)?.let {
           DanmakuSearchRequest.fromList(it)
         }
@@ -925,36 +986,40 @@ private open class NativePlayerApiPigeonCodec : StandardMessageCodec() {
         stream.write(142)
         writeValue(stream, value.toList())
       }
-      is Heartbeat -> {
+      is ProbedVideoSize -> {
         stream.write(143)
         writeValue(stream, value.toList())
       }
-      is StateEvent -> {
+      is Heartbeat -> {
         stream.write(144)
         writeValue(stream, value.toList())
       }
-      is ErrorReport -> {
+      is StateEvent -> {
         stream.write(145)
         writeValue(stream, value.toList())
       }
-      is PreferenceReport -> {
+      is ErrorReport -> {
         stream.write(146)
         writeValue(stream, value.toList())
       }
-      is PageClosedEvent -> {
+      is PreferenceReport -> {
         stream.write(147)
         writeValue(stream, value.toList())
       }
-      is EpisodeRequest -> {
+      is PageClosedEvent -> {
         stream.write(148)
         writeValue(stream, value.toList())
       }
-      is DanmakuRequest -> {
+      is EpisodeRequest -> {
         stream.write(149)
         writeValue(stream, value.toList())
       }
-      is DanmakuSearchRequest -> {
+      is DanmakuRequest -> {
         stream.write(150)
+        writeValue(stream, value.toList())
+      }
+      is DanmakuSearchRequest -> {
+        stream.write(151)
         writeValue(stream, value.toList())
       }
       else -> super.writeValue(stream, value)
@@ -962,14 +1027,16 @@ private open class NativePlayerApiPigeonCodec : StandardMessageCodec() {
   }
 }
 
+
 /**
  * Dart -> Kotlin
  *
  * Generated interface from Pigeon that represents a handler of messages from Flutter.
  */
 interface NativePlayerHostApi {
-  fun openPlayerPage(request: OpenPlayerRequest)
+  fun openPlayerPage(request: OpenPlayerRequest, callback: (Result<Unit>) -> Unit)
   fun provideSource(payload: SourcePayload)
+  fun updateVideoSize(sessionId: String, lineIndex: Long, episodeIndex: Long, width: Long, height: Long)
   fun updateDanmaku(payload: DanmakuPayload)
   fun updateLineTmdbMatches(sessionId: String, matches: List<TmdbEpisodeItem>)
   fun updateRuntimeConfig(sessionId: String, patch: RuntimeConfigPatch)
@@ -996,13 +1063,14 @@ interface NativePlayerHostApi {
           channel.setMessageHandler { message, reply ->
             val args = message as List<Any?>
             val requestArg = args[0] as OpenPlayerRequest
-            val wrapped: List<Any?> = try {
-              api.openPlayerPage(requestArg)
-              listOf(null)
-            } catch (exception: Throwable) {
-              wrapError(exception)
+            api.openPlayerPage(requestArg) { result: Result<Unit> ->
+              val error = result.exceptionOrNull()
+              if (error != null) {
+                reply.reply(wrapError(error))
+              } else {
+                reply.reply(wrapResult(null))
+              }
             }
-            reply.reply(wrapped)
           }
         } else {
           channel.setMessageHandler(null)
@@ -1016,6 +1084,28 @@ interface NativePlayerHostApi {
             val payloadArg = args[0] as SourcePayload
             val wrapped: List<Any?> = try {
               api.provideSource(payloadArg)
+              listOf(null)
+            } catch (exception: Throwable) {
+              wrapError(exception)
+            }
+            reply.reply(wrapped)
+          }
+        } else {
+          channel.setMessageHandler(null)
+        }
+      }
+      run {
+        val channel = BasicMessageChannel<Any?>(binaryMessenger, "dev.flutter.pigeon.uzv_reimpl.NativePlayerHostApi.updateVideoSize$separatedMessageChannelSuffix", codec)
+        if (api != null) {
+          channel.setMessageHandler { message, reply ->
+            val args = message as List<Any?>
+            val sessionIdArg = args[0] as String
+            val lineIndexArg = args[1] as Long
+            val episodeIndexArg = args[2] as Long
+            val widthArg = args[3] as Long
+            val heightArg = args[4] as Long
+            val wrapped: List<Any?> = try {
+              api.updateVideoSize(sessionIdArg, lineIndexArg, episodeIndexArg, widthArg, heightArg)
               listOf(null)
             } catch (exception: Throwable) {
               wrapError(exception)
@@ -1160,6 +1250,41 @@ class NativePlayerFlutterApi(private val binaryMessenger: BinaryMessenger, priva
     val channelName = "dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onEpisodeRequest$separatedMessageChannelSuffix"
     val channel = BasicMessageChannel<Any?>(binaryMessenger, channelName, codec)
     channel.send(listOf(requestArg)) {
+      if (it is List<*>) {
+        if (it.size > 1) {
+          callback(Result.failure(FlutterError(it[0] as String, it[1] as String, it[2] as String?)))
+        } else {
+          callback(Result.success(Unit))
+        }
+      } else {
+        callback(Result.failure(createConnectionError(channelName)))
+      } 
+    }
+  }
+  fun onProbeVideoSize(sessionIdArg: String, lineIndexArg: Long, episodeIndexArg: Long, urlArg: String, headersArg: Map<String, String>, budgetMsArg: Long, callback: (Result<ProbedVideoSize?>) -> Unit)
+{
+    val separatedMessageChannelSuffix = if (messageChannelSuffix.isNotEmpty()) ".$messageChannelSuffix" else ""
+    val channelName = "dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onProbeVideoSize$separatedMessageChannelSuffix"
+    val channel = BasicMessageChannel<Any?>(binaryMessenger, channelName, codec)
+    channel.send(listOf(sessionIdArg, lineIndexArg, episodeIndexArg, urlArg, headersArg, budgetMsArg)) {
+      if (it is List<*>) {
+        if (it.size > 1) {
+          callback(Result.failure(FlutterError(it[0] as String, it[1] as String, it[2] as String?)))
+        } else {
+          val output = it[0] as ProbedVideoSize?
+          callback(Result.success(output))
+        }
+      } else {
+        callback(Result.failure(createConnectionError(channelName)))
+      } 
+    }
+  }
+  fun onVideoSizeDetected(sessionIdArg: String, lineIndexArg: Long, episodeIndexArg: Long, widthArg: Long, heightArg: Long, callback: (Result<Unit>) -> Unit)
+{
+    val separatedMessageChannelSuffix = if (messageChannelSuffix.isNotEmpty()) ".$messageChannelSuffix" else ""
+    val channelName = "dev.flutter.pigeon.uzv_reimpl.NativePlayerFlutterApi.onVideoSizeDetected$separatedMessageChannelSuffix"
+    val channel = BasicMessageChannel<Any?>(binaryMessenger, channelName, codec)
+    channel.send(listOf(sessionIdArg, lineIndexArg, episodeIndexArg, widthArg, heightArg)) {
       if (it is List<*>) {
         if (it.size > 1) {
           callback(Result.failure(FlutterError(it[0] as String, it[1] as String, it[2] as String?)))

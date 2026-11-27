@@ -102,10 +102,12 @@ class _UzvAppState extends ConsumerState<UzvApp> with WidgetsBindingObserver {
       final bgAt = _backgroundedAt;
       _backgroundedAt = null;
       unawaited(ref.read(catpawSupervisorProvider).onAppResumed());
+      final container = ProviderScope.containerOf(context, listen: false);
+      unawaited(retryPendingSubscriptionAutoUpdates(container));
       if (bgAt != null &&
           DateTime.now().difference(bgAt) >= const Duration(seconds: 60) &&
           ref.read(activePlayerSessionProvider) == null) {
-        unawaited(runStartupSubscriptionAutoUpdate(ProviderScope.containerOf(context, listen: false)));
+        unawaited(runStartupSubscriptionAutoUpdate(container));
       }
     }
   }

@@ -9,6 +9,7 @@ import com.example.uzv.native_player.kernel.TrackOption
 import com.example.uzv.native_player.ui.DanmakuView
 import com.example.uzv.native_player.ui.PlayerUiText
 import org.json.JSONArray
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Playback state machine for one session. Mirrors the ask/answer protocol of the Pigeon API:
@@ -19,6 +20,7 @@ class PlayerController(
     initialKernel: PlayerKernel,
     private val danmakuView: DanmakuView,
     initialKernelId: String = request.playbackConfig.kernel,
+    private val prewarmed: PrewarmedLaunch? = null,
     private val onClose: () -> Unit,
 ) : PlayerKernel.Listener {
     var kernel: PlayerKernel = initialKernel
@@ -48,6 +50,7 @@ class PlayerController(
     private var playback = request.playbackConfig
     private var danmaku = request.danmakuConfig
     private var closed = false
+    private val danmakuSeq = AtomicInteger(0)
 
     /** 片头片尾 of this video: where the intro ends, and how long before the end the outro starts (0 = not marked). */
     private var introEndMs = 0L
@@ -77,13 +80,29 @@ class PlayerController(
     init {
         kernel.listener = this
         kernel.fitMode = playback.fitMode
-        applyTrackPreferences()
+        // Prewarmed kernels already received track preferences in NativePlayerHost.
+        if (prewarmed?.kernel == null) applyTrackPreferences()
         danmakuView.configure(danmaku)
     }
 
     private fun applyTrackPreferences() {
         kernel.applySubtitlePreferences(playback.subtitleLang, playback.subtitleFontFamily, playback.subtitleFontsDir)
         kernel.applyAudioPreference(playback.audioLang)
+    }
+
+    private fun swapKernel(cand: KernelSelection.Kernel): PlayerKernel? {
+        val nextKernel = onAutoSwitchKernel?.invoke(cand) ?: return null
+        val old = kernel
+        old.listener = null
+        old.release()
+        kernel = nextKernel
+        activeKernelId = cand.id
+        nextKernel.listener = this
+        nextKernel.fitMode = playback.fitMode
+        nextKernel.speed = currentSpeed.toFloat()
+        applyTrackPreferences()
+        danmakuView.attach(nextKernel)
+        return nextKernel
     }
 
     /** What the controls show; set by the activity. Always called on the main thread. */
@@ -96,6 +115,10 @@ class PlayerController(
 
         /** A system toast (OBSERVED in 1.1.13: i2.P0.F is Toast.makeText(…, LENGTH_SHORT)); [long] for 3.5 s. */
         fun onToast(text: String, long: Boolean = false)
+
+        fun onVideoSizeChanged(width: Int, height: Int) {}
+        fun onEpisodeStarted() {}
+        fun onOrientationConfigChanged() {}
     }
 
     var uiListener: UiListener? = null
@@ -202,6 +225,7 @@ class PlayerController(
         startLineIndex = line.toLong(),
         startEpisodeIndex = episode.toLong(),
         startQualityIndex = quality.toLong(),
+        initialSource = null,
     )
 
     /** Stops this controller without telling Dart the page closed: another page takes over the same session. */
@@ -209,6 +233,8 @@ class PlayerController(
         if (closed) return
         closed = true
         main.removeCallbacks(heartbeat)
+        PlayerStreamProxy.drop(activeProxyToken)
+        activeProxyToken = null
         kernel.release()
     }
 
@@ -242,12 +268,58 @@ class PlayerController(
     val loadedDanmakuCount: Int get() = danmakuView.commentCount
 
     fun start() {
-        requestEpisode(request.startLineIndex.toInt(), request.startEpisodeIndex.toInt())
+        val pw = prewarmed
+        val src = pw?.initialSource
+        if (pw?.kernel != null && src != null && src.success && src.url != null) {
+            line = request.startLineIndex.toInt()
+            episode = request.startEpisodeIndex.toInt()
+            loaded = true
+            resolvingSource = false
+            lastPayload = src
+            activeProxyToken = pw.proxyToken
+            lastLoadStartMs = pw.lastLoadStartMs
+            autoSkippedIntroThisEpisode = pw.autoSkippedIntro
+            pendingStartMs = 0
+            qualityNames = src.qualities.orEmpty().sortedBy { it.qualityIndex }.map { it.qualityName }
+            if (qualityNames.isNotEmpty()) quality = quality.coerceIn(0, qualityNames.size - 1)
+            triedKernels.clear()
+            triedKernels.add(KernelSelection.parse(activeKernelId))
+            if (autoSkippedIntroThisEpisode && playback.skipNotice) {
+                uiListener?.onNotice(PlayerUiText.t("已跳过片头", "Intro skipped"))
+                onSkipIntro?.invoke(0L)
+            }
+            pw.notice?.let { uiListener?.onToast(it, long = true) }
+            api.onDanmakuRequest(DanmakuRequest(request.sessionId, line.toLong(), episode.toLong())) {}
+            main.postDelayed(heartbeat, 1000)
+            if (pw.earlyError != null) {
+                onError(pw.earlyError.first, pw.earlyError.second)
+            } else {
+                state = if (kernel.isPlaying) "playing" else "buffering"
+                uiListener?.onChanged()
+                kernel.play()
+                if (kernel.isPlaying) onState("playing")
+            }
+            return
+        }
+        if (pw?.kernel == null && src != null) {
+            line = request.startLineIndex.toInt()
+            episode = request.startEpisodeIndex.toInt()
+            resolvingSource = true
+            state = "buffering"
+            pw.notice?.let { uiListener?.onToast(it, long = true) }
+            val id = ++requestId
+            api.onDanmakuRequest(DanmakuRequest(request.sessionId, line.toLong(), episode.toLong())) {}
+            uiListener?.onChanged()
+            onSource(src.copy(requestId = id.toLong()))
+            main.postDelayed(heartbeat, 1000)
+            return
+        }
+        requestEpisode(request.startLineIndex.toInt(), request.startEpisodeIndex.toInt(), isInitialLoad = true)
         main.postDelayed(heartbeat, 1000)
     }
 
     /** [refreshDanmaku] is false when only the quality changes: same episode, same comments. */
-    fun requestEpisode(lineIndex: Int, episodeIndex: Int, refreshDanmaku: Boolean = true) {
+    fun requestEpisode(lineIndex: Int, episodeIndex: Int, refreshDanmaku: Boolean = true, isInitialLoad: Boolean = false) {
         line = lineIndex
         episode = episodeIndex
         error = null
@@ -259,7 +331,10 @@ class PlayerController(
         skippedRangeIndices.clear()
         state = "buffering"
         if (loaded) kernel.pause()
-        if (refreshDanmaku) extraSubtitles.clear()
+        if (refreshDanmaku && !isInitialLoad) {
+            extraSubtitles.clear()
+            uiListener?.onEpisodeStarted()
+        }
         val id = ++requestId
         api.onEpisodeRequest(EpisodeRequest(request.sessionId, id.toLong(), lineIndex.toLong(), episodeIndex.toLong(), quality.toLong())) {}
         if (refreshDanmaku) api.onDanmakuRequest(DanmakuRequest(request.sessionId, lineIndex.toLong(), episodeIndex.toLong())) {}
@@ -319,7 +394,7 @@ class PlayerController(
     fun onSource(payload: SourcePayload) = main.post {
         if (payload.requestId != requestId.toLong()) return@post // stale answer from a previous request
         resolvingSource = false
-        if (!payload.success || payload.url == null) {
+        if (!payload.success || payload.url.isNullOrBlank()) {
             // OBSERVED in 1.1.13 (W0.c.n): a toast with the message, then the error layer, except for a quality that
             // 未匹配 while an earlier source plays: that one keeps playing.
             val message = PlayerUiText.sourceFailed(payload.errorMessage)
@@ -335,6 +410,9 @@ class PlayerController(
         if (qualityNames.isNotEmpty()) quality = quality.coerceIn(0, qualityNames.size - 1)
         uiListener?.onChanged()
         lastPayload = payload
+        extractSourceSize(payload)?.let { (w, h) ->
+            uiListener?.onVideoSizeChanged(w, h)
+        }
         // 跳过片头: only auto-skip when starting from 0, never on resume / quality switch / retry
         var start = pendingStartMs
         if (start <= 0 && introEndMs in 1..MAX_HEAD_TAIL_MS) {
@@ -352,17 +430,7 @@ class PlayerController(
         if (currentKernel == KernelSelection.Kernel.EXO && KernelSelection.requiresFfmpegKernel(payload.url)) {
             for (cand in KernelSelection.fallbackOrder(currentKernel)) {
                 if (!triedKernels.add(cand)) continue
-                val nextKernel = onAutoSwitchKernel?.invoke(cand) ?: continue
-                val old = kernel
-                old.listener = null
-                old.release()
-                kernel = nextKernel
-                activeKernelId = cand.id
-                nextKernel.listener = this
-                nextKernel.fitMode = playback.fitMode
-                nextKernel.speed = currentSpeed.toFloat()
-                applyTrackPreferences()
-                danmakuView.attach(nextKernel)
+                if (swapKernel(cand) == null) continue
                 uiListener?.onNotice(
                     PlayerUiText.t(
                         "检测到蓝光原盘格式，已自动切换至 ${PlayerUiText.kernelName(cand.id)} 内核",
@@ -378,6 +446,7 @@ class PlayerController(
 
     private fun loadPayloadIntoKernel(payload: SourcePayload, startMs: Long) {
         val wrapped = PlayerStreamProxy.wrap(payload.url!!, payload.headers.orEmpty())
+        PlayerStreamProxy.drop(activeProxyToken)
         activeProxyToken = wrapped.token
         lastLoadStartMs = startMs
         kernel.load(wrapped.url, payload.audioUrl, wrapped.forwardedHeaders, startMs, payload.subtitles.orEmpty() + extraSubtitles)
@@ -397,12 +466,27 @@ class PlayerController(
         return true
     }
 
-    fun onDanmaku(payload: DanmakuPayload) = main.post {
-        val arr = JSONArray(payload.commentsJson)
-        danmakuView.setComments((0 until arr.length()).map { arr.getJSONObject(it) }.map {
-            DanmakuView.Comment(it.getDouble("t"), it.getInt("m"), it.getInt("c"), it.getString("x"))
-        })
-        danmakuCountListener?.invoke(danmakuView.commentCount)
+    fun onDanmaku(payload: DanmakuPayload) {
+        val seq = danmakuSeq.incrementAndGet()
+        Thread({
+            if (closed || danmakuSeq.get() != seq) return@Thread
+            val parsed = try {
+                val arr = JSONArray(payload.commentsJson)
+                ArrayList<DanmakuView.Comment>(arr.length()).apply {
+                    for (i in 0 until arr.length()) {
+                        val it = arr.getJSONObject(i)
+                        add(DanmakuView.Comment(it.getDouble("t"), it.getInt("m"), it.getInt("c"), it.getString("x")))
+                    }
+                }
+            } catch (_: Throwable) {
+                return@Thread
+            }
+            main.post {
+                if (closed || danmakuSeq.get() != seq) return@post
+                danmakuView.setComments(parsed)
+                danmakuCountListener?.invoke(danmakuView.commentCount)
+            }
+        }, "danmaku-parse").start()
     }
 
     fun onTmdbMatches(matches: List<TmdbEpisodeItem>) = main.post {
@@ -414,11 +498,17 @@ class PlayerController(
 
     fun onRuntimeConfig(patch: RuntimeConfigPatch) = main.post {
         patch.playbackConfig?.let {
+            val old = playback
             playback = it
             currentSpeed = it.speed
             kernel.speed = it.speed.toFloat()
             kernel.fitMode = it.fitMode
             applyTrackPreferences()
+            if (PlayerUiText.effectiveOrientationMode(old) != PlayerUiText.effectiveOrientationMode(it) ||
+                old.isPriorityLandscape != it.isPriorityLandscape
+            ) {
+                uiListener?.onOrientationConfigChanged()
+            }
             uiListener?.onChanged()
         }
         patch.danmakuConfig?.let { danmaku = it; danmakuView.configure(it) }
@@ -535,6 +625,23 @@ class PlayerController(
         }
     }
 
+    fun onProbedVideoSize(targetSessionId: String, lineIndex: Int, episodeIndex: Int, width: Int, height: Int) = main.post {
+        if (closed || targetSessionId != request.sessionId || lineIndex != line || episodeIndex != episode || width <= 0 || height <= 0) {
+            return@post
+        }
+        val decoded = if (resolvingSource) null else kernel.mediaInfo()
+        if (decoded != null && decoded.width > 0 && decoded.height > 0) return@post
+        uiListener?.onVideoSizeChanged(width, height)
+    }
+
+    override fun onVideoSizeChanged(width: Int, height: Int) {
+        main.post {
+            if (closed || resolvingSource || width <= 0 || height <= 0) return@post
+            api.onVideoSizeDetected(request.sessionId, line.toLong(), episode.toLong(), width.toLong(), height.toLong()) {}
+            uiListener?.onVideoSizeChanged(width, height)
+        }
+    }
+
     /** Kernels raise this only for errors that stop playback (OBSERVED in 1.1.13: c2.K.t opens the error layer). */
     override fun onError(message: String, code: Int?) {
         main.post {
@@ -551,18 +658,8 @@ class PlayerController(
             if (payload != null && payload.url != null) {
                 for (cand in KernelSelection.fallbackOrder(from)) {
                     if (!triedKernels.add(cand)) continue
-                    val nextKernel = onAutoSwitchKernel?.invoke(cand) ?: continue
                     val resumeMs = maxOf(lastLoadStartMs, kernel.positionMs)
-                    val old = kernel
-                    old.listener = null
-                    old.release()
-                    kernel = nextKernel
-                    activeKernelId = cand.id
-                    nextKernel.listener = this
-                    nextKernel.fitMode = playback.fitMode
-                    nextKernel.speed = currentSpeed.toFloat()
-                    applyTrackPreferences()
-                    danmakuView.attach(nextKernel)
+                    if (swapKernel(cand) == null) continue
                     error = null
                     failed = false
                     state = "buffering"
@@ -626,21 +723,11 @@ class PlayerController(
      * `[{"type":"intro","endMs":N}, {"type":"outro","beforeEndMs":M}, {"type":"range","startMs":S,"endMs":E}]` (see lib/features/player/head_tail.dart).
      */
     fun applyHeadTail() {
-        val json = request.headTailSectionsJson ?: return
-        val arr = try { JSONArray(json) } catch (e: org.json.JSONException) { return }
+        val parsed = parseHeadTail(request.headTailSectionsJson)
+        introEndMs = parsed.introEndMs
+        outroBeforeEndMs = parsed.outroBeforeEndMs
         skipRanges.clear()
-        for (i in 0 until arr.length()) {
-            val o = arr.optJSONObject(i) ?: continue
-            when (o.optString("type")) {
-                "intro" -> introEndMs = o.optLong("endMs").coerceIn(0L, MAX_HEAD_TAIL_MS)
-                "outro" -> outroBeforeEndMs = o.optLong("beforeEndMs").coerceIn(0L, MAX_HEAD_TAIL_MS)
-                "range" -> {
-                    val s = o.optLong("startMs")
-                    val e = o.optLong("endMs")
-                    if (e > s && s >= 0) skipRanges.add(s to e)
-                }
-            }
-        }
+        skipRanges.addAll(parsed.ranges)
     }
 
     /** 记片头 / 记片尾 are offered for anything with a length (not for live channels). */
@@ -679,10 +766,37 @@ class PlayerController(
         if (hasNext) nextEpisode()
     }
 
+    internal data class HeadTailParsed(
+        val introEndMs: Long = 0L,
+        val outroBeforeEndMs: Long = 0L,
+        val ranges: List<Pair<Long, Long>> = emptyList(),
+    )
+
     companion object {
         private const val MAX_HEAD_TAIL_MS = 600_000L
         private const val MIN_AUTO_OUTRO_DURATION_MS = 180_000L
         private const val MIN_MAIN_CONTENT_MS = 90_000L
+
+        internal fun parseHeadTail(json: String?): HeadTailParsed {
+            if (json == null) return HeadTailParsed()
+            val arr = try { JSONArray(json) } catch (_: org.json.JSONException) { return HeadTailParsed() }
+            var intro = 0L
+            var outro = 0L
+            val ranges = ArrayList<Pair<Long, Long>>()
+            for (i in 0 until arr.length()) {
+                val o = arr.optJSONObject(i) ?: continue
+                when (o.optString("type")) {
+                    "intro" -> intro = o.optLong("endMs").coerceIn(0L, MAX_HEAD_TAIL_MS)
+                    "outro" -> outro = o.optLong("beforeEndMs").coerceIn(0L, MAX_HEAD_TAIL_MS)
+                    "range" -> {
+                        val s = o.optLong("startMs")
+                        val e = o.optLong("endMs")
+                        if (e > s && s >= 0) ranges.add(s to e)
+                    }
+                }
+            }
+            return HeadTailParsed(intro, outro, ranges)
+        }
     }
 
     fun close(completed: Boolean = false, finishActivity: Boolean = true) {
@@ -690,6 +804,8 @@ class PlayerController(
         closed = true
         main.removeCallbacks(heartbeat)
         api.onPageClosed(PageClosedEvent(request.sessionId, kernel.positionMs / 1000.0, completed)) {}
+        PlayerStreamProxy.drop(activeProxyToken)
+        activeProxyToken = null
         kernel.release()
         if (finishActivity) onClose()
     }

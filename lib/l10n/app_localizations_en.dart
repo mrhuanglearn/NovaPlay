@@ -220,6 +220,21 @@ class AppLocalizationsEn extends AppLocalizations {
   String get playerPreferLandscape => 'Prefer landscape';
 
   @override
+  String get playerOrientationMode => 'Screen orientation';
+
+  @override
+  String get playerOrientationAuto => 'Auto (by video aspect)';
+
+  @override
+  String get playerOrientationAutoShort => 'Auto';
+
+  @override
+  String get playerOrientationLandscape => 'Always landscape';
+
+  @override
+  String get playerOrientationPortrait => 'Always portrait';
+
+  @override
   String get playerAutoPip => 'Picture-in-picture in background';
 
   @override
@@ -1010,6 +1025,9 @@ class AppLocalizationsEn extends AppLocalizations {
 
   @override
   String get detailPlayNow => 'Play';
+
+  @override
+  String get detailLoading => 'Loading…';
 
   @override
   String get detailEpisodes => 'Episodes';

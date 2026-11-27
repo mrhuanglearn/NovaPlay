@@ -14,6 +14,7 @@ import 'native_player_api.g.dart';
 import 'player_session.dart';
 import 'playback_source.dart';
 import 'session_router.dart';
+import 'video_format_probe.dart';
 
 /// Defaults mirror the player options visible in the changelog and the dex strings
 /// (hardware decode, fill mode, long-press speed, fast-forward step, PiP, skip notice, danmaku appearance).
@@ -26,6 +27,7 @@ PlaybackConfig defaultPlaybackConfig() => PlaybackConfig(
       autoPictureInPicture: true,
       pauseOnBackground: false,
       isPriorityLandscape: true,
+      orientationMode: 'auto',
       isHiddenFastSeekBtn: false,
       isShowStatsBar: false,
       isShowAllDuration: false,
@@ -109,11 +111,14 @@ class PlayerLauncher {
     this.describeError,
     NativePlayerHostApi? host,
     PlayerSessionRouter? router,
+    VideoFormatProbe? formatProbe,
+    this.fastLaunchBudget = const Duration(milliseconds: 300),
     this.installRouter = true,
     Future<void> Function()? enableWakelock,
     Future<void> Function()? disableWakelock,
   })  : host = host ?? NativePlayerHostApi(),
         router = router ?? PlayerSessionRouter.shared,
+        _formatProbe = formatProbe ?? VideoFormatProbe.shared,
         _enableWakelock = enableWakelock ?? _defaultEnableWakelock,
         _disableWakelock = disableWakelock ?? _defaultDisableWakelock;
 
@@ -147,6 +152,11 @@ class PlayerLauncher {
   final String Function(Object error)? describeError;
   final NativePlayerHostApi host;
   final PlayerSessionRouter router;
+  final VideoFormatProbe _formatProbe;
+
+  /// Maximum time spent trying to fast-resolve + header-probe the stream's format before opening the player in
+  /// default landscape (any still-running resolve/probe continues in parallel and adapts to portrait if needed).
+  final Duration fastLaunchBudget;
   final bool installRouter;
   final Future<void> Function() _enableWakelock;
   final Future<void> Function() _disableWakelock;
@@ -156,7 +166,9 @@ class PlayerLauncher {
     int line = 0,
     int episode = 0,
     void Function()? onOpened,
+    bool Function()? isCancelled,
   }) async {
+    final sw = Stopwatch()..start();
     final session = PlayerSession(
       sessionId: '${source.memoryKey ?? source.title}|${DateTime.now().microsecondsSinceEpoch}',
       source: source,
@@ -166,8 +178,10 @@ class PlayerLauncher {
       preferVideoDanmu: preferVideoDanmu,
       refs: refs,
       headTail: headTail,
+      formatProbe: _formatProbe,
       onPreferences: (r) => configs.saveReport(r),
       describeError: describeError ?? (e) => '$e',
+      isCancelled: isCancelled,
     );
     if (installRouter) router.install();
     router.register(session);
@@ -178,21 +192,108 @@ class PlayerLauncher {
       final memKey = source.memoryKey;
       final configFuture = configs.load();
       final htFuture = memKey == null || headTail == null ? Future.value(null) : headTail!.getAll(memKey);
-      final htJsonFuture = memKey == null || headTail == null ? Future.value(null) : headTail!.sectionsJson(memKey);
       final qualityFuture = source.resumeQuality();
+      final fallbackDimsFuture = source.fallbackDimensions(line, episode);
       await _enableWakelock();
       wakelockHeld = true;
       final (playback, danmaku) = await configFuture;
       final ht = await htFuture;
+      final quality = await qualityFuture;
+      if (isCancelled?.call() == true) {
+        session.cancelBeforeOpen();
+        return await session.closed;
+      }
+
+      final startSecondsFuture = source.resumeSeconds(line, episode, outroSeconds: ht?.outro ?? 0);
+      final autoOrient = effectiveOrientationMode(playback) == 'auto' && source.epg == null;
+      final budget = autoOrient ? fastLaunchBudget : const Duration(milliseconds: 60);
+      final resolveWindow = budget - sw.elapsed;
+      final initialSource = resolveWindow > Duration.zero
+          ? await session.preResolveInitialSource(
+              line: line,
+              episode: episode,
+              quality: quality,
+              timeout: resolveWindow,
+            )
+          : null;
+      if (isCancelled?.call() == true) {
+        session.cancelBeforeOpen();
+        return await session.closed;
+      }
+
+      final fallbackDims = autoOrient ? await fallbackDimsFuture : null;
+      var startedInitialProbe = false;
+      if (autoOrient && initialSource != null && initialSource.success) {
+        final url = initialSource.url?.trim() ?? '';
+        if (url.isNotEmpty && (initialSource.videoWidth == null || initialSource.videoHeight == null)) {
+          final cached = _formatProbe.cached(url);
+          if (cached != null) {
+            initialSource.videoWidth = cached.width;
+            initialSource.videoHeight = cached.height;
+            source.onVideoDimensionsKnown(cached.width, cached.height);
+          } else if (fallbackDims != null) {
+            initialSource.videoWidth = fallbackDims.width;
+            initialSource.videoHeight = fallbackDims.height;
+            source.onVideoDimensionsKnown(fallbackDims.width, fallbackDims.height);
+          } else if (!VideoFormatProbe.shouldSkipProbe(url)) {
+            startedInitialProbe = true;
+            session.startInitialProbe(
+              lineIndex: line,
+              episodeIndex: episode,
+              url: url,
+              headers: initialSource.headers ?? const {},
+            );
+          }
+        }
+      }
+
+      final startSeconds = await startSecondsFuture;
+      if (isCancelled?.call() == true) {
+        session.cancelBeforeOpen();
+        return await session.closed;
+      }
+
+      // Spend any remaining click-to-open budget directly in Dart on the already-running probe so `OpenPlayerRequest`
+      // carries `(videoWidth, videoHeight)` to Native in a single hop (zero `Dart -> Native -> Dart` round-trips). If
+      // the unified budget expires first, Native opens immediately in default landscape (`probeBudgetMs: 0`) and the
+      // still-running probe pushes `updateVideoSize` in the background as soon as it finishes.
+      if (startedInitialProbe && initialSource != null) {
+        final remainingProbeWindow = budget - sw.elapsed;
+        final clampedWindow = remainingProbeWindow <= Duration.zero
+            ? Duration.zero
+            : (remainingProbeWindow > const Duration(milliseconds: 260)
+                ? const Duration(milliseconds: 260)
+                : remainingProbeWindow);
+        final hit = _formatProbe.cached(initialSource.url ?? '') ??
+            (clampedWindow > Duration.zero ? await session.waitForInitialProbe(clampedWindow) : null);
+        if (isCancelled?.call() == true) {
+          session.cancelBeforeOpen();
+          return await session.closed;
+        }
+        if (hit != null) {
+          initialSource.videoWidth = hit.width;
+          initialSource.videoHeight = hit.height;
+          session.markInitialProbeDelivered();
+          source.onVideoDimensionsKnown(hit.width, hit.height);
+        }
+      }
+
       await session.open(
         playback: playback,
         danmaku: danmaku,
         line: line,
         episode: episode,
-        startSeconds: await source.resumeSeconds(line, episode, outroSeconds: ht?.outro ?? 0),
-        quality: await qualityFuture,
-        headTailJson: await htJsonFuture,
+        startSeconds: startSeconds,
+        quality: quality,
+        headTailJson: HeadTailRepository.sectionsJsonFrom(ht),
+        initialSource: initialSource,
+        fallbackVideoSize: autoOrient ? fallbackDims : null,
+        probeBudgetMs: 0,
       );
+      if (isCancelled?.call() == true) {
+        session.cancelBeforeOpen();
+        return await session.closed;
+      }
       onOpened?.call();
       return await session.closed;
     } finally {
@@ -214,8 +315,28 @@ class PlayerLauncher {
     int line = 0,
     int episode = 0,
     void Function()? onOpened,
+    bool Function()? isCancelled,
   }) =>
       playSource(
-          VodPlaybackSource(site: site, api: api, detail: detail, history: history, recordHistory: recordHistory),
-          line: line, episode: episode, onOpened: onOpened);
+        VodPlaybackSource(site: site, api: api, detail: detail, history: history, recordHistory: recordHistory),
+        line: line,
+        episode: episode,
+        onOpened: onOpened,
+        isCancelled: isCancelled,
+      );
+}
+
+
+const _orientationModes = {'auto', 'landscape', 'portrait'};
+
+/// 屏幕方向: a valid [PlaybackConfig.orientationMode] wins, else derived from the legacy isPriorityLandscape flag.
+String effectiveOrientationMode(PlaybackConfig p) {
+  final m = p.orientationMode;
+  if (m != null && _orientationModes.contains(m)) return m;
+  return p.isPriorityLandscape ? 'auto' : 'portrait';
+}
+
+void setOrientationMode(PlaybackConfig p, String mode) {
+  p.orientationMode = mode;
+  p.isPriorityLandscape = mode != 'portrait';
 }

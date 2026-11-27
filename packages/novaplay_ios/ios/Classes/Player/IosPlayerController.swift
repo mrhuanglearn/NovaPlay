@@ -12,6 +12,13 @@ protocol IosPlayerControllerUiDelegate: AnyObject {
   func controllerPictureInPictureDidStart(origin: IosPipOrigin)
   func controllerDidPauseFromBackgroundPiPClose()
   func controllerRequestRestorePiP(completion: @escaping (Bool) -> Void)
+  func controllerDidBeginNewEpisode()
+  func controllerDidChangeOrientationConfig(_ mode: String)
+}
+
+extension IosPlayerControllerUiDelegate {
+  func controllerDidBeginNewEpisode() {}
+  func controllerDidChangeOrientationConfig(_ mode: String) {}
 }
 
 /// iOS counterpart of Android's `PlayerController.kt`, implementing the exact Pigeon ask/answer state machine.
@@ -48,12 +55,15 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   private var outroDone: Bool = false
   private var outroHitTicks: Int = 0
   private var resolvingSource: Bool = false
+  var isResolvingSource: Bool { resolvingSource }
   private var autoSkippedIntroThisEpisode: Bool = false
   private var skipRanges: [(Int64, Int64)] = []
   private var skippedRangeIndices = Set<Int>()
 
   private var extraSubtitles: [SubtitleOption] = []
   private var lastPayload: SourcePayload?
+  private(set) var probedVideoSize: CGSize = .zero
+  private var lastReportedDecodedSize: CGSize = .zero
   private var heartbeatTimer: Timer?
 
   var danmakuSearchListener: (([DanmakuSearchResultItem]) -> Void)?
@@ -92,6 +102,11 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     self.danmakuConfig = request.danmakuConfig
     self.currentSpeed = initialPlayback.speed
     self.tmdbMatches = request.tmdbEpisodes ?? []
+    if let w = request.initialSource?.videoWidth ?? request.initialVideoWidth,
+       let h = request.initialSource?.videoHeight ?? request.initialVideoHeight,
+       w > 0, h > 0 {
+      self.probedVideoSize = CGSize(width: CGFloat(w), height: CGFloat(h))
+    }
 
     IosPlayerUiText.applyLocale(initialPlayback.uiLocale)
     kernel.delegate = self
@@ -136,7 +151,12 @@ final class IosPlayerController: IosPlayerKernelDelegate {
 
   func start() {
     danmakuView.startDisplayLink()
-    requestEpisode(lineIndex: line, episodeIndex: episode)
+    requestEpisode(lineIndex: line, episodeIndex: episode, isInitialLoad: true)
+    startHeartbeat()
+  }
+
+  private func startHeartbeat() {
+    heartbeatTimer?.invalidate()
     let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
       self?.onHeartbeatTick()
     }
@@ -160,7 +180,11 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     updateNowPlayingInfo()
   }
 
-  func requestEpisode(lineIndex: Int, episodeIndex: Int, refreshDanmaku: Bool = true) {
+  func requestEpisode(lineIndex: Int, episodeIndex: Int, refreshDanmaku: Bool = true, isInitialLoad: Bool = false) {
+    let isEpisodeSwitch = refreshDanmaku && !isInitialLoad
+    if isEpisodeSwitch {
+      uiDelegate?.controllerDidBeginNewEpisode()
+    }
     line = lineIndex
     episode = episodeIndex
     errorMessage = nil
@@ -172,7 +196,9 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     skippedRangeIndices.removeAll()
     state = "buffering"
     if loaded { kernel.pause() }
-    if refreshDanmaku {
+    if isEpisodeSwitch {
+      probedVideoSize = .zero
+      lastReportedDecodedSize = .zero
       extraSubtitles.removeAll()
       danmakuAnimeTitle = nil
       danmakuEpisodeTitle = nil
@@ -218,34 +244,85 @@ final class IosPlayerController: IosPlayerKernelDelegate {
         return
       }
 
-      self.loaded = true
-      let sortedQualities = (payload.qualities ?? []).sorted { $0.qualityIndex < $1.qualityIndex }
-      self.qualityNames = sortedQualities.map { $0.qualityName }
-      if !self.qualityNames.isEmpty {
-        self.quality = min(max(0, self.quality), self.qualityNames.count - 1)
-      }
-      self.lastPayload = payload
-
-      var start = self.pendingStartMs
-      if start <= 0 && self.introEndMs > 0 && self.introEndMs <= Self.maxHeadTailMs {
-        start = self.introEndMs
-        self.autoSkippedIntroThisEpisode = true
-        if self.playbackConfig.skipNotice {
-          self.uiDelegate?.controllerDidShowNotice(IosPlayerUiText.t("已跳过片头", "Intro skipped"))
-        }
-      }
-      self.pendingStartMs = 0
-
-      let subs = (payload.subtitles ?? []) + self.extraSubtitles
-      self.kernel.load(
-        url: url,
-        audioUrl: payload.audioUrl,
-        headers: payload.headers ?? [:],
-        startMs: start,
-        subtitles: subs
-      )
+      self.loadPayload(payload, url: url, autoPlay: true)
       self.uiDelegate?.controllerDidChangeState()
     }
+  }
+
+  private func loadPayload(_ payload: SourcePayload, url: String, autoPlay: Bool) {
+    loaded = true
+    let sortedQualities = (payload.qualities ?? []).sorted { $0.qualityIndex < $1.qualityIndex }
+    qualityNames = sortedQualities.map { $0.qualityName }
+    if !qualityNames.isEmpty {
+      quality = min(max(0, quality), qualityNames.count - 1)
+    }
+    lastPayload = payload
+    if let w = payload.videoWidth, let h = payload.videoHeight, w > 0, h > 0 {
+      probedVideoSize = CGSize(width: CGFloat(w), height: CGFloat(h))
+      uiDelegate?.controllerDidUpdateMetrics()
+    }
+
+    var start = pendingStartMs
+    if start <= 0 && introEndMs > 0 && introEndMs <= Self.maxHeadTailMs {
+      start = introEndMs
+      autoSkippedIntroThisEpisode = true
+      if playbackConfig.skipNotice {
+        uiDelegate?.controllerDidShowNotice(IosPlayerUiText.t("已跳过片头", "Intro skipped"))
+      }
+    }
+    pendingStartMs = 0
+
+    let subs = (payload.subtitles ?? []) + extraSubtitles
+    kernel.load(
+      url: url,
+      audioUrl: payload.audioUrl,
+      headers: payload.headers ?? [:],
+      startMs: start,
+      subtitles: subs,
+      autoPlay: autoPlay
+    )
+  }
+
+  func seedInitialProbedSize(_ size: CGSize) {
+    guard size.width > 0 && size.height > 0 else { return }
+    probedVideoSize = size
+  }
+
+  func onProbedVideoSize(sessionId: String, lineIndex: Int, episodeIndex: Int, width: Int, height: Int) {
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self,
+            !self.isClosed,
+            sessionId == self.request.sessionId,
+            lineIndex == self.line,
+            episodeIndex == self.episode,
+            width > 0,
+            height > 0 else { return }
+      if !self.resolvingSource && self.kernel.videoSize.width > 0 && self.kernel.videoSize.height > 0 {
+        return
+      }
+      self.probedVideoSize = CGSize(width: CGFloat(width), height: CGFloat(height))
+      self.uiDelegate?.controllerDidUpdateMetrics()
+    }
+  }
+
+  /// Start directly with Dart's pre-resolved `initialSource` without sending a duplicate `onEpisodeRequest`,
+  /// matching Android `PlayerController.start()`.
+  func start(withInitialSource payload: SourcePayload) {
+    danmakuView.startDisplayLink()
+    resolvingSource = true
+    state = "buffering"
+    requestId += 1
+    let dmReq = DanmakuRequest(
+      sessionId: request.sessionId,
+      lineIndex: Int64(line),
+      episodeIndex: Int64(episode)
+    )
+    flutterApi.onDanmakuRequest(request: dmReq) { _ in }
+    uiDelegate?.controllerDidChangeState()
+    var p = payload
+    p.requestId = requestId
+    onSource(p)
+    startHeartbeat()
   }
 
   func onDanmaku(_ payload: DanmakuPayload) {
@@ -292,7 +369,13 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     DispatchQueue.main.async { [weak self] in
       guard let self = self, !self.isClosed else { return }
       if let nextP = patch.playbackConfig {
+        let oldMode = IosPlayerUiText.effectiveOrientationMode(self.playbackConfig)
+        let oldPriority = self.playbackConfig.isPriorityLandscape
         self.applyPlaybackChange(nextP, reportToDart: false)
+        let newMode = IosPlayerUiText.effectiveOrientationMode(self.playbackConfig)
+        if oldMode != newMode || oldPriority != self.playbackConfig.isPriorityLandscape {
+          self.uiDelegate?.controllerDidChangeOrientationConfig(newMode)
+        }
       }
       if let nextD = patch.danmakuConfig {
         self.danmakuConfig = nextD
@@ -728,6 +811,17 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   }
 
   func kernelDidUpdateMetrics() {
+    let kSize = kernel.videoSize
+    if !resolvingSource && kSize.width > 0 && kSize.height > 0 && kSize != lastReportedDecodedSize {
+      lastReportedDecodedSize = kSize
+      flutterApi.onVideoSizeDetected(
+        sessionId: request.sessionId,
+        lineIndex: Int64(line),
+        episodeIndex: Int64(episode),
+        width: Int64(kSize.width.rounded()),
+        height: Int64(kSize.height.rounded())
+      ) { _ in }
+    }
     uiDelegate?.controllerDidUpdateMetrics()
   }
 

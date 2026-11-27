@@ -21,7 +21,16 @@ android {
         versionCode = flutter.versionCode
         versionName = flutter.versionName
         if (project.findProperty("split-per-abi")?.toString()?.toBoolean() != true) {
-            ndk { abiFilters += listOf("armeabi-v7a", "arm64-v8a") }
+            val abiMap = mapOf("android-arm" to "armeabi-v7a", "android-arm64" to "arm64-v8a", "android-x64" to "x86_64")
+            val requested = (project.findProperty("target-platform")?.toString() ?: "")
+                .split(',').mapNotNull { abiMap[it.trim()] }.distinct()
+            // Flutter CLI omits --target-platform by passing all 3 ABIs; drop x86_64 unless targeted specifically.
+            val abis = if (requested.isEmpty() || requested.size >= 3) listOf("armeabi-v7a", "arm64-v8a") else requested
+            ndk {
+                // Override FlutterPlugin's PLATFORM_ABI_LIST so `--target-platform` doesn't bundle unused 70MB+ ABIs.
+                abiFilters.clear()
+                abiFilters.addAll(abis)
+            }
         }
         manifestPlaceholders["enableImpeller"] = System.getenv("UZV_ENABLE_IMPELLER")?.takeIf { it.isNotBlank() } ?: "true"
     }

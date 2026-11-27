@@ -11,6 +11,9 @@ import '../app/ui_hooks.dart';
 import '../features/downloads/enqueue.dart';
 import '../features/library/watch_repository.dart';
 import '../features/player/head_tail.dart';
+import '../features/player/playback_source.dart';
+import '../features/player/player_launcher.dart' show effectiveOrientationMode;
+import '../features/player/video_format_probe.dart';
 import '../models/vod.dart';
 import '../services/tmdb_client.dart';
 import '../l10n/l10n.dart';
@@ -29,7 +32,7 @@ abstract final class DetailScreenRetry {
 }
 
 class DetailScreen extends ConsumerStatefulWidget {
-  const DetailScreen({super.key, required this.vodId, this.siteKey, this.initialItem});
+  const DetailScreen({super.key, required this.vodId, this.siteKey, this.initialItem, this.enablePrewarmInTest = false});
   final String vodId;
 
   /// Site the item came from; null = the site currently selected on the home page.
@@ -37,12 +40,23 @@ class DetailScreen extends ConsumerStatefulWidget {
 
   /// Optional list/search card metadata shown immediately while `/detail` resolves episodes.
   final VodItem? initialItem;
+
+  /// Allows widget tests targeting prewarm behavior to opt into [_maybeWarmUpTargetEpisode].
+  final bool enablePrewarmInTest;
+
   @override
   ConsumerState<DetailScreen> createState() => _DetailScreenState();
 }
 
 class _DetailScreenState extends ConsumerState<DetailScreen> {
   int _line = 0;
+  int? _historyLine;
+  int? _historyEpisode;
+  int _historyQuality = 0;
+  bool _historyLoaded = false;
+  String? _loadedSiteKey;
+  String? _lastWarmedTarget;
+  String? _inflightWarmupTarget;
   bool _favorite = false;
   bool _opening = false;
   bool _redirectedWeb = false;
@@ -56,16 +70,97 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
   @override
   void initState() {
     super.initState();
-    final site = ref.read(siteByKeyProvider(widget.siteKey));
-    if (site != null) {
-      ref.read(favoriteRepositoryProvider).isFavorite(site.key, widget.vodId).then((v) {
-        if (mounted) setState(() => _favorite = v);
+    _syncSiteState(ref.read(siteByKeyProvider(widget.siteKey)));
+  }
+
+  void _syncSiteState(dynamic site) {
+    if (site == null) return;
+    final key = site.key as String;
+    if (_loadedSiteKey == key) return;
+    _loadedSiteKey = key;
+    _historyLoaded = false;
+    ref.read(favoriteRepositoryProvider).isFavorite(key, widget.vodId).then((v) {
+      if (mounted && _loadedSiteKey == key) setState(() => _favorite = v);
+    });
+    // The 选集 sheet opens on the line the history was played on (before 2026-11-10 it always showed the first).
+    ref.read(historyRepositoryProvider).find(key, widget.vodId).then((e) {
+      if (!mounted || _loadedSiteKey != key) return;
+      if (e != null && e.videoWidth != null && e.videoHeight != null) {
+        VideoFormatProbe.shared.rememberVod(
+          vodKey(key, widget.vodId),
+          (width: e.videoWidth!, height: e.videoHeight!),
+        );
+      }
+      setState(() {
+        _historyLoaded = true;
+        _historyLine = e?.lineIndex;
+        _historyEpisode = e?.episodeIndex;
+        _historyQuality = e?.qualityIndex ?? 0;
+        if (e != null && !_lineTouched) {
+          _line = e.lineIndex;
+        }
       });
-      // The 选集 sheet opens on the line the history was played on (before 2026-11-10 it always showed the first).
-      ref.read(historyRepositoryProvider).find(site.key, widget.vodId).then((e) {
-        if (mounted && e != null && !_lineTouched) setState(() => _line = e.lineIndex);
-      });
+    });
+  }
+
+  ({int line, int episode})? _resolvePlayTarget(VodDetail d, {int? historyLine, int? historyEpisode}) {
+    if (d.lines.isEmpty) return null;
+    if (!_lineTouched &&
+        historyLine != null &&
+        historyEpisode != null &&
+        historyLine >= 0 &&
+        historyLine < d.lines.length &&
+        historyEpisode >= 0 &&
+        historyEpisode < d.lines[historyLine].episodes.length) {
+      return (line: historyLine, episode: historyEpisode);
     }
+    final lIdx = _line.clamp(0, d.lines.length - 1);
+    final eps = d.lines[lIdx].episodes;
+    if (eps.isEmpty) return null;
+    final eIdx = (historyLine == lIdx && historyEpisode != null && historyEpisode >= 0 && historyEpisode < eps.length)
+        ? historyEpisode
+        : 0;
+    return (line: lIdx, episode: eIdx);
+  }
+
+  void _maybeWarmUpTargetEpisode(VodDetail d) {
+    if ((_inWidgetTest && !widget.enablePrewarmInTest) || !_historyLoaded) return;
+    final target = _resolvePlayTarget(d, historyLine: _historyLine, historyEpisode: _historyEpisode);
+    if (target == null) return;
+    final line = d.lines[target.line];
+    final ep = line.episodes[target.episode];
+    final targetKey = '$_siteKey|${target.line}|${target.episode}|$_historyQuality|${ep.url}';
+    if (_lastWarmedTarget == targetKey || _inflightWarmupTarget == targetKey) return;
+    _inflightWarmupTarget = targetKey;
+
+    unawaited(ref.read(playerConfigRepositoryProvider).load().then((cfg) async {
+      if (!mounted || effectiveOrientationMode(cfg.$1) != 'auto') {
+        if (_inflightWarmupTarget == targetKey) _inflightWarmupTarget = null;
+        return;
+      }
+      final rt = ref.read(catpawRuntimeProvider).valueOrNull ?? await ref.read(catpawRuntimeProvider.future);
+      if (!mounted) {
+        if (_inflightWarmupTarget == targetKey) _inflightWarmupTarget = null;
+        return;
+      }
+      final site = ref.read(siteByKeyProvider(widget.siteKey));
+      if (_inflightWarmupTarget == targetKey) _inflightWarmupTarget = null;
+      if (rt != null && site != null) {
+        _lastWarmedTarget = targetKey;
+        VodEpisodePrewarmCache.shared.warmUp(
+          site: site,
+          api: rt.api,
+          lineName: line.name,
+          episodeUrl: ep.url,
+          memoryKey: vodKey(site.key, d.item.id),
+          preferredQualityIndex: _historyQuality,
+        );
+      } else {
+        VideoFormatProbe.shared.warmUpIfDirectMediaUrl(ep.url);
+      }
+    }).catchError((Object _) {
+      if (_inflightWarmupTarget == targetKey) _inflightWarmupTarget = null;
+    }));
   }
 
   /// The user picked a line before the history was read: keep theirs.
@@ -79,6 +174,7 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
   /// for at least [DetailScreenRetry.minSpinner], and also reloads the subscription runtime when that is what failed.
   Future<void> _retry() async {
     if (_retrying) return;
+    _lastWarmedTarget = null;
     setState(() => _retrying = true);
     final started = DateTime.now();
     final query = (siteKey: widget.siteKey, vodId: widget.vodId);
@@ -115,13 +211,15 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
   }
 
   Future<void> _play(VodDetail detail, int episode) async {
-    final webUrl = _webEntryUrl(detail, lineIndex: _line, episodeIndex: episode);
+    final lineIdx = detail.lines.isEmpty ? 0 : _line.clamp(0, detail.lines.length - 1);
+    final webUrl = _webEntryUrl(detail, lineIndex: lineIdx, episodeIndex: episode);
     if (webUrl != null) {
       await context.push<void>(Uri(path: '/website', queryParameters: {'url': webUrl}).toString());
       if (mounted && webUrl.contains('/woniu-auth')) unawaited(_retry());
       return;
     }
-    final rt = ref.read(catpawRuntimeProvider).valueOrNull;
+    final rt = ref.read(catpawRuntimeProvider).valueOrNull ?? await ref.read(catpawRuntimeProvider.future);
+    if (!mounted) return;
     final site = ref.read(siteByKeyProvider(widget.siteKey));
     if (rt == null || site == null || _opening) return;
     setState(() => _opening = true);
@@ -134,13 +232,36 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
             detail: detail,
             history: ref.read(historyRepositoryProvider),
             recordHistory: sitePrefs.recordsHistory(site.key),
-            line: _line,
+            line: lineIdx,
             episode: episode,
+            isCancelled: () => !mounted,
             onOpened: () {
               if (mounted) setState(() => _opening = false);
             },
           );
       ref.invalidate(historyListProvider);
+      if (mounted) {
+        _lastWarmedTarget = null;
+        final latest = await ref.read(historyRepositoryProvider).find(site.key, widget.vodId);
+        if (mounted) {
+          if (latest != null) {
+            if (latest.videoWidth != null && latest.videoHeight != null) {
+              VideoFormatProbe.shared.rememberVod(
+                vodKey(site.key, widget.vodId),
+                (width: latest.videoWidth!, height: latest.videoHeight!),
+              );
+            }
+            setState(() {
+              _line = latest.lineIndex;
+              _historyLine = latest.lineIndex;
+              _historyEpisode = latest.episodeIndex;
+              _historyQuality = latest.qualityIndex;
+              _lineTouched = false;
+            });
+          }
+          _maybeWarmUpTargetEpisode(detail);
+        }
+      }
     } catch (e) {
       showToast('$e');
     } finally {
@@ -206,19 +327,15 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
     );
   }
 
-  /// 立即播放 continues where the history left off (same line and episode), else the first episode of the first line.
+  /// 立即播放 continues on the user's selected line if touched, else where history left off, else Line 0 Episode 0.
   Future<void> _playNow(VodDetail d) async {
     final noLines = context.l10n.detailNoLines;
     final entry = await ref.read(historyRepositoryProvider).find(_siteKey, widget.vodId);
     if (!mounted) return;
-    if (entry != null &&
-        entry.lineIndex < d.lines.length &&
-        entry.episodeIndex < d.lines[entry.lineIndex].episodes.length) {
-      setState(() => _line = entry.lineIndex);
-      return _play(d, entry.episodeIndex);
-    }
-    if (d.lines.isEmpty) return showToast(noLines);
-    return _play(d, 0);
+    final target = _resolvePlayTarget(d, historyLine: entry?.lineIndex, historyEpisode: entry?.episodeIndex);
+    if (target == null) return showToast(noLines);
+    if (_line != target.line) setState(() => _line = target.line);
+    return _play(d, target.episode);
   }
 
   /// OBSERVED 选集 sheet: "选集  线路一 · 3集", locate and order buttons, line pills, numbered episode rows with a
@@ -297,6 +414,7 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
                                   _lineTouched = true;
                                 });
                                 setSheet(() {});
+                                _maybeWarmUpTargetEpisode(d);
                               },
                               child: Padding(
                                 padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 7),
@@ -417,6 +535,10 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
   Widget build(BuildContext context) {
     final l = context.l10n;
     final c = AppColors.of(context);
+    final activeSite = ref.watch(siteByKeyProvider(widget.siteKey));
+    if (activeSite != null && _loadedSiteKey != activeSite.key) {
+      _syncSiteState(activeSite);
+    }
     final detail = ref.watch(videoDetailProvider((siteKey: widget.siteKey, vodId: widget.vodId)));
     final d0 = detail.valueOrNull;
     final preview = widget.initialItem;
@@ -493,6 +615,9 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
               context.pushReplacement(Uri(path: '/website', queryParameters: {'url': webUrl}).toString());
             });
           }
+          if (webUrl == null) {
+            _maybeWarmUpTargetEpisode(d);
+          }
           final overview =
               (d.content ?? '').isNotEmpty ? d.content!.replaceAll(RegExp(r'<[^>]+>'), '').trim() : tmdb?.overview;
           final meta = TextStyle(fontSize: 13, color: c.label.withValues(alpha: 0.9), height: 1.5);
@@ -513,7 +638,7 @@ class _DetailScreenState extends ConsumerState<DetailScreen> {
                       icon: _opening
                           ? const SizedBox(width: 18, height: 18, child: CircularProgressIndicator(strokeWidth: 2))
                           : const Icon(Icons.play_arrow, size: 20),
-                      label: Text(l.detailPlayNow),
+                      label: Text(_opening ? l.detailLoading : l.detailPlayNow),
                     ),
                   ),
                   const SizedBox(width: 12),

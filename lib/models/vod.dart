@@ -330,7 +330,14 @@ class PlayResult {
     this.subtitles = const [],
     this.videoDanmuUrl,
     this.videoDanmuComments = const [],
+    this.videoWidth,
+    this.videoHeight,
   });
+
+  static int? _posInt(Object? raw) {
+    final v = raw is int ? raw : (raw is num ? raw.round() : int.tryParse('${raw ?? ''}'));
+    return (v != null && v > 0) ? v : null;
+  }
 
   factory PlayResult.fromJson(Map<String, dynamic> j) {
     final raw = j['url'];
@@ -358,6 +365,8 @@ class PlayResult {
       subtitles: parsedSubs,
       videoDanmuUrl: danmuUrl,
       videoDanmuComments: danmuComments,
+      videoWidth: _posInt(j['width'] ?? j['videoWidth']),
+      videoHeight: _posInt(j['height'] ?? j['videoHeight']),
     );
   }
 
@@ -373,6 +382,8 @@ class PlayResult {
   final List<PlaySubtitle> subtitles;
   final String? videoDanmuUrl;
   final List<DanmuComment> videoDanmuComments;
+  final int? videoWidth;
+  final int? videoHeight;
 
   /// Headers applicable to the currently selected [url]: omits upstream-only credentials when [url] already points to
   /// a local loopback `/proxy/` endpoint (which carries its own sealed upstream headers), while keeping full [headers]
@@ -404,6 +415,8 @@ class PlayResult {
       subtitles: subtitles,
       videoDanmuUrl: videoDanmuUrl,
       videoDanmuComments: videoDanmuComments,
+      videoWidth: q.url == url ? videoWidth : null,
+      videoHeight: q.url == url ? videoHeight : null,
     );
   }
 }

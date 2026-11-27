@@ -67,6 +67,24 @@ object MpvOptions {
         "msg-level" to "all=warn",
     )
 
+    /** Minimal headless options for fast aspect/dimension probing (including HLS `.m3u8`). */
+    fun probeOptions(): List<Pair<String, String>> = listOf(
+        "vo" to "null",
+        "ao" to "null",
+        "hwdec" to "no",
+        "vd-lavc-threads" to "0",
+        "idle" to "yes",
+        "osd-level" to "0",
+        "sub-auto" to "no",
+        "audio-file-auto" to "no",
+        "ytdl" to "no",
+        "network-timeout" to "2",
+        "demuxer-lavf-analyzeduration" to "1",
+        "demuxer-lavf-probesize" to "1572864",
+        "cache" to "no",
+        "msg-level" to "all=warn",
+    )
+
     /** (keepaspect, panscan) for PlaybackConfig.fitMode: fit = letterbox, fill = stretch, zoom = crop to fill. */
     fun fit(mode: String): Pair<Boolean, Double> = when (mode) {
         "fill" -> false to 0.0

@@ -1,5 +1,6 @@
 package com.example.uzv.native_player.kernel
 
+import java.io.BufferedInputStream
 import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
@@ -39,6 +40,17 @@ object PlayerStreamProxy {
         """&(?=(?:User-Agent|UA|Referer|Referrer|Cookie|Origin|Authorization|Host|Accept|X-[A-Za-z0-9_-]+|Sec-[A-Za-z0-9_-]+)=)""",
         RegexOption.IGNORE_CASE,
     )
+    private val headerKeyStripRegex = Regex("""[\r\n:]""")
+    private val headerValueBreakRegex = Regex("""[\r\n]""")
+    private val rawSegmentExts = setOf("m4s", "mp4", "cmfv", "cmfa", "vtt", "webvtt", "aac", "mp3", "ac3", "ec3")
+    private val inferredFileExts = setOf("mp4", "m4v", "mov", "mkv", "webm", "flv", "avi", "ts", "mp3", "m4a", "aac")
+    private val hexDigits = "0123456789ABCDEF".toCharArray()
+    private val safeUriBytes = BooleanArray(256).apply {
+        for (c in 'A'..'Z') this[c.code] = true
+        for (c in 'a'..'z') this[c.code] = true
+        for (c in '0'..'9') this[c.code] = true
+        for (c in "-._~:/?#@!$&'()*+,;=[]") this[c.code] = true
+    }
 
     internal class Session(
         val token: String,
@@ -105,6 +117,11 @@ object PlayerStreamProxy {
         return synchronized(lock) { sessions[token] }?.rootError
     }
 
+    fun drop(token: String?) {
+        if (token.isNullOrEmpty()) return
+        synchronized(lock) { sessions.remove(token) }
+    }
+
     private fun getSession(token: String): Session? = synchronized(lock) { sessions[token] }
 
     internal fun ensureStarted(): Int? {
@@ -133,7 +150,7 @@ object PlayerStreamProxy {
         socket.use { sock ->
             sock.tcpNoDelay = true
             sock.soTimeout = 15_000
-            val input = sock.getInputStream()
+            val input = BufferedInputStream(sock.getInputStream(), 2048)
             val out = BufferedOutputStream(sock.getOutputStream(), 32 * 1024)
             val reqLine = readAsciiLine(input) ?: return
             val parts = reqLine.split(' ')
@@ -467,7 +484,7 @@ object PlayerStreamProxy {
             val proxied = when {
                 expectVariant || ext == "m3u8" || ext == "m3u" ->
                     buildProxyUrl(port, token, "sub.m3u8", resolved, origin, "hls", false, false)
-                ext in setOf("m4s", "mp4", "cmfv", "cmfa", "vtt", "webvtt", "aac", "mp3", "ac3", "ec3") ->
+                ext in rawSegmentExts ->
                     buildProxyUrl(port, token, "seg.$ext", resolved, origin, "raw", false, false)
                 else ->
                     buildProxyUrl(port, token, "seg.ts", resolved, origin, "ts", hasEncryption || hasByteRange, false)
@@ -499,8 +516,8 @@ object PlayerStreamProxy {
     internal fun normalizeUrlAndHeaders(rawUrl: String, headers: Map<String, String>): Pair<String, Map<String, String>> {
         val cleaned = LinkedHashMap<String, String>()
         for ((k, v) in headers) {
-            val ck = k.replace(Regex("[\\r\\n:]"), "").trim()
-            val cv = v.replace(Regex("[\\r\\n]"), " ").trim()
+            val ck = headerKeyStripRegex.replace(k, "").trim()
+            val cv = headerValueBreakRegex.replace(v, " ").trim()
             if (ck.isNotEmpty() && cv.isNotEmpty()) cleaned[canonicalHeaderName(ck)] = cv
         }
         val trimmed = rawUrl.trim()
@@ -517,7 +534,7 @@ object PlayerStreamProxy {
                         val eq = seg.indexOf('=')
                         if (eq <= 0) continue
                         val hk = seg.substring(0, eq).trim()
-                        val hv = seg.substring(eq + 1).replace(Regex("[\\r\\n]"), " ").trim()
+                        val hv = headerValueBreakRegex.replace(seg.substring(eq + 1), " ").trim()
                         if (hk.isNotEmpty() && hv.isNotEmpty()) {
                             cleaned[canonicalHeaderName(hk)] = hv
                             parsed = true
@@ -595,7 +612,7 @@ object PlayerStreamProxy {
 
     private fun inferredFileName(path: String): String {
         val ext = path.substringAfterLast('/', "").substringAfterLast('.', "").lowercase(Locale.ROOT)
-        return if (ext in setOf("mp4", "m4v", "mov", "mkv", "webm", "flv", "avi", "ts", "mp3", "m4a", "aac")) "stream.$ext" else "stream"
+        return if (ext in inferredFileExts) "stream.$ext" else "stream"
     }
 
     private fun looksLikeHlsPlaylist(bytes: ByteArray): Boolean {
@@ -660,7 +677,7 @@ object PlayerStreamProxy {
                 i++
                 continue
             }
-            if (isSafeUriByte(b)) sb.append(b.toChar()) else sb.append(String.format(Locale.ROOT, "%%%02X", b))
+            if (safeUriBytes[b]) sb.append(b.toChar()) else sb.append('%').append(hexDigits[b ushr 4]).append(hexDigits[b and 0x0F])
             i++
         }
         return sb.toString()
@@ -670,13 +687,6 @@ object PlayerStreamProxy {
         val c = b.toInt() and 0xFF
         return (c in 0x30..0x39) || (c in 0x41..0x46) || (c in 0x61..0x66)
     }
-
-    private fun isSafeUriByte(b: Int): Boolean =
-        (b in 0x41..0x5A) || (b in 0x61..0x7A) || (b in 0x30..0x39) ||
-            b in intArrayOf(
-                0x2D, 0x2E, 0x5F, 0x7E, 0x3A, 0x2F, 0x3F, 0x23, 0x40,
-                0x21, 0x24, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x2B, 0x2C, 0x3B, 0x3D, 0x5B, 0x5D,
-            )
 
     private fun b64UrlEncode(s: String): String =
         Base64.getUrlEncoder().withoutPadding().encodeToString(s.toByteArray(StandardCharsets.UTF_8))

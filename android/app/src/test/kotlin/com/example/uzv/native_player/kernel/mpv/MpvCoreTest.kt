@@ -10,8 +10,10 @@ class MpvCoreTest {
     private class Recorder : MpvCore.Events {
         val states = mutableListOf<String>()
         val errors = mutableListOf<Pair<String, Int?>>()
+        val videoSizes = mutableListOf<Pair<Int, Int>>()
         override fun onState(state: String) { states += state }
         override fun onError(message: String, code: Int?) { errors += message to code }
+        override fun onVideoSizeChanged(width: Int, height: Int) { videoSizes += width to height }
     }
 
     private val api = FakeMpvApi()
@@ -538,5 +540,169 @@ class MpvCoreTest {
         c.stopEvents()
         c.destroy(background = false)
         assertTrue(api2.calls.contains("destroy"))
+    }
+
+    @Test
+    fun mediaInfoPrefersDisplayParamsAndEmitsOnLoadAndVideoReconfig() {
+        started()
+        api.numbers["video-params/w"] = 1920.0
+        api.numbers["video-params/h"] = 1080.0
+        api.numbers["video-params/rotate"] = 90.0
+        load(url = "http://v/1.mp4")
+        api.event(MpvEvent.START_FILE)
+        api.event(MpvEvent.FILE_LOADED)
+        pumpAll()
+        assertEquals(1080 to 1920, core.mediaInfo()?.let { it.width to it.height })
+        assertEquals(listOf(1080 to 1920), rec.videoSizes)
+
+        // Same size on VIDEO_RECONFIG does not duplicate
+        api.event(MpvEvent.VIDEO_RECONFIG)
+        pumpAll()
+        assertEquals(listOf(1080 to 1920), rec.videoSizes)
+
+        // video-out-params/dw,dh wins over video-params/dw,dh and w,h
+        api.numbers["video-params/dw"] = 1080.0
+        api.numbers["video-params/dh"] = 1920.0
+        api.numbers["video-out-params/dw"] = 720.0
+        api.numbers["video-out-params/dh"] = 1280.0
+        api.event(MpvEvent.VIDEO_RECONFIG)
+        pumpAll()
+        assertEquals(720 to 1280, core.mediaInfo()?.let { it.width to it.height })
+        assertEquals(listOf(1080 to 1920, 720 to 1280), rec.videoSizes)
+
+        // New load resets lastVideoSize so the next file emits again
+        load(url = "http://v/2.mp4")
+        api.event(MpvEvent.START_FILE)
+        api.event(MpvEvent.FILE_LOADED)
+        pumpAll()
+        assertEquals(listOf(1080 to 1920, 720 to 1280, 720 to 1280), rec.videoSizes)
+    }
+
+    @Test
+    fun mediaInfoAppliesRotateToOutParamsAndDemuxRotationBeforeReconfig() {
+        started()
+        // At FILE_LOADED before VIDEO_RECONFIG, only w/h and demux-rotation are populated.
+        api.numbers["video-params/w"] = 1280.0
+        api.numbers["video-params/h"] = 720.0
+        api.numbers["current-tracks/video/demux-rotation"] = 270.0
+        load(url = "http://v/rot270.mp4")
+        api.event(MpvEvent.START_FILE)
+        api.event(MpvEvent.FILE_LOADED)
+        pumpAll()
+        assertEquals(720 to 1280, core.mediaInfo()?.let { it.width to it.height })
+
+        // Even though libmpv keeps dwidth/dheight and dw/dh unrotated, video-out-params/rotate swaps them cleanly.
+        api.numbers["dwidth"] = 1280.0
+        api.numbers["dheight"] = 720.0
+        api.numbers["video-out-params/dw"] = 1280.0
+        api.numbers["video-out-params/dh"] = 720.0
+        api.numbers["video-out-params/rotate"] = 270.0
+        api.event(MpvEvent.VIDEO_RECONFIG)
+        pumpAll()
+        assertEquals(720 to 1280, core.mediaInfo()?.let { it.width to it.height })
+        assertEquals(listOf(720 to 1280), rec.videoSizes)
+    }
+
+    @Test
+    fun eventsFakeWithoutVideoSizeOverrideCompilesAndRuns() {
+        val minEvents = object : MpvCore.Events {
+            override fun onState(state: String) {}
+            override fun onError(message: String, code: Int?) {}
+        }
+        val api2 = FakeMpvApi().apply {
+            numbers["video-out-params/dw"] = 1280.0
+            numbers["video-out-params/dh"] = 720.0
+        }
+        val c = MpvCore(api2, minEvents)
+        assertNull(c.start(emptyList(), startThread = false))
+        c.load("http://v/1.mp4", null, emptyMap(), 0, emptyList())
+        api2.event(MpvEvent.START_FILE)
+        api2.event(MpvEvent.FILE_LOADED)
+        c.pump(0.0)
+        c.pump(0.0)
+        assertEquals(1280 to 720, c.mediaInfo()?.let { it.width to it.height })
+    }
+
+    @Test
+    fun probeVideoSizeWaitsForOutParamsReconfigAndReturnsDisplaySize() {
+        var now = 0L
+        val base = FakeMpvApi().apply {
+            numbers["video-params/w"] = 720.0
+            numbers["video-params/h"] = 720.0
+            event(MpvEvent.START_FILE)
+            event(MpvEvent.FILE_LOADED)
+        }
+        var reconfigured = false
+        val probeApi = object : MpvApi by base {
+            override fun waitEvent(handle: Long, timeoutSeconds: Double): IntArray {
+                now += 10_000_000L
+                val ev = base.waitEvent(handle, timeoutSeconds)
+                if (ev[0] == MpvEvent.FILE_LOADED && !reconfigured) {
+                    reconfigured = true
+                    base.numbers["video-out-params/dw"] = 405.0
+                    base.numbers["video-out-params/dh"] = 720.0
+                    base.event(MpvEvent.VIDEO_RECONFIG)
+                }
+                return ev
+            }
+        }
+
+        val size = MpvCore.probeVideoSize(
+            probeApi,
+            "http://v/LandscapeOrSar.m3u8",
+            emptyMap(),
+            timeoutMs = 2_000L,
+            settleMs = 150L,
+            nowNs = { now },
+        )
+        assertEquals(405 to 720, size)
+        assertTrue(base.calls.contains("set:vo=null"))
+        assertTrue(base.calls.contains("cmd:loadfile|http://v/LandscapeOrSar.m3u8|replace|-1|start=0.000"))
+    }
+
+    @Test
+    fun probeVideoSizeSettlesWithoutOutParamsAndRespectsCancel() {
+        var now = 0L
+        var step = 0
+        val api2 = FakeMpvApi().apply {
+            numbers["video-params/w"] = 1280.0
+            numbers["video-params/h"] = 720.0
+            event(MpvEvent.START_FILE)
+            event(MpvEvent.FILE_LOADED)
+        }
+        val settled = MpvCore.probeVideoSize(
+            api2,
+            "http://v/landscape.m3u8",
+            emptyMap(),
+            timeoutMs = 2_000L,
+            settleMs = 150L,
+            nowNs = { now.also { if (step++ > 2) now += 60_000_000L } },
+        )
+        assertEquals(1280 to 720, settled)
+
+        val rejected = FakeMpvApi().apply { rejectedProperties += "vo" }
+        assertNull(MpvCore.probeVideoSize(rejected, "http://v/1.m3u8", emptyMap(), nowNs = { 0L }))
+
+        var cancelFn: (() -> Unit)? = null
+        val cancelledApi = FakeMpvApi()
+        var polls = 0
+        val cancelledResult = MpvCore.probeVideoSize(
+            cancelledApi,
+            "http://v/slow.m3u8",
+            emptyMap(),
+            timeoutMs = 2_000L,
+            nowNs = { if (polls++ == 2) cancelFn?.invoke(); polls * 1_000_000L },
+            registerCancel = { cancelFn = it },
+        )
+        assertNull(cancelledResult)
+        assertTrue(cancelledApi.calls.contains("wakeup"))
+    }
+
+    @Test
+    fun requestStopWakesHandleWithoutDestroyingIt() {
+        started()
+        core.requestStop()
+        assertEquals(listOf("wakeup"), api.calls)
+        assertTrue(core.handle != 0L)
     }
 }

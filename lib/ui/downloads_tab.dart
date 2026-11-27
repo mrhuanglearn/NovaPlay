@@ -74,7 +74,9 @@ class _TaskTile extends ConsumerWidget {
           ? () async {
               try {
                 await ref.read(playerLauncherProvider).playSource(
-                    DirectPlaybackSource.single(title: task.title, url: Uri.file(task.localPlaylist!).toString()));
+                      DirectPlaybackSource.single(title: task.title, url: Uri.file(task.localPlaylist!).toString()),
+                      isCancelled: () => !context.mounted,
+                    );
               } catch (e) {
                 showToast('$e');
               }

@@ -36,6 +36,7 @@ class MpvSurfaceView(
             surfaceWidth = width
             surfaceHeight = height
             GLES20.glViewport(0, 0, width, height)
+            requestRender()
         }
 
         override fun onDrawFrame(gl: GL10?) {

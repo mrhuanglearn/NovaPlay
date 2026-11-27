@@ -214,6 +214,21 @@ class AppLocalizationsZh extends AppLocalizations {
   String get playerPreferLandscape => '优先横屏';
 
   @override
+  String get playerOrientationMode => '屏幕方向';
+
+  @override
+  String get playerOrientationAuto => '自适应（按视频比例）';
+
+  @override
+  String get playerOrientationAutoShort => '自适应';
+
+  @override
+  String get playerOrientationLandscape => '始终横屏';
+
+  @override
+  String get playerOrientationPortrait => '始终竖屏';
+
+  @override
   String get playerAutoPip => '进入后台自动画中画';
 
   @override
@@ -975,6 +990,9 @@ class AppLocalizationsZh extends AppLocalizations {
 
   @override
   String get detailPlayNow => '立即播放';
+
+  @override
+  String get detailLoading => '加载中…';
 
   @override
   String get detailEpisodes => '选集';
