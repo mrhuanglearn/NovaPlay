@@ -153,13 +153,30 @@ final class NativePlayerHost: NativePlayerHostApi {
       }
       self.openSerial += 1
       let serial = self.openSerial
-      // Cleanly close any existing session (e.g. a leftover PiP session) before opening the new one
-      if let prevVC = self.activeViewController, let prevPresenter = prevVC.presentingViewController {
-        prevPresenter.dismiss(animated: false)
+      // Cleanly close any existing session (including any smooth-exiting VC or leftover PiP session) before opening the new one
+      if let prevVC = self.activeViewController {
+        prevVC.cancelForImmediateReplacement()
+        if let prevPresenter = prevVC.presentingViewController {
+          prevPresenter.dismiss(animated: false)
+        }
+      }
+      if let root = Self.flutterWindow()?.rootViewController {
+        var cursor = root.presentedViewController
+        while let candidate = cursor {
+          if let lingeringPlayer = candidate as? NativePlayerViewController {
+            lingeringPlayer.cancelForImmediateReplacement()
+            if !lingeringPlayer.isBeingDismissed {
+              lingeringPlayer.presentingViewController?.dismiss(animated: false)
+            }
+            break
+          }
+          cursor = candidate.presentedViewController
+        }
       }
       if let prev = self.activeController, !prev.isClosed {
         prev.close(completed: false, dismissVC: false)
       }
+      self.activeViewController = nil
       self.removeParkedVideoViewHost()
       self.pendingForegroundDismissVC = nil
 
@@ -169,27 +186,39 @@ final class NativePlayerHost: NativePlayerHostApi {
       )
       let danmakuView = IosDanmakuView(frame: .zero)
       weak var vcWeakRef: NativePlayerViewController?
+      weak var ctrlWeakRef: IosPlayerController?
 
       let controller = IosPlayerController(
         request: request,
         kernel: kernel,
         danmakuView: danmakuView,
         flutterApi: api,
-        onDismissPage: { [weak self] in
-          DispatchQueue.main.async {
-            guard let vc = vcWeakRef else { return }
-            if let presenter = vc.presentingViewController {
-              let isActive = UIApplication.shared.applicationState == .active
-              if !isActive {
-                self?.pendingForegroundDismissVC = vc
-                presenter.dismiss(animated: false)
-              } else if !vc.isExitingPlayer {
-                vc.exitPlayerSmoothly(completed: true)
-              }
-            }
+        onDismissPage: { [weak self] completedFlag in
+          guard let vc = vcWeakRef,
+                !vc.isDismissedForPiP,
+                let presenter = vc.presentingViewController else {
+            return false
           }
+          let isActive = UIApplication.shared.applicationState == .active
+          if !isActive {
+            self?.pendingForegroundDismissVC = vc
+            presenter.dismiss(animated: false)
+            return false
+          }
+          if ctrlWeakRef?.isClosed == true {
+            vc.cancelForImmediateReplacement()
+            presenter.dismiss(animated: false) {
+              Self.enforceHostInterfaceOrientation()
+            }
+            return false
+          }
+          if !vc.isExitingPlayer {
+            vc.exitPlayerSmoothly(completed: completedFlag)
+          }
+          return true
         }
       )
+      ctrlWeakRef = controller
       self.activeController = controller
       self.activeViewController = nil
 
@@ -243,7 +272,6 @@ final class NativePlayerHost: NativePlayerHostApi {
         )
         playerVC.modalPresentationStyle = .fullScreen
         vcWeakRef = playerVC
-        self.activeViewController = playerVC
 
         self.presentPlayerVC(
           playerVC,
@@ -338,6 +366,19 @@ final class NativePlayerHost: NativePlayerHostApi {
     return true
   }
 
+  var hasActiveInlinePlayer: Bool {
+    if let playerVC = activeViewController,
+       let ctrl = activeController,
+       !ctrl.isClosed,
+       !playerVC.isDismissedForPiP,
+       !playerVC.isBeingDismissed,
+       !playerVC.isExitingPlayer,
+       (playerVC.presentingViewController != nil || playerVC.isBeingPresented || playerVC.viewIfLoaded?.window != nil) {
+      return true
+    }
+    return false
+  }
+
   /// Window-agnostic interface orientation mask used by `AppDelegate.application(_:supportedInterfaceOrientationsFor:)`.
   /// Returning the active player's mask even when UIKit queries `nil` or `UITextEffectsWindow` prevents
   /// `geometryUpdate denied` errors and keyboard/alert forced-portrait snaps.
@@ -346,7 +387,8 @@ final class NativePlayerHost: NativePlayerHostApi {
        let ctrl = activeController,
        !ctrl.isClosed,
        !playerVC.isDismissedForPiP,
-       !playerVC.isBeingDismissed {
+       !playerVC.isBeingDismissed,
+       (playerVC.presentingViewController != nil || playerVC.isBeingPresented || playerVC.viewIfLoaded?.window != nil) {
       return playerVC.supportedInterfaceOrientations
     }
     let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
@@ -433,11 +475,15 @@ final class NativePlayerHost: NativePlayerHostApi {
       return
     }
 
+    activeViewController = playerVC
     presenter.present(playerVC, animated: false) { [weak self] in
       self?.syncIdleTimer(forceReassert: true)
     }
 
     guard playerVC.presentingViewController != nil || playerVC.isBeingPresented else {
+      if activeViewController === playerVC {
+        activeViewController = nil
+      }
       if retryCount < 8 {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
           self?.presentPlayerVC(
@@ -509,6 +555,7 @@ final class NativePlayerHost: NativePlayerHostApi {
 
   static func enforceHostInterfaceOrientation() {
     guard UIDevice.current.userInterfaceIdiom == .phone else { return }
+    guard !shared.hasActiveInlinePlayer else { return }
     guard let window = flutterWindow(), let root = window.rootViewController else { return }
     if #available(iOS 16.0, *) {
       root.setNeedsUpdateOfSupportedInterfaceOrientations()

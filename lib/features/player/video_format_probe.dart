@@ -557,6 +557,51 @@ class VideoFormatProbe {
     return next;
   }
 
+  static Map<String, String> _mergeRedirectCookies(
+    Uri fromUri,
+    Uri toUri,
+    List<Cookie> responseCookies,
+    Map<String, String> headers,
+  ) {
+    if (responseCookies.isEmpty) return headers;
+    final crossDomain = _registrableDomain(fromUri.host) != _registrableDomain(toUri.host) ||
+        (fromUri.scheme.toLowerCase() == 'https' && toUri.scheme.toLowerCase() == 'http');
+    if (crossDomain) return headers;
+
+    final merged = <String, String>{};
+    String? existingCookieKey;
+    headers.forEach((k, v) {
+      if (k.trim().toLowerCase() == 'cookie') {
+        existingCookieKey = k;
+        for (final pair in v.split(';')) {
+          final eq = pair.indexOf('=');
+          if (eq <= 0) continue;
+          final name = pair.substring(0, eq).trim();
+          final val = pair.substring(eq + 1).trim();
+          if (name.isNotEmpty) merged[name] = val;
+        }
+      }
+    });
+
+    final toHttps = toUri.scheme.toLowerCase() == 'https';
+    for (final c in responseCookies) {
+      if (c.secure && !toHttps) continue;
+      final name = c.name.trim();
+      if (name.isEmpty) continue;
+      if (c.value.isEmpty || (c.maxAge != null && c.maxAge! <= 0)) {
+        merged.remove(name);
+      } else {
+        merged[name] = c.value;
+      }
+    }
+    final next = Map<String, String>.of(headers);
+    if (existingCookieKey != null) next.remove(existingCookieKey);
+    if (merged.isNotEmpty) {
+      next['Cookie'] = merged.entries.map((e) => '${e.key}=${e.value}').join('; ');
+    }
+    return next;
+  }
+
   Future<_FetchedSlice?> _fetchSlice(
     Uri uri,
     Map<String, String> headers, {
@@ -585,7 +630,12 @@ class VideoFormatProbe {
         req!.headers.set(k.trim(), v);
       });
       if (!hasUa) {
-        req.headers.set(HttpHeaders.userAgentHeader, 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36');
+        req.headers.set(
+          HttpHeaders.userAgentHeader,
+          Platform.isIOS
+              ? 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1'
+              : 'Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36',
+        );
       }
       if (sendRange) {
         final end = start + effectiveMaxBytes - 1;
@@ -599,10 +649,19 @@ class VideoFormatProbe {
           res.statusCode == HttpStatus.temporaryRedirect ||
           res.statusCode == HttpStatus.permanentRedirect) {
         final location = res.headers.value(HttpHeaders.locationHeader)?.trim() ?? '';
+        List<Cookie> redirectCookies = const [];
+        try {
+          redirectCookies = res.cookies;
+        } catch (_) {}
         await res.drain<void>().timeout(sliceTimeout).catchError((Object _) {});
         if (location.isEmpty || redirectHops >= 5) return null;
         final nextUri = uri.resolve(location);
-        final nextHeaders = _sanitizeHeadersForRedirect(uri, nextUri, headers);
+        final nextHeaders = _mergeRedirectCookies(
+          uri,
+          nextUri,
+          redirectCookies,
+          _sanitizeHeadersForRedirect(uri, nextUri, headers),
+        );
         return await _fetchSlice(
           nextUri,
           nextHeaders,

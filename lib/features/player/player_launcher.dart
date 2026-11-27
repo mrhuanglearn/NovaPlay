@@ -197,7 +197,7 @@ class PlayerLauncher {
       final fallbackDimsFuture = source.fallbackDimensions(line, episode);
       wakelockFuture = _enableWakelock().then((_) {
         wakelockHeld = true;
-      });
+      }, onError: (Object _) {});
       final (playback, danmaku) = await configFuture;
       final ht = await htFuture;
       final quality = await qualityFuture;
@@ -261,11 +261,16 @@ class PlayerLauncher {
       // still-running probe pushes `updateVideoSize` in the background as soon as it finishes.
       if (startedInitialProbe && initialSource != null) {
         final remainingProbeWindow = budget - sw.elapsed;
-        final clampedWindow = remainingProbeWindow <= Duration.zero
+        final minPostResolveFloor = budget >= const Duration(milliseconds: 200)
+            ? const Duration(milliseconds: 150)
+            : Duration.zero;
+        final targetWindow =
+            remainingProbeWindow > minPostResolveFloor ? remainingProbeWindow : minPostResolveFloor;
+        final clampedWindow = targetWindow <= Duration.zero
             ? Duration.zero
-            : (remainingProbeWindow > const Duration(milliseconds: 260)
+            : (targetWindow > const Duration(milliseconds: 260)
                 ? const Duration(milliseconds: 260)
-                : remainingProbeWindow);
+                : targetWindow);
         final hit = _formatProbe.cached(initialSource.url ?? '') ??
             (clampedWindow > Duration.zero ? await session.waitForInitialProbe(clampedWindow) : null);
         if (isCancelled?.call() == true) {
@@ -280,7 +285,6 @@ class PlayerLauncher {
         }
       }
 
-      await wakelockFuture;
       await session.open(
         playback: playback,
         danmaku: danmaku,
@@ -301,7 +305,7 @@ class PlayerLauncher {
       return await session.closed;
     } finally {
       if (wakelockFuture != null) {
-        await wakelockFuture.catchError((Object _) {});
+        await wakelockFuture.timeout(const Duration(seconds: 2), onTimeout: () {});
       }
       router.unregister(session);
       onSession?.call(router.latest); // another player may still be open (e.g. one in picture-in-picture)

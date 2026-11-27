@@ -33,7 +33,6 @@ final class MpvMetalView: UIView {
     backgroundColor = .black
     isOpaque = true
     let scale = UIScreen.main.nativeScale
-    metalLayer.device = MTLCreateSystemDefaultDevice()
     metalLayer.pixelFormat = .bgra8Unorm
     metalLayer.framebufferOnly = false
     metalLayer.isOpaque = true
@@ -42,15 +41,23 @@ final class MpvMetalView: UIView {
     metalLayer.backgroundColor = UIColor.black.cgColor
     metalLayer.contentsScale = scale
     metalLayer.contentsGravity = .resizeAspect
-    let screenBounds = UIScreen.main.bounds
+  }
+
+  func ensureDeviceAttached() {
+    guard metalLayer.device == nil else { return }
+    metalLayer.device = MTLCreateSystemDefaultDevice()
+    let scale = window?.screen.nativeScale ?? UIScreen.main.nativeScale
+    let refBounds = (bounds.width > 1 && bounds.height > 1) ? bounds : UIScreen.main.bounds
+    metalLayer.contentsScale = scale
     metalLayer.drawableSize = CGSize(
-      width: max(64, screenBounds.width * scale),
-      height: max(64, screenBounds.height * scale)
+      width: max(64, (refBounds.width * scale).rounded()),
+      height: max(64, (refBounds.height * scale).rounded())
     )
   }
 
   override func layoutSubviews() {
     super.layoutSubviews()
+    guard !isHidden || metalLayer.device != nil else { return }
     let scale = window?.screen.nativeScale ?? UIScreen.main.nativeScale
     if metalLayer.contentsScale != scale {
       metalLayer.contentsScale = scale
@@ -206,6 +213,7 @@ final class IosMpvEngine {
   private var bgObserver: NSObjectProtocol?
 
   init(metalView: MpvMetalView, hwDecode: Bool, fitMode: String, speed: Float) {
+    metalView.ensureDeviceAttached()
     self.metalView = metalView
     let layer = metalView.metalLayer
     self.metalLayerRef = layer
@@ -857,9 +865,12 @@ final class IosMpvEngine {
       switch ev.event_id {
       case 6: // START_FILE
         let serial = currentLoadSerial()
-        DispatchQueue.main.async { [weak self] in
+        mpvQueue.async { [weak self] in
           guard let self = self, self.currentLoadSerial() == serial else { return }
-          self.awaitingStartFile = false
+          DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.currentLoadSerial() == serial else { return }
+            self.awaitingStartFile = false
+          }
         }
 
       case 8: // FILE_LOADED
@@ -916,27 +927,26 @@ final class IosMpvEngine {
           errDiag = (shortMsg, fullDiag)
         }
         mpvQueue.async { [weak self] in
-          if self?.currentLoadSerial() == serial {
-            self?.workerFileLoaded = false
-          }
-        }
-        DispatchQueue.main.async { [weak self] in
-          guard let self = self, self.currentLoadSerial() == serial, !self.awaitingStartFile else { return }
-          self.fileLoaded = false
-          self.isSeeking = false
-          if endReason == 0 { // EOF
-            self.reachedEof = true
-            self.loadingFile = false
-            self.publishStateIfNeeded()
-          } else if endReason == 2 || endReason == 3 { // STOP / QUIT
-            self.loadingFile = false
-            self.pausedForCache = false
-            self.publishStateIfNeeded()
-          } else if endReason == 4, let diag = errDiag { // ERROR
-            self.loadingFile = false
-            self.pausedForCache = false
-            mpvUsbLog.error("[NovaPlay][MPV] END_FILE error: \(diag.full, privacy: .public)")
-            self.delegate?.mpvEngineDidFail(message: diag.short, diagnostic: diag.full, code: Int(endError))
+          guard let self = self, self.currentLoadSerial() == serial else { return }
+          self.workerFileLoaded = false
+          DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.currentLoadSerial() == serial, !self.awaitingStartFile else { return }
+            self.fileLoaded = false
+            self.isSeeking = false
+            if endReason == 0 { // EOF
+              self.reachedEof = true
+              self.loadingFile = false
+              self.publishStateIfNeeded()
+            } else if endReason == 2 || endReason == 3 { // STOP / QUIT
+              self.loadingFile = false
+              self.pausedForCache = false
+              self.publishStateIfNeeded()
+            } else if endReason == 4, let diag = errDiag { // ERROR
+              self.loadingFile = false
+              self.pausedForCache = false
+              mpvUsbLog.error("[NovaPlay][MPV] END_FILE error: \(diag.full, privacy: .public)")
+              self.delegate?.mpvEngineDidFail(message: diag.short, diagnostic: diag.full, code: Int(endError))
+            }
           }
         }
 
@@ -957,10 +967,13 @@ final class IosMpvEngine {
 
       case 20: // SEEK
         let serial = currentLoadSerial()
-        DispatchQueue.main.async { [weak self] in
+        mpvQueue.async { [weak self] in
           guard let self = self, self.currentLoadSerial() == serial else { return }
-          self.isSeeking = true
-          self.publishStateIfNeeded()
+          DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.currentLoadSerial() == serial else { return }
+            self.isSeeking = true
+            self.publishStateIfNeeded()
+          }
         }
 
       case 21: // PLAYBACK_RESTART
@@ -1064,6 +1077,7 @@ final class IosMpvEngine {
     let dims = rotatedMpvDimsOnQueue(inst, "video-out-params/dw", "video-out-params/dh", ["video-out-params/rotate"])
       ?? rotatedMpvDimsOnQueue(inst, "video-params/dw", "video-params/dh", ["video-params/rotate"])
       ?? rotatedMpvDimsOnQueue(inst, "video-params/w", "video-params/h", ["video-params/rotate", "current-tracks/video/demux-rotation", "track-list/0/demux-rotation"])
+      ?? rotatedMpvDimsOnQueue(inst, "current-tracks/video/demux-w", "current-tracks/video/demux-h", ["current-tracks/video/demux-rotation", "track-list/0/demux-rotation"])
     let sz = dims.map { CGSize(width: CGFloat($0.0), height: CGFloat($0.1)) }
 
     let fpsEst = uzv_ios_mpv_get_property_double(inst, "estimated-vf-fps", 0)

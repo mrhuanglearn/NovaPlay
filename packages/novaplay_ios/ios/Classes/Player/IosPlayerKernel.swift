@@ -176,7 +176,6 @@ final class PlayerVideoContainerView: UIView {
       avLayerView.frame = bounds
       CATransaction.commit()
     }
-    mpvMetalView.frame = bounds
     applyFitLayout()
   }
 
@@ -285,6 +284,8 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
   private var inlineAutomaticPipAllowed = true
   private var isAppInBackground = (UIApplication.shared.applicationState == .background)
   private var lastForegroundEntryTime: CFTimeInterval = 0
+  private var audioSessionConfigured = false
+  private lazy var screenshotCIContext = CIContext(options: nil)
   private var appLifecycleObservers: [NSObjectProtocol] = []
   var isPlayerPageVisibleInline: (() -> Bool)?
 
@@ -577,10 +578,14 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     }
   }
 
-  private func configureAudioSession() {
+  private func configureAudioSession(force: Bool = false) {
     let session = AVAudioSession.sharedInstance()
+    if !force && audioSessionConfigured && session.category == .playback && session.mode == .moviePlayback {
+      return
+    }
     try? session.setCategory(.playback, mode: .moviePlayback, options: [.allowAirPlay, .allowBluetoothA2DP])
     try? session.setActive(true)
+    audioSessionConfigured = true
   }
 
   private func setupPictureInPictureIfSupported() {
@@ -612,6 +617,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     ) { [weak self] _ in
       guard let self = self else { return }
       self.isAppInBackground = false
+      self.audioSessionConfigured = false
       self.lastForegroundEntryTime = CACurrentMediaTime()
     }
     let activeObs = nc.addObserver(
@@ -622,7 +628,21 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
       guard let self = self else { return }
       self.isAppInBackground = false
     }
-    appLifecycleObservers = [bgObs, fgObs, activeObs]
+    let audioIntObs = nc.addObserver(
+      forName: AVAudioSession.interruptionNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.audioSessionConfigured = false
+    }
+    let audioResetObs = nc.addObserver(
+      forName: AVAudioSession.mediaServicesWereResetNotification,
+      object: nil,
+      queue: .main
+    ) { [weak self] _ in
+      self?.audioSessionConfigured = false
+    }
+    appLifecycleObservers = [bgObs, fgObs, activeObs, audioIntObs, audioResetObs]
   }
 
   private func attachAvPeriodicObserver() {
@@ -2338,14 +2358,16 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
 
   private func fetchSidecarSubtitleAt(idx: Int, sub: SubtitleOption, headers: [String: String]) {
     guard let u = parseMediaURL(sub.url) else { return }
+    let gen = loadGeneration
     if u.isFileURL {
-      let accessed = u.startAccessingSecurityScopedResource()
-      let text = (try? String(contentsOf: u, encoding: .utf8)) ?? (try? String(contentsOf: u, encoding: .utf16))
-      if accessed { u.stopAccessingSecurityScopedResource() }
-      if let text = text {
+      DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        let accessed = u.startAccessingSecurityScopedResource()
+        let text = (try? String(contentsOf: u, encoding: .utf8)) ?? (try? String(contentsOf: u, encoding: .utf16))
+        if accessed { u.stopAccessingSecurityScopedResource() }
+        guard let text = text else { return }
         let cues = SidecarSubtitleParser.parse(text)
-        DispatchQueue.main.async { [weak self] in
-          guard let self = self, idx < self.sidecarSubtitles.count else { return }
+        DispatchQueue.main.async {
+          guard let self = self, self.loadGeneration == gen, idx < self.sidecarSubtitles.count else { return }
           self.sidecarSubtitles[idx].cues = cues
           self.updateCurrentSidecarCue()
         }
@@ -2359,7 +2381,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
             let text = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .utf16) else { return }
       let cues = SidecarSubtitleParser.parse(text)
       DispatchQueue.main.async {
-        guard let self = self, idx < self.sidecarSubtitles.count else { return }
+        guard let self = self, self.loadGeneration == gen, idx < self.sidecarSubtitles.count else { return }
         self.sidecarSubtitles[idx].cues = cues
         self.updateCurrentSidecarCue()
       }
@@ -2401,8 +2423,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         return
       }
       let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
-      let context = CIContext(options: nil)
-      guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+      guard let cgImage = screenshotCIContext.createCGImage(ciImage, from: ciImage.extent) else {
         completion(false, IosPlayerUiText.t("生成截图失败", "Failed to render frame"))
         return
       }

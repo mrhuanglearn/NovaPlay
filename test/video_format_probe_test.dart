@@ -1460,6 +1460,102 @@ high.m3u8
       await router.onPageClosed(PageClosedEvent(sessionId: session2Id, positionSeconds: 3, completed: false));
       await f2;
     });
+
+    test('grants 150ms post-resolve header-probe floor when spider /play consumes 260ms of 300ms fastLaunchBudget',
+        () async {
+      final router = PlayerSessionRouter();
+      final host = _RecordingHost();
+      final launcher = buildLauncher(host, router, budget: const Duration(milliseconds: 300));
+      final nearBudgetApi = _DelayedPlayApi(() async {
+        await Future<void>.delayed(const Duration(milliseconds: 260));
+        return PlayResult(url: 'http://127.0.0.1:${mediaServer.port}/vertical.m3u8');
+      });
+
+      final playFut = launcher.play(
+        site: site,
+        api: nearBudgetApi,
+        detail: makeDetail('late_spider_vertical_ep'),
+        history: history,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 360));
+
+      expect(host.opened, hasLength(1));
+      final opened = host.opened.single;
+      expect(
+        (opened.initialSource?.videoWidth, opened.initialSource?.videoHeight),
+        (1080, 1920),
+        reason: 'post-resolve probe floor lets vertical short dramas open directly in portrait instead of double-rotating',
+      );
+      await router.onPageClosed(PageClosedEvent(sessionId: opened.sessionId, positionSeconds: 1, completed: false));
+      await playFut;
+    });
+
+    test('stalled enableWakelock never blocks openPlayerPage', () async {
+      final router = PlayerSessionRouter();
+      final host = _RecordingHost();
+      final probe = VideoFormatProbe(httpClientFactory: HttpClient.new);
+      addTearDown(probe.close);
+      final wakelockGate = Completer<void>();
+      final launcher = PlayerLauncher(
+        configs: PlayerConfigRepository(store: JsonStore('player_config.json', baseDir: dir)),
+        sniffer: SnifferService(),
+        host: host,
+        router: router,
+        formatProbe: probe,
+        fastLaunchBudget: const Duration(milliseconds: 80),
+        installRouter: false,
+        enableWakelock: () => wakelockGate.future,
+        disableWakelock: () async {},
+      );
+      final api = _DelayedPlayApi(() async => PlayResult(url: 'http://127.0.0.1:${mediaServer.port}/vertical.m3u8'));
+
+      final playFut = launcher.play(site: site, api: api, detail: makeDetail('stalled_wakelock_ep'), history: history);
+      await Future<void>.delayed(const Duration(milliseconds: 70));
+
+      expect(host.opened, hasLength(1), reason: 'openPlayerPage must fire without awaiting stalled wakelock channel');
+      final opened = host.opened.single;
+      expect((opened.initialSource?.videoWidth, opened.initialSource?.videoHeight), (1080, 1920));
+
+      wakelockGate.complete();
+      await router.onPageClosed(PageClosedEvent(sessionId: opened.sessionId, positionSeconds: 1, completed: false));
+      await playFut;
+    });
+
+    test('forwards Set-Cookie across same-site 302 redirects during VideoFormatProbe.probe', () async {
+      final cookieServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => cookieServer.close(force: true));
+      cookieServer.listen((req) async {
+        if (req.uri.path == '/entry') {
+          req.response.statusCode = HttpStatus.found;
+          req.response.cookies.add(Cookie('cdn_gate', 'allow123')..path = '/');
+          req.response.headers.set(HttpHeaders.locationHeader, '/gated/master.m3u8');
+          await req.response.close();
+          return;
+        }
+        if (req.uri.path == '/gated/master.m3u8') {
+          final cookieHeader = req.headers.value(HttpHeaders.cookieHeader) ?? '';
+          if (!cookieHeader.contains('sid=init1') || !cookieHeader.contains('cdn_gate=allow123')) {
+            req.response.statusCode = HttpStatus.forbidden;
+            await req.response.close();
+            return;
+          }
+          req.response.headers.contentType = ContentType('application', 'vnd.apple.mpegurl');
+          req.response.write('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=1080x1920\nv.m3u8\n');
+          await req.response.close();
+          return;
+        }
+        req.response.statusCode = HttpStatus.notFound;
+        await req.response.close();
+      });
+
+      final probe = VideoFormatProbe(httpClientFactory: HttpClient.new);
+      addTearDown(probe.close);
+      final dims = await probe.probe(
+        'http://127.0.0.1:${cookieServer.port}/entry',
+        headers: const {'Cookie': 'sid=init1'},
+      );
+      expect(dims, (width: 1080, height: 1920));
+    });
   });
 }
 

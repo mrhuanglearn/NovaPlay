@@ -94,6 +94,8 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   private let isPhone: Bool = UIDevice.current.userInterfaceIdiom == .phone
   private var manualOrientationThisEpisode = false
   private var pipSavedOrientationStep: OrientationStep?
+  private var lockedInterfaceOrientationMask: UIInterfaceOrientationMask?
+  private var lastEpisodeVideoSize: CGSize = .zero
   private var staleVideoSize: CGSize = .zero
   private var builtCutoutInset: CGFloat = -1
   private var builtSafeTop: CGFloat = -1
@@ -103,6 +105,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   private var dismissedForPiP: Bool = false
   var isDismissedForPiP: Bool { dismissedForPiP }
   private(set) var isExitingPlayer: Bool = false
+  private var isCancelledForReplacement: Bool = false
   private var exitCompletedFlag: Bool = false
   private var pendingExitDismissWork: DispatchWorkItem?
   private var pendingGeometryRetryWork: DispatchWorkItem?
@@ -239,6 +242,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   }
 
   deinit {
+    pendingExitDismissWork?.cancel()
     pendingGeometryRetryWork?.cancel()
     uiRefreshTimer?.invalidate()
     skipCountdownTimer?.invalidate()
@@ -250,8 +254,20 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     }
   }
 
+  func cancelForImmediateReplacement() {
+    isCancelledForReplacement = true
+    isExitingPlayer = true
+    pendingExitDismissWork?.cancel()
+    pendingExitDismissWork = nil
+    pendingGeometryRetryWork?.cancel()
+    pendingGeometryRetryWork = nil
+    uiRefreshTimer?.invalidate()
+    skipCountdownTimer?.invalidate()
+    hideControlsWorkItem?.cancel()
+  }
+
   override var prefersStatusBarHidden: Bool {
-    !controlsVisible || view.bounds.width > view.bounds.height
+    !controlsVisible || view.bounds.width > view.bounds.height || (isPhone && orientationStep.isLandscapeTarget && !isExitingPlayer)
   }
 
   override var preferredStatusBarStyle: UIStatusBarStyle { .lightContent }
@@ -259,7 +275,10 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   override var prefersHomeIndicatorAutoHidden: Bool { !controlsVisible }
 
   override var supportedInterfaceOrientations: UIInterfaceOrientationMask {
-    orientationStep.mask
+    if screenLocked, !isExitingPlayer, let mask = lockedInterfaceOrientationMask {
+      return mask
+    }
+    return orientationStep.mask
   }
 
   override var shouldAutorotate: Bool { true }
@@ -322,7 +341,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   override func viewWillTransition(to size: CGSize, with coordinator: UIViewControllerTransitionCoordinator) {
     super.viewWillTransition(to: size, with: coordinator)
     if isExitingPlayer {
-      guard size.width <= size.height, pendingExitDismissWork != nil else { return }
+      guard !isCancelledForReplacement, size.width <= size.height, pendingExitDismissWork != nil else { return }
       pendingExitDismissWork?.cancel()
       coordinator.animate(alongsideTransition: nil) { [weak self] _ in
         self?.performFinalExitDismiss()
@@ -337,7 +356,9 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     coordinator.animate(alongsideTransition: nil) { [weak self] _ in
       guard let self = self else { return }
       self.isTransitioningOrientation = false
+      self.inFlightGeometryStep = nil
       self.inFlightGeometryUntil = 0
+      self.geometryRetryCount = 0
       self.pendingGeometryRetryWork?.cancel()
       self.pendingGeometryRetryWork = nil
       self.syncOrientationForCurrentState()
@@ -400,6 +421,13 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     }
     pendingGeometryRetryWork?.cancel()
     pendingGeometryRetryWork = nil
+    if isTransitioningOrientation && !isExitingPlayer {
+      if #available(iOS 16.0, *) {
+        setNeedsUpdateOfSupportedInterfaceOrientations()
+      }
+      setNeedsStatusBarAppearanceUpdate()
+      return
+    }
     let stepName = orientationStep.debugName
     let b = isViewLoaded ? view.bounds.size : .zero
     vcOrientLog.notice(
@@ -419,7 +447,18 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
       let requestedStep = orientationStep
       if let scene = view.window?.windowScene {
         let curOrient = scene.interfaceOrientation
+        let hasConflictingInFlight: Bool = {
+          guard let inflight = inFlightGeometryStep,
+                inflight != requestedStep,
+                CACurrentMediaTime() < inFlightGeometryUntil else {
+            return false
+          }
+          return true
+        }()
         let alreadySatisfied: Bool = {
+          if hasConflictingInFlight {
+            return false
+          }
           switch requestedStep {
           case .sensorLandscape:
             return (curOrient == .landscapeLeft || curOrient == .landscapeRight) && view.bounds.width > view.bounds.height
@@ -441,12 +480,29 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
         inFlightGeometryUntil = CACurrentMediaTime() + 0.45
         scene.requestGeometryUpdate(.iOS(interfaceOrientations: requestedStep.mask)) { [weak self] err in
           DispatchQueue.main.async {
-            guard let self = self else { return }
+            guard let self = self, !self.isCancelledForReplacement else { return }
             if self.inFlightGeometryStep == requestedStep {
               self.inFlightGeometryUntil = 0
             }
-            guard !self.isExitingPlayer,
-                  !self.dismissedForPiP,
+            if self.isExitingPlayer {
+              guard self.pendingExitDismissWork != nil,
+                    !self.isBeingDismissed,
+                    self.orientationStep == requestedStep,
+                    self.geometryRetryCount < 1 else { return }
+              self.geometryRetryCount += 1
+              let work = DispatchWorkItem { [weak self] in
+                guard let self = self,
+                      !self.isCancelledForReplacement,
+                      self.pendingExitDismissWork != nil,
+                      !self.isBeingDismissed else { return }
+                self.pendingGeometryRetryWork = nil
+                self.applyOrientationStep(isRetry: true)
+              }
+              self.pendingGeometryRetryWork = work
+              DispatchQueue.main.asyncAfter(deadline: .now() + 0.06, execute: work)
+              return
+            }
+            guard !self.dismissedForPiP,
                   !self.isBeingDismissed,
                   self.orientationStep == requestedStep,
                   self.geometryRetryCount < 6 else { return }
@@ -498,28 +554,33 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     if !controller.isClosed {
       controller.kernel.pause()
     }
-    if presentedViewController != nil {
-      dismiss(animated: false)
-    }
-
-    let currentlyLandscape = view.bounds.width > view.bounds.height
-    if isPhone && (currentlyLandscape || orientationStep != .portrait) {
-      orientationStep = .portrait
-      if currentlyLandscape && UIApplication.shared.applicationState == .active {
-        let work = DispatchWorkItem { [weak self] in
-          self?.performFinalExitDismiss()
+    let finishExit = { [weak self] in
+      guard let self = self, !self.isCancelledForReplacement else { return }
+      let currentlyLandscape = self.view.bounds.width > self.view.bounds.height
+      if self.isPhone && (currentlyLandscape || self.orientationStep != .portrait) {
+        self.orientationStep = .portrait
+        if currentlyLandscape && UIApplication.shared.applicationState == .active {
+          let work = DispatchWorkItem { [weak self] in
+            self?.performFinalExitDismiss()
+          }
+          self.pendingExitDismissWork = work
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.42, execute: work)
+          self.applyOrientationStep()
+          return
         }
-        pendingExitDismissWork = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.42, execute: work)
-        applyOrientationStep()
-        return
+        self.applyOrientationStep()
       }
-      applyOrientationStep()
+      self.performFinalExitDismiss()
     }
-    performFinalExitDismiss()
+    if presentedViewController != nil {
+      dismiss(animated: false, completion: finishExit)
+    } else {
+      finishExit()
+    }
   }
 
   private func performFinalExitDismiss() {
+    guard !isCancelledForReplacement else { return }
     pendingExitDismissWork?.cancel()
     pendingExitDismissWork = nil
     guard let presenter = presentingViewController else {
@@ -557,7 +618,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
 
   private func effectiveVideoSizeForOrientation() -> CGSize? {
     if !controller.isResolvingSource {
-      let kSize = controller.kernel.videoSize
+      let kSize = controller.effectiveDisplayVideoSize
       if kSize.width > 0 && kSize.height > 0 {
         if !(staleVideoSize != .zero && kSize == staleVideoSize && controller.state != "playing") {
           staleVideoSize = .zero
@@ -568,6 +629,9 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     let pSize = controller.probedVideoSize
     if pSize.width > 0 && pSize.height > 0 {
       return pSize
+    }
+    if lastEpisodeVideoSize.width > 0 && lastEpisodeVideoSize.height > 0 {
+      return lastEpisodeVideoSize
     }
     return nil
   }
@@ -593,7 +657,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   /// Synchronizes player orientation across initial appear, fast-probed/decoded dimension updates, episode switches,
   /// runtime mode changes, and Picture-in-Picture / background restoration.
   private func syncOrientationForCurrentState(ignoreOverlay: Bool = false, applyNow: Bool = true) {
-    guard !isExitingPlayer, !dismissedForPiP, !isBeingDismissed else { return }
+    guard !isExitingPlayer, !dismissedForPiP, !isBeingDismissed, !screenLocked else { return }
     let mode = IosPlayerUiText.effectiveOrientationMode(controller.playbackConfig)
     let desired: OrientationStep
     switch mode {
@@ -653,7 +717,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
 
   /// Adapts player orientation whenever fast-probed or decoded stream dimensions arrive (unless manually rotated).
   private func evaluateOrientationAndReveal(ignoreOverlay: Bool = false, applyNow: Bool = true) {
-    guard !isExitingPlayer, !dismissedForPiP, !isBeingDismissed, isPhone, !manualOrientationThisEpisode else { return }
+    guard !isExitingPlayer, !dismissedForPiP, !isBeingDismissed, !screenLocked, isPhone, !manualOrientationThisEpisode else { return }
     guard IosPlayerUiText.effectiveOrientationMode(controller.playbackConfig) == "auto" else { return }
     guard effectiveVideoSizeForOrientation() != nil else { return }
     syncOrientationForCurrentState(ignoreOverlay: ignoreOverlay, applyNow: applyNow)
@@ -689,10 +753,13 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     guard !isExitingPlayer else { return }
     let wasManual = manualOrientationThisEpisode
     let prevSize = effectiveVideoSizeForOrientation()
+    if let prev = prevSize, prev.width > 0, prev.height > 0 {
+      lastEpisodeVideoSize = prev
+    }
     manualOrientationThisEpisode = false
     pipSavedOrientationStep = nil
-    staleVideoSize = controller.kernel.videoSize
-    guard isViewLoaded, !dismissedForPiP else { return }
+    staleVideoSize = controller.effectiveDisplayVideoSize
+    guard isViewLoaded, !dismissedForPiP, !screenLocked else { return }
     if wasManual && isPhone && IosPlayerUiText.effectiveOrientationMode(controller.playbackConfig) == "auto" {
       let targetLandscape = prevSize.map { $0.width >= $0.height } ?? true
       let targetStep: OrientationStep = targetLandscape ? .sensorLandscape : .portrait
@@ -1871,13 +1938,34 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   private func setScreenLocked(_ locked: Bool) {
     screenLocked = locked
     if locked {
+      let cur = view.window?.windowScene?.interfaceOrientation
+      switch cur {
+      case .landscapeLeft:
+        lockedInterfaceOrientationMask = .landscapeLeft
+      case .landscapeRight:
+        lockedInterfaceOrientationMask = .landscapeRight
+      case .portraitUpsideDown:
+        lockedInterfaceOrientationMask = .portraitUpsideDown
+      case .portrait:
+        lockedInterfaceOrientationMask = .portrait
+      default:
+        lockedInterfaceOrientationMask = (view.bounds.width > view.bounds.height) ? .landscapeRight : .portrait
+      }
+      if #available(iOS 16.0, *) {
+        setNeedsUpdateOfSupportedInterfaceOrientations()
+      }
       hideControlsAnimated(false)
       overlayHost.closeMenu()
       overlayHost.closePanel()
       showLockLayerBriefly()
     } else {
+      lockedInterfaceOrientationMask = nil
+      if #available(iOS 16.0, *) {
+        setNeedsUpdateOfSupportedInterfaceOrientations()
+      }
       hideLockWorkItem?.cancel()
       lockLayer.isHidden = true
+      syncOrientationForCurrentState()
       showControls()
     }
   }
@@ -2393,8 +2481,9 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     } else {
       episodeChip?.isHidden = true
     }
-    if k.videoSize.width > 0 && k.videoSize.height > 0 {
-      resolutionChip?.text = "\(Int(k.videoSize.width))x\(Int(k.videoSize.height))"
+    let dispSize = controller.effectiveDisplayVideoSize
+    if dispSize.width > 0 && dispSize.height > 0 {
+      resolutionChip?.text = "\(Int(dispSize.width))x\(Int(dispSize.height))"
       resolutionChip?.isHidden = false
     } else {
       resolutionChip?.isHidden = true

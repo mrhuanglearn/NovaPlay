@@ -27,7 +27,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   let kernel: IosPlayerKernel
   let danmakuView: IosDanmakuView
   private let flutterApi: NativePlayerFlutterApi
-  private let onDismissPage: () -> Void
+  private let onDismissPage: (Bool) -> Bool
 
   weak var uiDelegate: IosPlayerControllerUiDelegate?
 
@@ -82,7 +82,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     kernel: IosPlayerKernel,
     danmakuView: IosDanmakuView,
     flutterApi: NativePlayerFlutterApi,
-    onDismissPage: @escaping () -> Void
+    onDismissPage: @escaping (Bool) -> Bool
   ) {
     self.request = request
     self.kernel = kernel
@@ -283,6 +283,21 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     )
   }
 
+  /// Display-oriented decoded video dimensions, preferring container-rotated `probedVideoSize` when `MobileVLCKit`
+  /// reports unrotated coded dimensions that are an exact 90°/270° transpose.
+  var effectiveDisplayVideoSize: CGSize {
+    let kSize = kernel.videoSize
+    guard kSize.width > 0 && kSize.height > 0 else { return .zero }
+    if kernel.isUsingVlc,
+       probedVideoSize.width > 0,
+       probedVideoSize.height > 0,
+       abs(kSize.width - probedVideoSize.height) <= 2,
+       abs(kSize.height - probedVideoSize.width) <= 2 {
+      return probedVideoSize
+    }
+    return kSize
+  }
+
   func seedInitialProbedSize(_ size: CGSize) {
     guard size.width > 0 && size.height > 0 else { return }
     probedVideoSize = size
@@ -297,11 +312,22 @@ final class IosPlayerController: IosPlayerKernelDelegate {
             episodeIndex == self.episode,
             width > 0,
             height > 0 else { return }
-      if !self.resolvingSource && self.kernel.videoSize.width > 0 && self.kernel.videoSize.height > 0 {
+      let nextProbed = CGSize(width: CGFloat(width), height: CGFloat(height))
+      let kSize = self.kernel.videoSize
+      let isVlcTranspose = self.kernel.isUsingVlc
+        && kSize.width > 0
+        && kSize.height > 0
+        && abs(kSize.width - nextProbed.height) <= 2
+        && abs(kSize.height - nextProbed.width) <= 2
+      if !self.resolvingSource && kSize.width > 0 && kSize.height > 0 && !isVlcTranspose {
         return
       }
-      self.probedVideoSize = CGSize(width: CGFloat(width), height: CGFloat(height))
-      self.uiDelegate?.controllerDidUpdateMetrics()
+      self.probedVideoSize = nextProbed
+      if isVlcTranspose {
+        self.kernelDidUpdateMetrics()
+      } else {
+        self.uiDelegate?.controllerDidUpdateMetrics()
+      }
     }
   }
 
@@ -795,7 +821,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     flutterApi.onStateChanged(event: StateEvent(sessionId: request.sessionId, state: nextState)) { _ in }
     updateNowPlayingInfo()
     if nextState == "ended" && !nextEpisode() {
-      close(completed: true, dismissVC: true)
+      requestSmoothDismissOrClose(completed: true)
     }
   }
 
@@ -811,7 +837,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   }
 
   func kernelDidUpdateMetrics() {
-    let kSize = kernel.videoSize
+    let kSize = effectiveDisplayVideoSize
     if !resolvingSource && kSize.width > 0 && kSize.height > 0 && kSize != lastReportedDecodedSize {
       lastReportedDecodedSize = kSize
       flutterApi.onVideoSizeDetected(
@@ -847,7 +873,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
 
   func kernelPictureInPictureDidCloseSession() {
     // PiP closed in non-auto-background scenarios: completely close the player page & session
-    close(completed: false, dismissVC: true)
+    requestSmoothDismissOrClose(completed: false)
   }
 
   func kernelPictureInPictureRestoreUI(completion: @escaping (Bool) -> Void) {
@@ -953,6 +979,22 @@ final class IosPlayerController: IosPlayerKernelDelegate {
 
   // MARK: - Teardown
 
+  private func requestSmoothDismissOrClose(completed: Bool) {
+    guard !isClosed else { return }
+    if Thread.isMainThread {
+      if !onDismissPage(completed) {
+        close(completed: completed, dismissVC: false)
+      }
+    } else {
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self, !self.isClosed else { return }
+        if !self.onDismissPage(completed) {
+          self.close(completed: completed, dismissVC: false)
+        }
+      }
+    }
+  }
+
   func close(completed: Bool = false, dismissVC: Bool = true) {
     guard !isClosed else { return }
     isClosed = true
@@ -967,7 +1009,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
       event: PageClosedEvent(sessionId: request.sessionId, positionSeconds: finalPosSec, completed: completed)
     ) { _ in }
     if dismissVC {
-      onDismissPage()
+      _ = onDismissPage(completed)
     }
   }
 }

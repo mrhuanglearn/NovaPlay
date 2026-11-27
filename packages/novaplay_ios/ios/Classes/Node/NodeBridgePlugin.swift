@@ -463,7 +463,9 @@ private final class NodeHostIos {
         if srvFd < 0 { break }
         continue
       }
-      serveConnection(connFd: connFd)
+      Thread.detachNewThread { [weak self] in
+        self?.serveConnection(connFd: connFd)
+      }
     }
   }
 
@@ -472,6 +474,8 @@ private final class NodeHostIos {
     setsockopt(connFd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
     var handshakeTimeout = timeval(tv_sec: 3, tv_usec: 0)
     setsockopt(connFd, SOL_SOCKET, SO_RCVTIMEO, &handshakeTimeout, socklen_t(MemoryLayout<timeval>.size))
+    var sndTimeout = timeval(tv_sec: 5, tv_usec: 0)
+    setsockopt(connFd, SOL_SOCKET, SO_SNDTIMEO, &sndTimeout, socklen_t(MemoryLayout<timeval>.size))
 
     defer {
       lock.lock()
@@ -515,8 +519,12 @@ private final class NodeHostIos {
           var noTimeout = timeval(tv_sec: 0, tv_usec: 0)
           setsockopt(connFd, SOL_SOCKET, SO_RCVTIMEO, &noTimeout, socklen_t(MemoryLayout<timeval>.size))
           lock.lock()
+          let prevFd = clientFd
           clientFd = connFd
           lock.unlock()
+          if prevFd >= 0 && prevFd != connFd {
+            Darwin.shutdown(prevFd, SHUT_RDWR)
+          }
           continue
         }
 

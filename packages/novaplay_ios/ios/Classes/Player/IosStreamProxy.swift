@@ -674,7 +674,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     proxyUsbLog.notice("[NovaPlay][Proxy] listening on 127.0.0.1:\(port, privacy: .public)")
 
     Thread.detachNewThread { [weak self] in
-      self?.acceptLoop(srvFd: fd)
+      self?.acceptLoop(initialSrvFd: fd, port: port)
     }
     return port
   }
@@ -915,6 +915,9 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
           if needed > 0 {
             capturedData.append(chunk.prefix(needed))
           }
+          if !isLikelyHlsResponse && capturedData.count <= 256 && IosHlsRewriter.looksLikeHlsPlaylist(capturedData) {
+            isLikelyHlsResponse = true
+          }
           if !isLikelyHlsResponse && capturedData.count >= 1024 {
             shouldStopNow = true
           } else if isLikelyHlsResponse && capturedData.count >= capBytes {
@@ -1096,7 +1099,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
 
   // MARK: - Loopback POSIX Socket Server
 
-  private func openLoopbackListener() -> (Int32, UInt16)? {
+  private func openLoopbackListener(preferredPort: UInt16 = 0) -> (Int32, UInt16)? {
     let fd = Darwin.socket(AF_INET, SOCK_STREAM, 0)
     guard fd >= 0 else { return nil }
     var yes: Int32 = 1
@@ -1106,7 +1109,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     var addr = sockaddr_in()
     addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     addr.sin_family = sa_family_t(AF_INET)
-    addr.sin_port = 0
+    addr.sin_port = preferredPort.bigEndian
     addr.sin_addr = in_addr(s_addr: inet_addr("127.0.0.1"))
 
     let bindRc = withUnsafePointer(to: &addr) { ptr in
@@ -1133,7 +1136,8 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
     return (fd, UInt16(bigEndian: bound.sin_port))
   }
 
-  private func acceptLoop(srvFd: Int32) {
+  private func acceptLoop(initialSrvFd: Int32, port: UInt16) {
+    var srvFd = initialSrvFd
     while true {
       let connFd = Darwin.accept(srvFd, nil, nil)
       if connFd < 0 {
@@ -1141,19 +1145,51 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
         if err == EINTR || err == EAGAIN || err == ECONNABORTED {
           continue
         }
-        break
+        // iOS may invalidate a loopback listening socket across prolonged suspend; rebind the same port so active
+        // HLS playlists (`http://127.0.0.1:<port>/proxy/...`) continue streaming after foreground resume.
+        lock.lock()
+        let wasCurrent = (serverFd == srvFd)
+        if wasCurrent {
+          serverFd = -1
+        }
+        lock.unlock()
+        Darwin.close(srvFd)
+        srvFd = -1
+        guard wasCurrent, port > 0 else { return }
+
+        var rebound = false
+        for _ in 0..<25 {
+          if let (newFd, newPort) = openLoopbackListener(preferredPort: port) {
+            lock.lock()
+            if serverFd < 0 {
+              serverFd = newFd
+              boundPort = newPort
+              srvFd = newFd
+              rebound = true
+              lock.unlock()
+              proxyUsbLog.notice("[NovaPlay][Proxy] rebound loopback listener on 127.0.0.1:\(newPort, privacy: .public)")
+              break
+            }
+            lock.unlock()
+            Darwin.close(newFd)
+            return
+          }
+          Thread.sleep(forTimeInterval: 0.2)
+        }
+        if !rebound {
+          lock.lock()
+          if serverFd < 0 && boundPort == port {
+            boundPort = 0
+          }
+          lock.unlock()
+          return
+        }
+        continue
       }
       DispatchQueue.global(qos: .userInitiated).async { [weak self] in
         self?.handleClientConnection(fd: connFd)
       }
     }
-    lock.lock()
-    if serverFd == srvFd {
-      serverFd = -1
-      boundPort = 0
-    }
-    lock.unlock()
-    Darwin.close(srvFd)
   }
 
   private func handleClientConnection(fd: Int32) {
@@ -1348,56 +1384,59 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
           return
         }
 
-        defer { Darwin.close(fd) }
-        if let err = err, !capped {
-          self.markRootResult(session: session, targetURL: targetURL, failed: true)
-          self.recordSessionError(session: session, errorText: err.localizedDescription)
-          _ = self.writeAll(fd: fd, data: Data("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
-          return
-        }
-        if status >= 400 {
-          self.markRootResult(session: session, targetURL: targetURL, failed: true)
-          let header = "HTTP/1.1 \(status) Upstream Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-          _ = self.writeAll(fd: fd, data: Data(header.utf8))
-          return
-        }
-        self.markRootResult(session: session, targetURL: targetURL, failed: false)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+          defer { Darwin.close(fd) }
+          guard let self = self else { return }
+          if let err = err, !capped {
+            self.markRootResult(session: session, targetURL: targetURL, failed: true)
+            self.recordSessionError(session: session, errorText: err.localizedDescription)
+            _ = self.writeAll(fd: fd, data: Data("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
+            return
+          }
+          if status >= 400 {
+            self.markRootResult(session: session, targetURL: targetURL, failed: true)
+            let header = "HTTP/1.1 \(status) Upstream Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            _ = self.writeAll(fd: fd, data: Data(header.utf8))
+            return
+          }
+          self.markRootResult(session: session, targetURL: targetURL, failed: false)
 
-        let finalURL = resp?.url ?? effectiveURL
-        let proxyPort = self.currentBoundPort
-        if proxyPort > 0,
-           IosHlsRewriter.looksLikeHlsPlaylist(data),
-           let playlistText = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) {
-          self.recordSessionContainer(session: session, container: .hls)
-          let rewritten = IosHlsRewriter.rewrite(
-            playlist: playlistText,
-            baseURL: finalURL,
-            proxyPort: proxyPort,
-            sessionToken: session.token
-          )
-          let outBytes = Data(rewritten.utf8)
+          let finalURL = resp?.url ?? effectiveURL
+          let proxyPort = self.currentBoundPort
+          if proxyPort > 0,
+             IosHlsRewriter.looksLikeHlsPlaylist(data),
+             let playlistText = String(data: data, encoding: .utf8) ?? String(data: data, encoding: .isoLatin1) {
+            self.recordSessionContainer(session: session, container: .hls)
+            let rewritten = IosHlsRewriter.rewrite(
+              playlist: playlistText,
+              baseURL: finalURL,
+              proxyPort: proxyPort,
+              sessionToken: session.token
+            )
+            let outBytes = Data(rewritten.utf8)
+            let headStr =
+              "HTTP/1.1 200 OK\r\n" +
+              "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n" +
+              "Content-Length: \(outBytes.count)\r\n" +
+              "Cache-Control: no-cache\r\n" +
+              "Connection: close\r\n\r\n"
+            if self.writeAll(fd: fd, data: Data(headStr.utf8)), !isHead {
+              _ = self.writeAll(fd: fd, data: outBytes)
+            }
+            return
+          }
+
+          let ct = resp?.value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"
+          let sniffed = Self.sniffContainer(firstBytes: data, contentType: ct, finalURL: finalURL)
+          self.recordSessionContainer(session: session, container: sniffed)
           let headStr =
-            "HTTP/1.1 200 OK\r\n" +
-            "Content-Type: application/vnd.apple.mpegurl; charset=utf-8\r\n" +
-            "Content-Length: \(outBytes.count)\r\n" +
-            "Cache-Control: no-cache\r\n" +
+            "HTTP/1.1 \(status) OK\r\n" +
+            "Content-Type: \(ct)\r\n" +
+            "Content-Length: \(data.count)\r\n" +
             "Connection: close\r\n\r\n"
           if self.writeAll(fd: fd, data: Data(headStr.utf8)), !isHead {
-            _ = self.writeAll(fd: fd, data: outBytes)
+            _ = self.writeAll(fd: fd, data: data)
           }
-          return
-        }
-
-        let ct = resp?.value(forHTTPHeaderField: "Content-Type") ?? "application/octet-stream"
-        let sniffed = Self.sniffContainer(firstBytes: data, contentType: ct, finalURL: finalURL)
-        self.recordSessionContainer(session: session, container: sniffed)
-        let headStr =
-          "HTTP/1.1 \(status) OK\r\n" +
-          "Content-Type: \(ct)\r\n" +
-          "Content-Length: \(data.count)\r\n" +
-          "Connection: close\r\n\r\n"
-        if self.writeAll(fd: fd, data: Data(headStr.utf8)), !isHead {
-          _ = self.writeAll(fd: fd, data: data)
         }
       }
     )
@@ -1471,24 +1510,27 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
           return
         }
 
-        defer { Darwin.close(fd) }
-        if let err = err, !capped {
-          self.recordSessionError(session: session, errorText: err.localizedDescription)
-          _ = self.writeAll(fd: fd, data: Data("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
-          return
-        }
-        if status >= 400 {
-          let header = "HTTP/1.1 \(status) Upstream Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-          _ = self.writeAll(fd: fd, data: Data(header.utf8))
-          return
-        }
-        let headStr =
-          "HTTP/1.1 200 OK\r\n" +
-          "Content-Type: application/octet-stream\r\n" +
-          "Content-Length: \(data.count)\r\n" +
-          "Connection: close\r\n\r\n"
-        if self.writeAll(fd: fd, data: Data(headStr.utf8)), !isHead {
-          _ = self.writeAll(fd: fd, data: data)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+          defer { Darwin.close(fd) }
+          guard let self = self else { return }
+          if let err = err, !capped {
+            self.recordSessionError(session: session, errorText: err.localizedDescription)
+            _ = self.writeAll(fd: fd, data: Data("HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".utf8))
+            return
+          }
+          if status >= 400 {
+            let header = "HTTP/1.1 \(status) Upstream Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            _ = self.writeAll(fd: fd, data: Data(header.utf8))
+            return
+          }
+          let headStr =
+            "HTTP/1.1 200 OK\r\n" +
+            "Content-Type: application/octet-stream\r\n" +
+            "Content-Length: \(data.count)\r\n" +
+            "Connection: close\r\n\r\n"
+          if self.writeAll(fd: fd, data: Data(headStr.utf8)), !isHead {
+            _ = self.writeAll(fd: fd, data: data)
+          }
         }
       }
     )
