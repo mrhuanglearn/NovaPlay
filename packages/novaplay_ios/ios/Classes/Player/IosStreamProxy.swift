@@ -1159,7 +1159,7 @@ final class IosStreamProxy: NSObject, URLSessionDataDelegate {
   private func handleClientConnection(fd: Int32) {
     var yes: Int32 = 1
     _ = setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &yes, socklen_t(MemoryLayout<Int32>.size))
-    var rcvTimeout = timeval(tv_sec: 10, tv_usec: 0)
+    var rcvTimeout = timeval(tv_sec: 3, tv_usec: 0)
     _ = setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &rcvTimeout, socklen_t(MemoryLayout<timeval>.size))
     var sndTimeout = timeval(tv_sec: 20, tv_usec: 0)
     _ = setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sndTimeout, socklen_t(MemoryLayout<timeval>.size))

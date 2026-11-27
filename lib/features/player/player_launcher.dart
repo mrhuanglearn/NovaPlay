@@ -188,14 +188,16 @@ class PlayerLauncher {
     onSession?.call(session);
     session.prefetchEpisode(line, episode);
     var wakelockHeld = false;
+    Future<void>? wakelockFuture;
     try {
       final memKey = source.memoryKey;
       final configFuture = configs.load();
       final htFuture = memKey == null || headTail == null ? Future.value(null) : headTail!.getAll(memKey);
       final qualityFuture = source.resumeQuality();
       final fallbackDimsFuture = source.fallbackDimensions(line, episode);
-      await _enableWakelock();
-      wakelockHeld = true;
+      wakelockFuture = _enableWakelock().then((_) {
+        wakelockHeld = true;
+      });
       final (playback, danmaku) = await configFuture;
       final ht = await htFuture;
       final quality = await qualityFuture;
@@ -278,6 +280,7 @@ class PlayerLauncher {
         }
       }
 
+      await wakelockFuture;
       await session.open(
         playback: playback,
         danmaku: danmaku,
@@ -297,6 +300,9 @@ class PlayerLauncher {
       onOpened?.call();
       return await session.closed;
     } finally {
+      if (wakelockFuture != null) {
+        await wakelockFuture.catchError((Object _) {});
+      }
       router.unregister(session);
       onSession?.call(router.latest); // another player may still be open (e.g. one in picture-in-picture)
       if (wakelockHeld && router.latest == null) {

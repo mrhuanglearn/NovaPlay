@@ -98,6 +98,7 @@ class VideoFormatProbe {
     final client = HttpClient();
     client.connectionTimeout = const Duration(milliseconds: 1500);
     client.idleTimeout = const Duration(seconds: 12);
+    client.badCertificateCallback = (_, __, ___) => true;
     client.findProxy = (uri) => _isLoopbackHost(uri.host) ? 'DIRECT' : HttpClient.findProxyFromEnvironment(uri);
     return client;
   }
@@ -499,6 +500,63 @@ class VideoFormatProbe {
     return false;
   }
 
+  static bool _isPresignedStorageUri(Uri uri) {
+    final q = uri.query.toLowerCase();
+    return q.contains('x-amz-signature=') ||
+        q.contains('x-oss-signature=') ||
+        q.contains('ossaccesskeyid=') ||
+        q.contains('q-signature=') ||
+        (q.contains('sig=') && q.contains('se='));
+  }
+
+  static String _registrableDomain(String host) {
+    final h = host.trim().toLowerCase();
+    if (h.isEmpty || _isLoopbackHost(h) || InternetAddress.tryParse(h) != null) return h;
+    final parts = h.split('.');
+    if (parts.length <= 2) return h;
+    final last2 = '${parts[parts.length - 2]}.${parts.last}';
+    const multiPartTlds = {
+      'com.cn',
+      'net.cn',
+      'org.cn',
+      'gov.cn',
+      'com.hk',
+      'com.tw',
+      'co.jp',
+      'co.uk',
+      'co.kr',
+      'com.au',
+    };
+    if (multiPartTlds.contains(last2) && parts.length >= 3) {
+      return '${parts[parts.length - 3]}.$last2';
+    }
+    return last2;
+  }
+
+  static Map<String, String> _sanitizeHeadersForRedirect(
+    Uri fromUri,
+    Uri toUri,
+    Map<String, String> headers,
+  ) {
+    if (headers.isEmpty) return headers;
+    final crossDomain = _registrableDomain(fromUri.host) != _registrableDomain(toUri.host) ||
+        (fromUri.scheme.toLowerCase() == 'https' && toUri.scheme.toLowerCase() == 'http');
+    final presigned = _isPresignedStorageUri(toUri);
+    if (!crossDomain && !presigned) return headers;
+    final next = <String, String>{};
+    headers.forEach((k, v) {
+      final lower = k.trim().toLowerCase();
+      if (crossDomain && (lower == 'authorization' || lower == 'cookie' || lower == 'origin')) {
+        return;
+      }
+      if (presigned && lower == 'authorization') {
+        return;
+      }
+      next[k] = v;
+    });
+    return next;
+  }
+
   Future<_FetchedSlice?> _fetchSlice(
     Uri uri,
     Map<String, String> headers, {
@@ -506,6 +564,7 @@ class VideoFormatProbe {
     required int maxBytes,
     bool explicitByteRange = false,
     bool omitRangeRetry = false,
+    int redirectHops = 0,
   }) async {
     if (maxBytes <= 0) return null;
     final isManifest = start == 0 && !explicitByteRange && _isManifestUri(uri);
@@ -517,8 +576,7 @@ class VideoFormatProbe {
     StreamSubscription<List<int>>? sub;
     try {
       req = await client.getUrl(uri).timeout(sliceTimeout);
-      req.followRedirects = true;
-      req.maxRedirects = 5;
+      req.followRedirects = false;
       var hasUa = false;
       headers.forEach((k, v) {
         final lower = k.trim().toLowerCase();
@@ -535,9 +593,42 @@ class VideoFormatProbe {
       }
 
       final res = await req.close().timeout(sliceTimeout);
-      if (res.statusCode == HttpStatus.requestedRangeNotSatisfiable && sendRange && start == 0 && !explicitByteRange) {
+      if (res.statusCode == HttpStatus.movedPermanently ||
+          res.statusCode == HttpStatus.found ||
+          res.statusCode == HttpStatus.seeOther ||
+          res.statusCode == HttpStatus.temporaryRedirect ||
+          res.statusCode == HttpStatus.permanentRedirect) {
+        final location = res.headers.value(HttpHeaders.locationHeader)?.trim() ?? '';
         await res.drain<void>().timeout(sliceTimeout).catchError((Object _) {});
-        return await _fetchSlice(uri, headers, start: 0, maxBytes: maxBytes, omitRangeRetry: true);
+        if (location.isEmpty || redirectHops >= 5) return null;
+        final nextUri = uri.resolve(location);
+        final nextHeaders = _sanitizeHeadersForRedirect(uri, nextUri, headers);
+        return await _fetchSlice(
+          nextUri,
+          nextHeaders,
+          start: start,
+          maxBytes: maxBytes,
+          explicitByteRange: explicitByteRange,
+          omitRangeRetry: omitRangeRetry,
+          redirectHops: redirectHops + 1,
+        );
+      }
+      if ((res.statusCode == HttpStatus.requestedRangeNotSatisfiable ||
+              res.statusCode == HttpStatus.badRequest ||
+              res.statusCode == HttpStatus.forbidden ||
+              res.statusCode == HttpStatus.notImplemented) &&
+          sendRange &&
+          start == 0 &&
+          !explicitByteRange) {
+        await res.drain<void>().timeout(sliceTimeout).catchError((Object _) {});
+        return await _fetchSlice(
+          uri,
+          headers,
+          start: 0,
+          maxBytes: maxBytes,
+          omitRangeRetry: true,
+          redirectHops: redirectHops,
+        );
       }
       if (res.statusCode < 200 || res.statusCode >= 300) {
         await res.drain<void>().timeout(sliceTimeout).catchError((Object _) {});
@@ -546,6 +637,8 @@ class VideoFormatProbe {
 
       final totalBytes = _parseTotalBytes(res, start);
       final contentType = res.headers.contentType?.mimeType.toLowerCase() ?? '';
+      final isMpegUrlContent = start == 0 && !explicitByteRange && contentType.contains('mpegurl');
+      final streamCapBytes = (isManifest || isMpegUrlContent) ? math.max(effectiveMaxBytes, _manifestMaxBytes) : effectiveMaxBytes;
       final builder = BytesBuilder(copy: false);
       final done = Completer<void>();
       VideoDimensions? earlyDimensions;
@@ -555,14 +648,14 @@ class VideoFormatProbe {
       sub = res.listen(
         (chunk) {
           if (done.isCompleted) return;
-          final remaining = effectiveMaxBytes - builder.length;
+          final remaining = streamCapBytes - builder.length;
           if (remaining <= 0) return;
           if (chunk.length <= remaining) {
             builder.add(chunk);
           } else {
             builder.add(chunk.sublist(0, remaining));
           }
-          if (builder.length >= effectiveMaxBytes) {
+          if (builder.length >= streamCapBytes) {
             done.complete();
             unawaited(sub?.cancel().catchError((Object _) {}) ?? Future<void>.value());
             return;
@@ -570,7 +663,7 @@ class VideoFormatProbe {
 
           // Early exit for huge HLS VOD media playlists (> 16 KB or chunked) once first segment is complete;
           // let <= 16 KB playlists finish naturally so their keep-alive socket stays pooled for the segment fetch.
-          if ((isManifest || contentType.contains('mpegurl')) &&
+          if ((isManifest || isMpegUrlContent || builder.length >= 4096) &&
               (res.contentLength < 0 ? builder.length >= 4096 : res.contentLength > 16384)) {
             if (_canStopHlsMediaPlaylistEarly(builder.toBytes())) {
               done.complete();
@@ -582,7 +675,7 @@ class VideoFormatProbe {
           // Incremental early exit for binary streams (.ts / .mp4 / .mkv / .flv): return as soon as dimensions are known
           // without waiting for the rest of the 64 KB Range window.
           if (!isManifest &&
-              !contentType.contains('mpegurl') &&
+              !isMpegUrlContent &&
               !contentType.contains('dash+xml') &&
               builder.length >= 188 &&
               (builder.length - lastIncrementalCheck >= 512 || builder.length <= 2048)) {
@@ -605,7 +698,7 @@ class VideoFormatProbe {
               }
               if (inc.deferredMoovOffset != null &&
                   res.statusCode == HttpStatus.partialContent &&
-                  inc.deferredMoovOffset! > start + effectiveMaxBytes) {
+                  inc.deferredMoovOffset! > start + streamCapBytes) {
                 earlyDeferredMoovOffset = inc.deferredMoovOffset;
                 done.complete();
                 unawaited(sub?.cancel().catchError((Object _) {}) ?? Future<void>.value());
@@ -1500,7 +1593,7 @@ class VideoFormatProbe {
   }
 
   static ({int offset, int packetSize})? _findTsSync(Uint8List bytes) {
-    final maxScan = math.min(bytes.length, 4096);
+    final maxScan = math.min(bytes.length, 32768);
     for (final packetSize in const [188, 192]) {
       final syncOff = packetSize == 192 ? 4 : 0;
       if (bytes.length < packetSize * 2 + syncOff + 1) continue;

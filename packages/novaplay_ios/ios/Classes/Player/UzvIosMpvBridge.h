@@ -16,6 +16,10 @@ typedef struct {
     uint64_t reply_userdata;
     int32_t end_reason;
     int32_t end_error;
+    int32_t prop_format;
+    int64_t prop_int64;
+    double prop_double;
+    bool prop_flag;
 } UzvIosMpvEvent;
 
 /// Probes `NovaMpv.framework` / `Libmpv.framework` via `dlopen` + `dlsym`.
@@ -56,6 +60,14 @@ int uzv_ios_mpv_command5(
 /// Executes a non-blocking asynchronous mpv command when `mpv_command_async` is available (falls back to `mpv_command`).
 int uzv_ios_mpv_command_async2(uzv_mpv_instance *inst, uint64_t userdata, const char *a0, const char *a1);
 int uzv_ios_mpv_command_async3(uzv_mpv_instance *inst, uint64_t userdata, const char *a0, const char *a1, const char *a2);
+int uzv_ios_mpv_command_async4(
+    uzv_mpv_instance *inst,
+    uint64_t userdata,
+    const char *a0,
+    const char *a1,
+    const char *a2,
+    const char *a3
+);
 int uzv_ios_mpv_command_async5(
     uzv_mpv_instance *inst,
     uint64_t userdata,
@@ -71,6 +83,11 @@ int uzv_ios_mpv_set_property_string(uzv_mpv_instance *inst, const char *name, co
 int uzv_ios_mpv_set_property_flag(uzv_mpv_instance *inst, const char *name, bool value);
 int uzv_ios_mpv_set_property_int64(uzv_mpv_instance *inst, const char *name, int64_t value);
 int uzv_ios_mpv_set_property_double(uzv_mpv_instance *inst, const char *name, double value);
+
+int uzv_ios_mpv_set_property_string_async(uzv_mpv_instance *inst, uint64_t userdata, const char *name, const char *value);
+int uzv_ios_mpv_set_property_flag_async(uzv_mpv_instance *inst, uint64_t userdata, const char *name, bool value);
+int uzv_ios_mpv_set_property_int64_async(uzv_mpv_instance *inst, uint64_t userdata, const char *name, int64_t value);
+int uzv_ios_mpv_set_property_double_async(uzv_mpv_instance *inst, uint64_t userdata, const char *name, double value);
 
 bool uzv_ios_mpv_get_property_flag(uzv_mpv_instance *inst, const char *name, bool fallback);
 int64_t uzv_ios_mpv_get_property_int64(uzv_mpv_instance *inst, const char *name, int64_t fallback);

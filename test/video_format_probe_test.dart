@@ -828,6 +828,100 @@ high.m3u8
       expect(await probe.probe(stalledUrl, timeout: const Duration(milliseconds: 500)), isNull);
       expect(sw.elapsedMilliseconds, lessThan(350), reason: 'sliceTimeout aborts stalled body without hanging');
     });
+
+    test('probes disguised HLS .ts segments prefixed with >4 KB fake PNG header', () async {
+      final rawTs = _buildMpegTsWithSps(_buildH264BaselineSps(mbsW: 45, mbsH: 80), streamType: 0x1B);
+      final fakePngPrefix = Uint8List(12 * 1024);
+      fakePngPrefix.setRange(0, 8, const [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+      final disguisedSeg = Uint8List.fromList([...fakePngPrefix, ...rawTs]);
+
+      final pngTsServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => pngTsServer.close(force: true));
+      pngTsServer.listen((req) async {
+        if (req.uri.path == '/drama.m3u8') {
+          req.response
+            ..headers.contentType = ContentType('application', 'vnd.apple.mpegurl')
+            ..write('#EXTM3U\n#EXTINF:4.0,\nseg0.png\n');
+          await req.response.close();
+          return;
+        }
+        if (req.uri.path == '/seg0.png') {
+          req.response
+            ..headers.contentType = ContentType('image', 'png')
+            ..add(disguisedSeg);
+          await req.response.close();
+          return;
+        }
+        req.response.statusCode = 404;
+        await req.response.close();
+      });
+
+      final probe = realProbe();
+      addTearDown(probe.close);
+      expect(await probe.probe('http://127.0.0.1:${pngTsServer.port}/drama.m3u8'), (width: 720, height: 1280));
+    });
+
+    test('retries extensionless HLS playlist on Range 403 and strips Authorization on presigned redirect', () async {
+      final mp4Head = _buildMp4(width: 1080, height: 1920);
+      final edgeServer = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      addTearDown(() => edgeServer.close(force: true));
+      edgeServer.listen((req) async {
+        if (req.uri.path == '/dynamic_hls_stream') {
+          // Simulates dynamic HLS endpoints without .m3u8 suffix that reject Range requests with 403.
+          if (req.headers.value(HttpHeaders.rangeHeader) != null) {
+            req.response.statusCode = HttpStatus.forbidden;
+            await req.response.close();
+            return;
+          }
+          req.response
+            ..headers.contentType = ContentType('application', 'vnd.apple.mpegurl')
+            ..write('#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1200000,RESOLUTION=1080x1920\nhigh.m3u8\n');
+          await req.response.close();
+          return;
+        }
+        if (req.uri.path == '/spider_redirect') {
+          if (req.headers.value(HttpHeaders.authorizationHeader) != 'Bearer spider-secret') {
+            req.response.statusCode = HttpStatus.unauthorized;
+            await req.response.close();
+            return;
+          }
+          req.response.statusCode = HttpStatus.found;
+          req.response.headers.set(
+            HttpHeaders.locationHeader,
+            'http://127.0.0.1:${edgeServer.port}/presigned.mp4?X-Amz-Signature=deadbeef',
+          );
+          await req.response.close();
+          return;
+        }
+        if (req.uri.path == '/presigned.mp4') {
+          // Presigned S3/OSS rejects requests that leak an Authorization header across redirect.
+          if (req.headers.value(HttpHeaders.authorizationHeader) != null) {
+            req.response.statusCode = HttpStatus.forbidden;
+            await req.response.close();
+            return;
+          }
+          req.response
+            ..statusCode = HttpStatus.partialContent
+            ..headers.set(HttpHeaders.contentRangeHeader, 'bytes 0-${mp4Head.length - 1}/${mp4Head.length}')
+            ..add(mp4Head);
+          await req.response.close();
+          return;
+        }
+        req.response.statusCode = 404;
+        await req.response.close();
+      });
+
+      final probe = realProbe();
+      addTearDown(probe.close);
+      expect(await probe.probe('http://127.0.0.1:${edgeServer.port}/dynamic_hls_stream'), (width: 1080, height: 1920));
+      expect(
+        await probe.probe(
+          'http://127.0.0.1:${edgeServer.port}/spider_redirect',
+          headers: const {'Authorization': 'Bearer spider-secret'},
+        ),
+        (width: 1080, height: 1920),
+      );
+    });
   });
 
   group('PlayerLauncher & PlayerSession adaptive launch interaction', () {
@@ -1299,6 +1393,71 @@ high.m3u8
       expect(hostWithoutFastProbe.videoSizes, [(openedSlow.sessionId, 0, 0, 720, 1280)]);
 
       await router.onPageClosed(PageClosedEvent(sessionId: openedSlow.sessionId, positionSeconds: 2, completed: false));
+      await f2;
+    });
+
+    test('parallel wakelock channel latency does not starve fastLaunchBudget probe window', () async {
+      final router = PlayerSessionRouter();
+      final host = _RecordingHost();
+      final probe = VideoFormatProbe(httpClientFactory: HttpClient.new);
+      addTearDown(probe.close);
+      final launcher = PlayerLauncher(
+        configs: PlayerConfigRepository(store: JsonStore('player_config.json', baseDir: dir)),
+        sniffer: SnifferService(),
+        host: host,
+        router: router,
+        formatProbe: probe,
+        fastLaunchBudget: const Duration(milliseconds: 90),
+        installRouter: false,
+        enableWakelock: () async => Future<void>.delayed(const Duration(milliseconds: 110)),
+        disableWakelock: () async {},
+      );
+      final api = _DelayedPlayApi(() async => PlayResult(url: 'http://127.0.0.1:${mediaServer.port}/vertical.m3u8'));
+
+      final playFut = launcher.play(site: site, api: api, detail: makeDetail('parallel_wakelock_ep'), history: history);
+      await Future<void>.delayed(const Duration(milliseconds: 170));
+
+      expect(host.opened, hasLength(1));
+      final opened = host.opened.single;
+      expect((opened.initialSource?.videoWidth, opened.initialSource?.videoHeight), (1080, 1920));
+      await router.onPageClosed(PageClosedEvent(sessionId: opened.sessionId, positionSeconds: 1, completed: false));
+      await playFut;
+    });
+
+    test('closed PlayerSession never overwrites a newly opened session via late provideSource', () async {
+      final router = PlayerSessionRouter();
+      final host = _RecordingHost(router: router);
+      final launcher = buildLauncher(host, router, budget: const Duration(milliseconds: 30));
+
+      final staleGate = Completer<PlayResult>();
+      final slowApi1 = _DelayedPlayApi(() => staleGate.future);
+      final f1 = launcher.play(site: site, api: slowApi1, detail: makeDetail('stale_session_1'), history: history);
+      await Future<void>.delayed(const Duration(milliseconds: 70));
+      expect(host.opened, hasLength(1));
+      final session1Id = host.opened.first.sessionId;
+
+      // Native requests episode on Session 1 (requestId: 1), then user immediately exits Session 1.
+      final epReq1Fut = router.onEpisodeRequest(
+        EpisodeRequest(sessionId: session1Id, requestId: 1, lineIndex: 0, episodeIndex: 0, qualityIndex: 0),
+      );
+      await Future<void>.delayed(const Duration(milliseconds: 15));
+      await router.onPageClosed(PageClosedEvent(sessionId: session1Id, positionSeconds: 0, completed: false));
+      await f1;
+
+      // User opens Session 2 while Session 1's spider promise is still pending.
+      final fastApi2 =
+          _DelayedPlayApi(() async => PlayResult(url: 'http://127.0.0.1:${mediaServer.port}/vertical.m3u8'));
+      final f2 = launcher.play(site: site, api: fastApi2, detail: makeDetail('active_session_2'), history: history);
+      await Future<void>.delayed(const Duration(milliseconds: 70));
+      expect(host.opened, hasLength(2));
+      final session2Id = host.opened.last.sessionId;
+
+      // Session 1's stale spider finally resolves: it MUST NOT call host.provideSource and hijack Session 2!
+      staleGate.complete(const PlayResult(url: 'https://stale.example/hijack.mp4'));
+      await epReq1Fut;
+      expect(host.sources, isEmpty, reason: 'disposed Session 1 must not push stale SourcePayload to active host');
+
+      await router.onPageClosed(PageClosedEvent(sessionId: session2Id, positionSeconds: 3, completed: false));
       await f2;
     });
   });

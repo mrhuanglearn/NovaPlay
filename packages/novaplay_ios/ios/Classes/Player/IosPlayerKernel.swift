@@ -168,10 +168,14 @@ final class PlayerVideoContainerView: UIView {
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    CATransaction.begin()
-    CATransaction.setDisableActions(true)
-    avLayerView.frame = bounds
-    CATransaction.commit()
+    if UIView.inheritedAnimationDuration > 0 {
+      avLayerView.frame = bounds
+    } else {
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      avLayerView.frame = bounds
+      CATransaction.commit()
+    }
     mpvMetalView.frame = bounds
     applyFitLayout()
   }
@@ -308,6 +312,10 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
   private var vlcStatsTimer: Timer?
   private var vlcOpenWatchdog: DispatchWorkItem?
   private var vlcAspectCString: UnsafeMutablePointer<CChar>?
+  private var vlcAppliedAspectRatio: String?
+  private var cachedVlcAudioTracks: [IosTrackOption] = []
+  private var cachedVlcEmbeddedSubtitles: [IosTrackOption] = []
+  private var cachedVlcSubtitlesEnabled: Bool = false
   private var vlcPendingStartMs: Int64 = 0
   private var vlcAppliedInitialSeek: Bool = false
   private var vlcLoadedViaProxy: Bool = false
@@ -1161,9 +1169,17 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     videoOutput = output
 
     observeAvItem(item, startMs: startMs)
+    if let prevItem = avPlayer.currentItem {
+      prevItem.cancelPendingSeeks()
+      prevItem.asset.cancelLoading()
+    }
     avPlayer.preventsDisplaySleepDuringVideoPlayback = true
     avPlayer.replaceCurrentItem(with: item)
 
+    if let prevSec = secondaryAudioPlayer?.currentItem {
+      prevSec.cancelPendingSeeks()
+      prevSec.asset.cancelLoading()
+    }
     secondaryAudioPlayer?.pause()
     secondaryAudioPlayer = nil
     if let audioStr = audioUrl, !audioStr.isEmpty {
@@ -1501,12 +1517,19 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
   private func applyVlcFillAspect(_ fillSize: CGSize) {
     #if canImport(MobileVLCKit)
     guard let player = vlcPlayer else { return }
+    let desiredRatio: String?
+    if fillSize.width > 0 && fillSize.height > 0 {
+      desiredRatio = "\(max(1, Int(fillSize.width.rounded()))):\(max(1, Int(fillSize.height.rounded())))"
+    } else {
+      desiredRatio = nil
+    }
+    guard desiredRatio != vlcAppliedAspectRatio else { return }
+    vlcAppliedAspectRatio = desiredRatio
     if let old = vlcAspectCString {
       free(old)
       vlcAspectCString = nil
     }
-    if fillSize.width > 0 && fillSize.height > 0 {
-      let ratio = "\(max(1, Int(fillSize.width.rounded()))):\(max(1, Int(fillSize.height.rounded())))"
+    if let ratio = desiredRatio {
       let dup = strdup(ratio)
       vlcAspectCString = dup
       player.videoAspectRatio = dup
@@ -1515,6 +1538,47 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     }
     #endif
   }
+
+  #if canImport(MobileVLCKit)
+  fileprivate func refreshVlcTracksCache() {
+    guard let player = vlcPlayer else {
+      cachedVlcAudioTracks = []
+      cachedVlcEmbeddedSubtitles = []
+      cachedVlcSubtitlesEnabled = false
+      return
+    }
+    let subNames = (player.videoSubTitlesNames as Any as? [String]) ?? []
+    let subIndexes = ((player.videoSubTitlesIndexes as Any as? [NSNumber]) ?? []).map { Int($0.int32Value) }
+    let curSub = Int(player.currentVideoSubTitleIndex)
+    cachedVlcSubtitlesEnabled = curSub >= 0
+    var nextSubs: [IosTrackOption] = []
+    for (pos, vlcIdx) in subIndexes.enumerated() where vlcIdx >= 0 {
+      let label = pos < subNames.count ? subNames[pos] : "Track \(vlcIdx)"
+      nextSubs.append(IosTrackOption(
+        index: vlcIdx,
+        label: label,
+        language: nil,
+        selected: curSub == vlcIdx && selectedSubtitleIdx < 10_000
+      ))
+    }
+    cachedVlcEmbeddedSubtitles = nextSubs
+
+    let audNames = (player.audioTrackNames as Any as? [String]) ?? []
+    let audIndexes = ((player.audioTrackIndexes as Any as? [NSNumber]) ?? []).map { Int($0.int32Value) }
+    let curAud = Int(player.currentAudioTrackIndex)
+    var nextAuds: [IosTrackOption] = []
+    for (pos, vlcIdx) in audIndexes.enumerated() where vlcIdx >= 0 {
+      let label = pos < audNames.count ? audNames[pos] : "Audio \(vlcIdx)"
+      nextAuds.append(IosTrackOption(
+        index: vlcIdx,
+        label: label,
+        language: nil,
+        selected: curAud == vlcIdx
+      ))
+    }
+    cachedVlcAudioTracks = nextAuds
+  }
+  #endif
 
   private func parseMediaURL(_ raw: String) -> URL? {
     IosUrlSanitizer.normalizeUrlAndHeaders(rawUrl: raw, headers: [:]).url
@@ -1640,6 +1704,12 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
         guard let self = self, self.isUsingAvPlayer else { return }
         switch it.status {
         case .readyToPlay:
+          let readySz = it.presentationSize
+          if readySz.width > 0 && readySz.height > 0 && readySz != self.videoSize {
+            self.videoSize = readySz
+            self.videoView.naturalVideoSize = readySz
+            self.delegate?.kernelDidUpdateMetrics()
+          }
           self.refreshAvLoadedAssetMetadata(on: it)
           guard self.isUsingAvPlayer else { return }
           let codec = self.videoCodecName ?? "unknown"
@@ -2107,7 +2177,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
       return (mpvEngine?.subtitlesEnabled ?? false) || selectedSubtitleIdx >= 10_000
     }
     #if canImport(MobileVLCKit)
-    if let cur = vlcPlayer?.currentVideoSubTitleIndex, cur >= 0 {
+    if cachedVlcSubtitlesEnabled {
       return true
     }
     #endif
@@ -2143,40 +2213,23 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     }
 
     #if canImport(MobileVLCKit)
-    if (state == "playing" || state == "paused"), let player = vlcPlayer {
-      let names = (player.videoSubTitlesNames as Any as? [String]) ?? []
-      let indexes = ((player.videoSubTitlesIndexes as Any as? [NSNumber]) ?? []).map { Int($0.int32Value) }
-      let current = Int(player.currentVideoSubTitleIndex)
-      var embeddedValidCount = 0
-      for (pos, vlcIdx) in indexes.enumerated() where vlcIdx >= 0 {
-        let label = pos < names.count ? names[pos] : "Track \(vlcIdx)"
-        list.append(IosTrackOption(
-          index: vlcIdx,
-          label: label,
-          language: nil,
-          selected: current == vlcIdx && selectedSubtitleIdx < 10_000
-        ))
-        embeddedValidCount += 1
-      }
-      for (j, side) in sidecarSubtitles.enumerated() {
-        let syntheticIdx = 10_000 + j
-        list.append(IosTrackOption(
-          index: syntheticIdx,
-          label: side.option.name + (embeddedValidCount > 0 ? " (外挂)" : ""),
-          language: side.option.language,
-          selected: selectedSubtitleIdx == syntheticIdx
-        ))
-      }
-    } else {
-      for (j, side) in sidecarSubtitles.enumerated() {
-        let syntheticIdx = 10_000 + j
-        list.append(IosTrackOption(
-          index: syntheticIdx,
-          label: side.option.name,
-          language: side.option.language,
-          selected: selectedSubtitleIdx == syntheticIdx
-        ))
-      }
+    let embeddedValidCount = cachedVlcEmbeddedSubtitles.count
+    for emb in cachedVlcEmbeddedSubtitles {
+      list.append(IosTrackOption(
+        index: emb.index,
+        label: emb.label,
+        language: emb.language,
+        selected: emb.selected && selectedSubtitleIdx < 10_000
+      ))
+    }
+    for (j, side) in sidecarSubtitles.enumerated() {
+      let syntheticIdx = 10_000 + j
+      list.append(IosTrackOption(
+        index: syntheticIdx,
+        label: side.option.name + (embeddedValidCount > 0 ? " (外挂)" : ""),
+        language: side.option.language,
+        selected: selectedSubtitleIdx == syntheticIdx
+      ))
     }
     #endif
     return list
@@ -2213,6 +2266,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
       } else {
         player.currentVideoSubTitleIndex = Int32(index)
       }
+      refreshVlcTracksCache()
     }
     updateCurrentSidecarCue()
     #endif
@@ -2240,24 +2294,10 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     }
 
     #if canImport(MobileVLCKit)
-    if (state == "playing" || state == "paused"), let player = vlcPlayer {
-      let names = (player.audioTrackNames as Any as? [String]) ?? []
-      let indexes = ((player.audioTrackIndexes as Any as? [NSNumber]) ?? []).map { Int($0.int32Value) }
-      let current = Int(player.currentAudioTrackIndex)
-      var result: [IosTrackOption] = []
-      for (pos, vlcIdx) in indexes.enumerated() where vlcIdx >= 0 {
-        let label = pos < names.count ? names[pos] : "Audio \(vlcIdx)"
-        result.append(IosTrackOption(
-          index: vlcIdx,
-          label: label,
-          language: nil,
-          selected: current == vlcIdx
-        ))
-      }
-      return result
-    }
-    #endif
+    return cachedVlcAudioTracks
+    #else
     return []
+    #endif
   }
 
   func selectAudio(_ index: Int) {
@@ -2282,6 +2322,7 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
 
     #if canImport(MobileVLCKit)
     vlcPlayer?.currentAudioTrackIndex = Int32(index)
+    refreshVlcTracksCache()
     #endif
   }
 
@@ -2369,11 +2410,22 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
       return
     }
 
-    if isUsingMpv, let mpvImg = mpvEngine?.captureVideoFrame() {
-      saveImageToPhotos(mpvImg, completion: completion)
+    if isUsingMpv, let engine = mpvEngine {
+      engine.captureVideoFrame { [weak self] mpvImg in
+        guard let self = self else { return }
+        if let mpvImg = mpvImg {
+          self.saveImageToPhotos(mpvImg, completion: completion)
+        } else {
+          self.captureDrawableHierarchyScreenshot(completion: completion)
+        }
+      }
       return
     }
 
+    captureDrawableHierarchyScreenshot(completion: completion)
+  }
+
+  private func captureDrawableHierarchyScreenshot(completion: @escaping (Bool, String) -> Void) {
     // Drawable hierarchy fallback (VLC / Metal view)
     guard videoView.bounds.width > 0, videoView.bounds.height > 0 else {
       completion(false, IosPlayerUiText.t("当前画面无法截图", "No video frame available"))
@@ -2432,8 +2484,16 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     if pipController?.isPictureInPictureActive == true {
       pipController?.stopPictureInPicture()
     }
+    if let item = avPlayer.currentItem {
+      item.cancelPendingSeeks()
+      item.asset.cancelLoading()
+    }
     avPlayer.pause()
     avPlayer.replaceCurrentItem(with: nil)
+    if let secItem = secondaryAudioPlayer?.currentItem {
+      secItem.cancelPendingSeeks()
+      secItem.asset.cancelLoading()
+    }
     secondaryAudioPlayer?.pause()
     secondaryAudioPlayer = nil
   }
@@ -2448,6 +2508,10 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
     vlcOpenWatchdog = nil
     vlcStatsTimer?.invalidate()
     vlcStatsTimer = nil
+    vlcAppliedAspectRatio = nil
+    cachedVlcAudioTracks = []
+    cachedVlcEmbeddedSubtitles = []
+    cachedVlcSubtitlesEnabled = false
     if let p = vlcPlayer {
       p.delegate = nil
       p.drawable = nil
@@ -2515,10 +2579,18 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
           }
         }
         player.rate = self.speed
+        let sz = player.videoSize
+        if sz.width > 0 && sz.height > 0 && sz != self.videoSize {
+          self.videoSize = sz
+          self.videoView.naturalVideoSize = sz
+        }
+        self.refreshVlcTracksCache()
         self.updateState("playing")
+        self.delegate?.kernelDidUpdateMetrics()
       case .paused:
         self.vlcOpenWatchdog?.cancel()
         self.vlcOpenWatchdog = nil
+        self.refreshVlcTracksCache()
         self.updateState("paused")
       case .ended:
         self.vlcOpenWatchdog?.cancel()
@@ -2574,7 +2646,15 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
         }
         self.lastDiagnosticReport = reportLines.joined(separator: "\n")
         self.delegate?.kernelDidFail(message: msg, code: -2)
-      case .stopped, .esAdded:
+      case .esAdded:
+        let sz = player.videoSize
+        if sz.width > 0 && sz.height > 0 && sz != self.videoSize {
+          self.videoSize = sz
+          self.videoView.naturalVideoSize = sz
+        }
+        self.refreshVlcTracksCache()
+        self.delegate?.kernelDidUpdateMetrics()
+      case .stopped:
         break
       @unknown default:
         break
@@ -2590,6 +2670,11 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
       let mediaLen: VLCTime? = player.media?.length
       if let len = mediaLen?.intValue, len > 0 {
         self.durationMs = Int64(len)
+      }
+      let sz = player.videoSize
+      if sz.width > 0 && sz.height > 0 && sz != self.videoSize {
+        self.videoSize = sz
+        self.videoView.naturalVideoSize = sz
       }
       if self.state == "buffering" && player.isPlaying && !self.isSeeking {
         self.updateState("playing")

@@ -255,6 +255,7 @@ class PlayerSession implements NativePlayerFlutterApi {
       }
       _resolvingEpisode = false;
       if (!gate.isCompleted) gate.complete();
+      if (_disposed || _closed.isCompleted) return;
       final url = payload.url?.trim() ?? '';
       if (payload.success && url.isNotEmpty && (payload.videoWidth == null || payload.videoHeight == null)) {
         final hit = formatProbe.cached(url);
@@ -275,6 +276,7 @@ class PlayerSession implements NativePlayerFlutterApi {
     } catch (e) {
       _resolvingEpisode = false;
       if (!gate.isCompleted) gate.complete();
+      if (_disposed || _closed.isCompleted) return;
       await host.provideSource(SourcePayload(requestId: request.requestId, success: false, errorMessage: describeError(e)));
     }
   }
@@ -495,17 +497,18 @@ class PlayerSession implements NativePlayerFlutterApi {
 
   @override
   Future<void> onDanmakuRequest(DanmakuRequest request) async {
-    if (_pushedByVideo) return;
+    if (_pushedByVideo || _disposed || _closed.isCompleted) return;
     if (_episodeResolved != null && !_episodeResolved!.isCompleted) {
       await _episodeResolved!.future.timeout(const Duration(seconds: 15), onTimeout: () {});
     }
-    if (_pushedByVideo) return;
+    if (_pushedByVideo || _disposed || _closed.isCompleted) return;
     if (await (preferVideoDanmu?.call() ?? Future.value(false))) {
       try {
         var direct = _episodeDanmuComments;
         if (direct.isEmpty && _episodeDanmuUrl != null) {
           direct = await fetchVideoDanmakuUrl(_episodeDanmuUrl!, headers: _episodeHeaders);
         }
+        if (_disposed || _closed.isCompleted) return;
         if (direct.isNotEmpty) {
           await host.updateDanmaku(DanmakuPayload(
             sessionId: sessionId,
@@ -519,7 +522,7 @@ class PlayerSession implements NativePlayerFlutterApi {
       }
     }
     final client = await _client();
-    if (client == null) return;
+    if (client == null || _disposed || _closed.isCompleted) return;
     try {
       final key = source.memoryKey;
       _anime ??= (key == null ? null : await refs?.get(key));
@@ -534,7 +537,7 @@ class PlayerSession implements NativePlayerFlutterApi {
       if (request.episodeIndex < 0 || request.episodeIndex >= eps.length) return;
       final ep = eps[request.episodeIndex];
       final list = await client.comments(ep.episodeId);
-      if (_pushedByVideo) return;
+      if (_pushedByVideo || _disposed || _closed.isCompleted) return;
       await host.updateDanmaku(DanmakuPayload(
         sessionId: sessionId,
         commentsJson: danmuCommentsToJson(list),
@@ -548,6 +551,7 @@ class PlayerSession implements NativePlayerFlutterApi {
 
   /// A script pushed comments through the `danmuPush` callback (payload shape inferred, see DartActions).
   Future<void> pushDanmaku(List<DanmuComment> comments, {String? title}) {
+    if (_disposed || _closed.isCompleted) return Future<void>.value();
     _pushedByVideo = true;
     return host.updateDanmaku(
         DanmakuPayload(sessionId: sessionId, commentsJson: danmuCommentsToJson(comments), animeTitle: title));

@@ -18,7 +18,6 @@ final class MpvMetalView: UIView {
   }
 
   var onLayoutReady: (() -> Void)?
-  var onDrawableSizeChanged: ((CGSize) -> Void)?
 
   override init(frame: CGRect) {
     super.init(frame: frame)
@@ -38,6 +37,8 @@ final class MpvMetalView: UIView {
     metalLayer.pixelFormat = .bgra8Unorm
     metalLayer.framebufferOnly = false
     metalLayer.isOpaque = true
+    metalLayer.presentsWithTransaction = false
+    metalLayer.allowsNextDrawableTimeout = true
     metalLayer.backgroundColor = UIColor.black.cgColor
     metalLayer.contentsScale = scale
     metalLayer.contentsGravity = .resizeAspect
@@ -51,7 +52,9 @@ final class MpvMetalView: UIView {
   override func layoutSubviews() {
     super.layoutSubviews()
     let scale = window?.screen.nativeScale ?? UIScreen.main.nativeScale
-    metalLayer.contentsScale = scale
+    if metalLayer.contentsScale != scale {
+      metalLayer.contentsScale = scale
+    }
     if bounds.width > 1 && bounds.height > 1 {
       let target = CGSize(
         width: (bounds.width * scale).rounded(),
@@ -59,7 +62,6 @@ final class MpvMetalView: UIView {
       )
       if metalLayer.drawableSize != target {
         metalLayer.drawableSize = target
-        onDrawableSizeChanged?(target)
       }
       if let cb = onLayoutReady {
         onLayoutReady = nil
@@ -80,13 +82,22 @@ private struct MpvParsedTrack {
   let type: String
   let lang: String?
   let title: String?
-  let selected: Bool
+  var selected: Bool
   let isDefault: Bool
   let isExternal: Bool
   let channels: Int
 }
 
+private struct MpvMetadataSnapshot {
+  let videoSize: CGSize?
+  let nominalFps: Double?
+  let videoCodecName: String?
+}
+
 /// Native iOS `libmpv` playback engine driving `UzvIosMpvBridge` on a `MpvMetalView`.
+///
+/// All `libmpv` C calls execute off the UI thread on a dedicated serial `mpvQueue` (plus the blocking `wait_event`
+/// thread), eliminating main-thread <-> MoltenVK `CAMetalLayer` swapchain deadlocks during rotation and stalls.
 final class IosMpvEngine {
   static var isAvailable: Bool {
     uzv_ios_mpv_is_available()
@@ -98,14 +109,22 @@ final class IosMpvEngine {
 
   weak var delegate: IosMpvEngineDelegate?
   private weak var metalView: MpvMetalView?
+  /// Retained across async `mpv_terminate_destroy` so MoltenVK's `wid` (`CAMetalLayer*`) never dangles on close.
+  private var metalLayerRef: CAMetalLayer?
+  private let metalLayerWid: Int64
 
-  private var instance: OpaquePointer?
+  private let mpvQueue = DispatchQueue(label: "app.novaplay.mpv.cmd", qos: .userInitiated)
+  /// Accessed exclusively on `mpvQueue` (except `uzv_ios_mpv_wakeup` under `lock` during `destroy()`).
+  private var workerInst: OpaquePointer?
+  private var wakeupInst: OpaquePointer?
   private let lock = NSLock()
   private var isRunningEvents = false
+  private var isDestroyed = false
+  private var statsInFlight = false
+  private var sharedLoadSerial: UInt64 = 0
   private let eventExitGroup = DispatchGroup()
 
   private var pendingLoadClosure: (() -> Void)?
-  private var loadSerial: UInt64 = 0
   private var awaitingStartFile = false
   private var fileLoaded = false
   private var loadingFile = false
@@ -115,15 +134,18 @@ final class IosMpvEngine {
   private var isSeeking = false
   private var lastPublishedState = "idle"
 
+  // Worker-queue-only HTTP header override tracking
   private var defaultUserAgent: String = "Mozilla/5.0"
   private var userAgentOverridden = false
   private var referrerOverridden = false
-  private var pendingSidecars: [SubtitleOption] = []
-  private var pendingExternalAudioUrl: String?
+  private var workerFileLoaded = false
+
   private var subtitlesDisabledByUser = false
   private var preferredAudioLang: String?
   private var preferredSubtitleLang: String?
   private var preferredSubtitleFont: String?
+  private var cachedSubtitleParsedTracks: [MpvParsedTrack] = []
+  private var cachedAudioParsedTracks: [MpvParsedTrack] = []
 
   private(set) var positionMs: Int64 = 0
   private(set) var durationMs: Int64 = 0
@@ -136,21 +158,34 @@ final class IosMpvEngine {
 
   var hwDecode: Bool = true {
     didSet {
-      guard oldValue != hwDecode, let inst = instance else { return }
-      _ = uzv_ios_mpv_set_property_string(inst, "hwdec", hwDecode ? "videotoolbox-copy" : "no")
+      guard oldValue != hwDecode else { return }
+      let hw = hwDecode
+      mpvQueue.async { [weak self] in
+        guard let self = self, let inst = self.workerInst else { return }
+        _ = uzv_ios_mpv_set_property_string_async(inst, 0, "hwdec", hw ? "videotoolbox-copy" : "no")
+      }
     }
   }
 
   var fitMode: String = "fit" {
     didSet {
-      applyFitMode()
+      guard oldValue != fitMode else { return }
+      let mode = fitMode
+      mpvQueue.async { [weak self] in
+        guard let self = self, let inst = self.workerInst else { return }
+        self.applyFitModeOnQueue(inst: inst, mode: mode)
+      }
     }
   }
 
   var speed: Float = 1.0 {
     didSet {
-      guard let inst = instance, speed > 0 else { return }
-      _ = uzv_ios_mpv_set_property_double(inst, "speed", Double(speed))
+      guard speed > 0, abs(oldValue - speed) > 0.0005 else { return }
+      let sp = Double(speed)
+      mpvQueue.async { [weak self] in
+        guard let self = self, let inst = self.workerInst else { return }
+        _ = uzv_ios_mpv_set_property_double_async(inst, 0, "speed", sp)
+      }
     }
   }
 
@@ -165,16 +200,20 @@ final class IosMpvEngine {
   private static let obsVideoW: UInt64 = 5
   private static let obsVideoH: UInt64 = 6
   private static let obsVideoRotate: UInt64 = 7
+  private static let obsTrackCount: UInt64 = 8
+  private static let obsAid: UInt64 = 9
+  private static let obsSid: UInt64 = 10
   private var bgObserver: NSObjectProtocol?
 
   init(metalView: MpvMetalView, hwDecode: Bool, fitMode: String, speed: Float) {
     self.metalView = metalView
+    let layer = metalView.metalLayer
+    self.metalLayerRef = layer
+    let layerPtr = Unmanaged.passUnretained(layer).toOpaque()
+    self.metalLayerWid = Int64(Int(bitPattern: layerPtr))
     self.hwDecode = hwDecode
     self.fitMode = fitMode
     self.speed = speed
-    metalView.onDrawableSizeChanged = { [weak self] _ in
-      self?.applyFitMode()
-    }
     self.bgObserver = NotificationCenter.default.addObserver(
       forName: UIApplication.didEnterBackgroundNotification,
       object: nil,
@@ -191,18 +230,38 @@ final class IosMpvEngine {
     }
   }
 
-  private func createInitializedHandle(view: MpvMetalView, vo: String) -> (OpaquePointer?, String?) {
+  private func bumpLoadSerial() -> UInt64 {
+    lock.lock()
+    sharedLoadSerial &+= 1
+    let s = sharedLoadSerial
+    lock.unlock()
+    return s
+  }
+
+  private func currentLoadSerial() -> UInt64 {
+    lock.lock()
+    let s = sharedLoadSerial
+    lock.unlock()
+    return s
+  }
+
+  private func isCurrentlyDestroyed() -> Bool {
+    lock.lock()
+    let d = isDestroyed
+    lock.unlock()
+    return d
+  }
+
+  private func createInitializedHandleOnQueue(wid: Int64, hw: Bool, vo: String) -> (OpaquePointer?, String?) {
     guard let inst = uzv_ios_mpv_create() else {
       return (nil, "libmpv unavailable (\(Self.probeDetail))")
     }
 
-    let layerPtr = Unmanaged.passUnretained(view.metalLayer).toOpaque()
-    let wid = Int64(Int(bitPattern: layerPtr))
     _ = uzv_ios_mpv_set_option_int64(inst, "wid", wid)
     _ = uzv_ios_mpv_set_option_string(inst, "vo", vo)
     _ = uzv_ios_mpv_set_option_string(inst, "gpu-api", "vulkan")
     _ = uzv_ios_mpv_set_option_string(inst, "gpu-context", "moltenvk")
-    _ = uzv_ios_mpv_set_option_string(inst, "hwdec", hwDecode ? "videotoolbox-copy" : "no")
+    _ = uzv_ios_mpv_set_option_string(inst, "hwdec", hw ? "videotoolbox-copy" : "no")
     _ = uzv_ios_mpv_set_option_string(inst, "hwdec-codecs", "all")
     _ = uzv_ios_mpv_set_option_string(inst, "vd-lavc-threads", "0")
     _ = uzv_ios_mpv_set_option_string(inst, "idle", "yes")
@@ -238,17 +297,25 @@ final class IosMpvEngine {
     return (inst, nil)
   }
 
-  private func ensureInitialized() -> String? {
-    if instance != nil { return nil }
-    guard let view = metalView else {
+  private func ensureInitializedOnQueue(
+    hw: Bool,
+    fit: String,
+    sp: Double,
+    aLang: String?,
+    sLang: String?,
+    sFont: String?
+  ) -> String? {
+    if workerInst != nil { return nil }
+    if isCurrentlyDestroyed() { return "MPV engine destroyed" }
+    guard metalLayerRef != nil, metalLayerWid != 0 else {
       return "MPV rendering view missing"
     }
 
     var activeVo = "gpu-next"
-    var (maybeInst, firstErr) = createInitializedHandle(view: view, vo: activeVo)
+    var (maybeInst, firstErr) = createInitializedHandleOnQueue(wid: metalLayerWid, hw: hw, vo: activeVo)
     if maybeInst == nil {
       activeVo = "gpu"
-      let (fallbackInst, fallbackErr) = createInitializedHandle(view: view, vo: activeVo)
+      let (fallbackInst, fallbackErr) = createInitializedHandleOnQueue(wid: metalLayerWid, hw: hw, vo: activeVo)
       maybeInst = fallbackInst
       if maybeInst == nil {
         return fallbackErr ?? firstErr ?? "mpv_initialize failed"
@@ -258,22 +325,32 @@ final class IosMpvEngine {
       return firstErr ?? "mpv_initialize failed"
     }
 
-    instance = inst
+    if isCurrentlyDestroyed() {
+      uzv_ios_mpv_destroy(inst)
+      return "MPV engine destroyed"
+    }
+
+    workerInst = inst
+    lock.lock()
+    wakeupInst = inst
+    isRunningEvents = true
+    lock.unlock()
+
     if let ua = getString(inst, "user-agent"), !ua.isEmpty {
       defaultUserAgent = ua
     }
-    applyFitMode()
-    if speed > 0 {
-      _ = uzv_ios_mpv_set_property_double(inst, "speed", Double(speed))
+    applyFitModeOnQueue(inst: inst, mode: fit)
+    if sp > 0 {
+      _ = uzv_ios_mpv_set_property_double_async(inst, 0, "speed", sp)
     }
-    if let aLang = preferredAudioLang {
-      _ = uzv_ios_mpv_set_property_string(inst, "alang", aLang)
+    if let aLang = aLang {
+      _ = uzv_ios_mpv_set_property_string_async(inst, 0, "alang", aLang)
     }
-    if let sLang = preferredSubtitleLang {
-      _ = uzv_ios_mpv_set_property_string(inst, "slang", sLang)
+    if let sLang = sLang {
+      _ = uzv_ios_mpv_set_property_string_async(inst, 0, "slang", sLang)
     }
-    if let sFont = preferredSubtitleFont, !sFont.isEmpty {
-      _ = uzv_ios_mpv_set_property_string(inst, "sub-font", sFont)
+    if let sFont = sFont, !sFont.isEmpty {
+      _ = uzv_ios_mpv_set_property_string_async(inst, 0, "sub-font", sFont)
     }
 
     _ = uzv_ios_mpv_observe_property(inst, Self.obsTimePos, "time-pos", 5)
@@ -283,18 +360,20 @@ final class IosMpvEngine {
     _ = uzv_ios_mpv_observe_property(inst, Self.obsVideoW, "video-params/w", 4)
     _ = uzv_ios_mpv_observe_property(inst, Self.obsVideoH, "video-params/h", 4)
     _ = uzv_ios_mpv_observe_property(inst, Self.obsVideoRotate, "video-params/rotate", 4)
-
-    lock.lock()
-    isRunningEvents = true
-    lock.unlock()
+    _ = uzv_ios_mpv_observe_property(inst, Self.obsTrackCount, "track-list/count", 4)
+    _ = uzv_ios_mpv_observe_property(inst, Self.obsAid, "aid", 0)
+    _ = uzv_ios_mpv_observe_property(inst, Self.obsSid, "sid", 0)
 
     eventExitGroup.enter()
     DispatchQueue.global(qos: .userInitiated).async { [weak self] in
       self?.runEventLoop(inst: inst)
     }
 
-    startStatsTimer()
-    mpvUsbLog.notice("[NovaPlay][MPV] initialized vo=\(activeVo, privacy: .public) hwdec=\(self.hwDecode, privacy: .public)")
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self, !self.isCurrentlyDestroyed() else { return }
+      self.startStatsTimer()
+    }
+    mpvUsbLog.notice("[NovaPlay][MPV] initialized vo=\(activeVo, privacy: .public) hwdec=\(hw, privacy: .public)")
     return nil
   }
 
@@ -305,11 +384,17 @@ final class IosMpvEngine {
     startMs: Int64,
     subtitles: [SubtitleOption]
   ) {
-    loadSerial &+= 1
-    let serial = loadSerial
+    let serial = bumpLoadSerial()
     let executeLoad = { [weak self] in
-      guard let self = self, self.loadSerial == serial else { return }
-      self.performLoadNow(url: url, audioUrl: audioUrl, headers: headers, startMs: startMs, subtitles: subtitles)
+      guard let self = self, self.currentLoadSerial() == serial else { return }
+      self.scheduleLoadOnWorker(
+        serial: serial,
+        url: url,
+        audioUrl: audioUrl,
+        headers: headers,
+        startMs: startMs,
+        subtitles: subtitles
+      )
     }
 
     if let view = metalView, view.bounds.width > 1 && view.bounds.height > 1 {
@@ -322,7 +407,7 @@ final class IosMpvEngine {
         job()
       }
       DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
-        guard let self = self, self.loadSerial == serial, let job = self.pendingLoadClosure else { return }
+        guard let self = self, self.currentLoadSerial() == serial, let job = self.pendingLoadClosure else { return }
         self.pendingLoadClosure = nil
         self.metalView?.onLayoutReady = nil
         job()
@@ -330,29 +415,20 @@ final class IosMpvEngine {
     }
   }
 
-  private func performLoadNow(
+  private func scheduleLoadOnWorker(
+    serial: UInt64,
     url: String,
     audioUrl: String?,
     headers: [String: String],
     startMs: Int64,
     subtitles: [SubtitleOption]
   ) {
-    if let initErr = ensureInitialized() {
-      mpvUsbLog.error("[NovaPlay][MPV] init error: \(initErr, privacy: .public)")
-      delegate?.mpvEngineDidFail(
-        message: "MPV " + IosPlayerUiText.t("初始化失败", "init failed"),
-        diagnostic: initErr,
-        code: -3
-      )
-      return
-    }
-    guard let inst = instance else { return }
-
+    let inBackground = UIApplication.shared.applicationState == .background
     awaitingStartFile = true
     fileLoaded = false
     loadingFile = true
     reachedEof = false
-    userPaused = false
+    userPaused = inBackground
     pausedForCache = false
     isSeeking = false
     positionMs = max(0, startMs)
@@ -362,8 +438,74 @@ final class IosMpvEngine {
     videoCodecName = nil
     downloadBytesPerSec = 0
     videoBitrateBps = 0
-    pendingSidecars = subtitles
-    pendingExternalAudioUrl = nil
+    cachedAudioParsedTracks = []
+    cachedSubtitleParsedTracks = []
+    publishStateIfNeeded()
+
+    let hw = hwDecode
+    let fit = fitMode
+    let sp = Double(speed)
+    let subsDisabled = subtitlesDisabledByUser
+    let aLang = preferredAudioLang
+    let sLang = preferredSubtitleLang
+    let sFont = preferredSubtitleFont
+
+    mpvQueue.async { [weak self] in
+      guard let self = self, self.currentLoadSerial() == serial, !self.isCurrentlyDestroyed() else { return }
+      self.performLoadOnQueue(
+        serial: serial,
+        url: url,
+        audioUrl: audioUrl,
+        headers: headers,
+        startMs: startMs,
+        subtitles: subtitles,
+        inBackground: inBackground,
+        hw: hw,
+        fit: fit,
+        sp: sp,
+        subsDisabled: subsDisabled,
+        aLang: aLang,
+        sLang: sLang,
+        sFont: sFont
+      )
+    }
+  }
+
+  private func performLoadOnQueue(
+    serial: UInt64,
+    url: String,
+    audioUrl: String?,
+    headers: [String: String],
+    startMs: Int64,
+    subtitles: [SubtitleOption],
+    inBackground: Bool,
+    hw: Bool,
+    fit: String,
+    sp: Double,
+    subsDisabled: Bool,
+    aLang: String?,
+    sLang: String?,
+    sFont: String?
+  ) {
+    if let initErr = ensureInitializedOnQueue(hw: hw, fit: fit, sp: sp, aLang: aLang, sLang: sLang, sFont: sFont) {
+      mpvUsbLog.error("[NovaPlay][MPV] init error: \(initErr, privacy: .public)")
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self, self.currentLoadSerial() == serial else { return }
+        self.loadingFile = false
+        self.awaitingStartFile = false
+        self.delegate?.mpvEngineDidFail(
+          message: "MPV " + IosPlayerUiText.t("初始化失败", "init failed"),
+          diagnostic: initErr,
+          code: -3
+        )
+      }
+      return
+    }
+    guard let inst = workerInst, currentLoadSerial() == serial else { return }
+
+    workerFileLoaded = false
+    pendingWorkerSidecars = subtitles
+    pendingWorkerExternalAudioUrl = nil
 
     var headerLines: [String] = []
     var reqUA: String?
@@ -389,7 +531,7 @@ final class IosMpvEngine {
       }
     }
 
-    _ = setListOption(inst, name: "http-header-fields", values: headerLines)
+    _ = setListOptionOnQueue(inst, name: "http-header-fields", values: headerLines)
     if let ua = reqUA, !ua.isEmpty {
       _ = uzv_ios_mpv_set_property_string(inst, "user-agent", ua)
       userAgentOverridden = true
@@ -408,24 +550,22 @@ final class IosMpvEngine {
 
     let cleanAudio = (audioUrl ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
     if !cleanAudio.isEmpty {
-      let rc = setListOption(inst, name: "audio-files", values: [cleanAudio])
+      let rc = setListOptionOnQueue(inst, name: "audio-files", values: [cleanAudio])
       if rc < 0 {
-        pendingExternalAudioUrl = cleanAudio
+        pendingWorkerExternalAudioUrl = cleanAudio
       }
     } else {
-      _ = setListOption(inst, name: "audio-files", values: [])
+      _ = setListOptionOnQueue(inst, name: "audio-files", values: [])
     }
 
-    _ = uzv_ios_mpv_set_property_string(inst, "hwdec", hwDecode ? "videotoolbox-copy" : "no")
-    _ = uzv_ios_mpv_set_property_string(inst, "sid", subtitlesDisabledByUser ? "no" : "auto")
+    _ = uzv_ios_mpv_set_property_string(inst, "hwdec", hw ? "videotoolbox-copy" : "no")
+    _ = uzv_ios_mpv_set_property_string(inst, "sid", subsDisabled ? "no" : "auto")
     _ = uzv_ios_mpv_set_property_string(inst, "aid", "auto")
-    let inBackground = UIApplication.shared.applicationState == .background
-    userPaused = inBackground
     _ = uzv_ios_mpv_set_property_flag(inst, "pause", inBackground)
-    if speed > 0 {
-      _ = uzv_ios_mpv_set_property_double(inst, "speed", Double(speed))
+    if sp > 0 {
+      _ = uzv_ios_mpv_set_property_double(inst, "speed", sp)
     }
-    applyFitMode()
+    applyFitModeOnQueue(inst: inst, mode: fit)
 
     let startOpt = String(format: "start=%.3f", Double(max(0, startMs)) / 1000.0)
     var loadRc = uzv_ios_mpv_command_async5(inst, 0, "loadfile", url, "replace", "-1", startOpt)
@@ -433,20 +573,24 @@ final class IosMpvEngine {
       loadRc = uzv_ios_mpv_command4(inst, "loadfile", url, "replace", startOpt)
     }
     if loadRc < 0 {
-      loadingFile = false
-      awaitingStartFile = false
       let errStr = String(cString: uzv_ios_mpv_error_string(Int32(loadRc)))
-      delegate?.mpvEngineDidFail(
-        message: "MPV " + IosPlayerUiText.t("加载失败", "load failed") + " (\(errStr))",
-        diagnostic: "mpv loadfile rc=\(loadRc): \(errStr)",
-        code: Int(loadRc)
-      )
-      return
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self, self.currentLoadSerial() == serial else { return }
+        self.loadingFile = false
+        self.awaitingStartFile = false
+        self.delegate?.mpvEngineDidFail(
+          message: "MPV " + IosPlayerUiText.t("加载失败", "load failed") + " (\(errStr))",
+          diagnostic: "mpv loadfile rc=\(loadRc): \(errStr)",
+          code: Int(loadRc)
+        )
+      }
     }
-    publishStateIfNeeded()
   }
 
-  private func setListOption(_ inst: OpaquePointer, name: String, values: [String]) -> Int32 {
+  private var pendingWorkerSidecars: [SubtitleOption] = []
+  private var pendingWorkerExternalAudioUrl: String?
+
+  private func setListOptionOnQueue(_ inst: OpaquePointer, name: String, values: [String]) -> Int32 {
     var rc = uzv_ios_mpv_command4(inst, "change-list", name, "clr", "")
     for item in values {
       let r = uzv_ios_mpv_command4(inst, "change-list", name, "append", item)
@@ -455,11 +599,10 @@ final class IosMpvEngine {
     return rc
   }
 
-  private func applyFitMode() {
-    guard let inst = instance else { return }
+  private func applyFitModeOnQueue(inst: OpaquePointer, mode: String) {
     let keepAspect: Bool
     let panscan: Double
-    switch fitMode {
+    switch mode {
     case "fill":
       keepAspect = false
       panscan = 0.0
@@ -470,76 +613,92 @@ final class IosMpvEngine {
       keepAspect = true
       panscan = 0.0
     }
-    _ = uzv_ios_mpv_set_property_flag(inst, "keepaspect", keepAspect)
-    _ = uzv_ios_mpv_set_property_double(inst, "panscan", panscan)
+    _ = uzv_ios_mpv_set_property_flag_async(inst, 0, "keepaspect", keepAspect)
+    _ = uzv_ios_mpv_set_property_double_async(inst, 0, "panscan", panscan)
   }
 
   func play() {
-    guard let inst = instance else { return }
     if UIApplication.shared.applicationState == .background {
       pause()
       return
     }
     userPaused = false
-    _ = uzv_ios_mpv_set_property_flag(inst, "pause", false)
-    if speed > 0 {
-      _ = uzv_ios_mpv_set_property_double(inst, "speed", Double(speed))
-    }
+    let sp = Double(speed)
     publishStateIfNeeded()
-  }
-
-  func pause() {
-    guard let inst = instance else { return }
-    userPaused = true
-    _ = uzv_ios_mpv_set_property_flag(inst, "pause", true)
-    publishStateIfNeeded()
-  }
-
-  func seekTo(_ ms: Int64) {
-    guard let inst = instance else { return }
-    let clamped = durationMs > 0 ? min(max(0, ms), durationMs) : max(0, ms)
-    positionMs = clamped
-    isSeeking = true
-    let secStr = String(format: "%.3f", Double(clamped) / 1000.0)
-    _ = uzv_ios_mpv_command_async3(inst, 0, "seek", secStr, "absolute")
-    publishStateIfNeeded()
-  }
-
-  func addExternalSubtitle(_ sub: SubtitleOption) {
-    pendingSidecars.append(sub)
-    guard let inst = instance, fileLoaded else { return }
-    _ = uzv_ios_mpv_command5(inst, "sub-add", sub.url, "select", sub.name, sub.language ?? "")
-    subtitlesDisabledByUser = false
-  }
-
-  func applyAudioPreference(lang: String?) {
-    preferredAudioLang = lang?.trimmingCharacters(in: .whitespacesAndNewlines)
-    if let inst = instance {
-      _ = uzv_ios_mpv_set_property_string(inst, "alang", preferredAudioLang ?? "")
-    }
-  }
-
-  func applySubtitlePreferences(lang: String?, fontFamily: String?) {
-    preferredSubtitleLang = lang?.trimmingCharacters(in: .whitespacesAndNewlines)
-    preferredSubtitleFont = fontFamily?.trimmingCharacters(in: .whitespacesAndNewlines)
-    if let inst = instance {
-      _ = uzv_ios_mpv_set_property_string(inst, "slang", preferredSubtitleLang ?? "")
-      if let font = preferredSubtitleFont, !font.isEmpty {
-        _ = uzv_ios_mpv_set_property_string(inst, "sub-font", font)
+    mpvQueue.async { [weak self] in
+      guard let self = self, let inst = self.workerInst else { return }
+      _ = uzv_ios_mpv_set_property_flag_async(inst, 0, "pause", false)
+      if sp > 0 {
+        _ = uzv_ios_mpv_set_property_double_async(inst, 0, "speed", sp)
       }
     }
   }
 
-  // MARK: - Tracks
+  func pause() {
+    userPaused = true
+    publishStateIfNeeded()
+    mpvQueue.async { [weak self] in
+      guard let self = self, let inst = self.workerInst else { return }
+      _ = uzv_ios_mpv_set_property_flag_async(inst, 0, "pause", true)
+    }
+  }
 
-  private func parseTracks(ofType targetType: String) -> [MpvParsedTrack] {
-    guard let inst = instance else { return [] }
+  func seekTo(_ ms: Int64) {
+    let clamped = durationMs > 0 ? min(max(0, ms), durationMs) : max(0, ms)
+    positionMs = clamped
+    isSeeking = true
+    let secStr = String(format: "%.3f", Double(clamped) / 1000.0)
+    publishStateIfNeeded()
+    mpvQueue.async { [weak self] in
+      guard let self = self, let inst = self.workerInst else { return }
+      _ = uzv_ios_mpv_command_async3(inst, 0, "seek", secStr, "absolute")
+    }
+  }
+
+  func addExternalSubtitle(_ sub: SubtitleOption) {
+    subtitlesDisabledByUser = false
+    let serial = currentLoadSerial()
+    mpvQueue.async { [weak self] in
+      guard let self = self, self.currentLoadSerial() == serial else { return }
+      self.pendingWorkerSidecars.append(sub)
+      guard let inst = self.workerInst, self.workerFileLoaded else { return }
+      _ = uzv_ios_mpv_command_async5(inst, 0, "sub-add", sub.url, "select", sub.name, sub.language ?? "")
+    }
+  }
+
+  func applyAudioPreference(lang: String?) {
+    let trimmed = lang?.trimmingCharacters(in: .whitespacesAndNewlines)
+    preferredAudioLang = trimmed
+    mpvQueue.async { [weak self] in
+      guard let self = self, let inst = self.workerInst else { return }
+      _ = uzv_ios_mpv_set_property_string_async(inst, 0, "alang", trimmed ?? "")
+    }
+  }
+
+  func applySubtitlePreferences(lang: String?, fontFamily: String?) {
+    let trimmedLang = lang?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let trimmedFont = fontFamily?.trimmingCharacters(in: .whitespacesAndNewlines)
+    preferredSubtitleLang = trimmedLang
+    preferredSubtitleFont = trimmedFont
+    mpvQueue.async { [weak self] in
+      guard let self = self, let inst = self.workerInst else { return }
+      _ = uzv_ios_mpv_set_property_string_async(inst, 0, "slang", trimmedLang ?? "")
+      if let font = trimmedFont, !font.isEmpty {
+        _ = uzv_ios_mpv_set_property_string_async(inst, 0, "sub-font", font)
+      }
+    }
+  }
+
+  // MARK: - Tracks (Cached on Main Thread; Queried on `mpvQueue`)
+
+  private func parseAllTracksOnQueue(inst: OpaquePointer) -> (subs: [MpvParsedTrack], audios: [MpvParsedTrack]) {
     let count = Int(uzv_ios_mpv_get_property_int64(inst, "track-list/count", 0))
-    guard count > 0 else { return [] }
-    var out: [MpvParsedTrack] = []
+    guard count > 0 else { return ([], []) }
+    var subs: [MpvParsedTrack] = []
+    var audios: [MpvParsedTrack] = []
     for i in 0..<count {
       let prefix = "track-list/\(i)/"
-      guard let type = getString(inst, prefix + "type"), type == targetType else { continue }
+      guard let type = getString(inst, prefix + "type"), type == "sub" || type == "audio" else { continue }
       let id = Int(uzv_ios_mpv_get_property_int64(inst, prefix + "id", -1))
       guard id >= 0 else { continue }
       let lang = getString(inst, prefix + "lang")?.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -547,8 +706,8 @@ final class IosMpvEngine {
       let selected = uzv_ios_mpv_get_property_flag(inst, prefix + "selected", false)
       let isDef = uzv_ios_mpv_get_property_flag(inst, prefix + "default", false)
       let isExt = uzv_ios_mpv_get_property_flag(inst, prefix + "external", false)
-      let ch = Int(uzv_ios_mpv_get_property_int64(inst, prefix + "demux-channel-count", 0))
-      out.append(MpvParsedTrack(
+      let ch = type == "audio" ? Int(uzv_ios_mpv_get_property_int64(inst, prefix + "demux-channel-count", 0)) : 0
+      let track = MpvParsedTrack(
         id: id,
         type: type,
         lang: (lang?.isEmpty == false) ? lang : nil,
@@ -557,18 +716,22 @@ final class IosMpvEngine {
         isDefault: isDef,
         isExternal: isExt,
         channels: ch
-      ))
+      )
+      if type == "sub" {
+        subs.append(track)
+      } else {
+        audios.append(track)
+      }
     }
-    return out
+    return (subs, audios)
   }
 
   var subtitlesEnabled: Bool {
-    !subtitlesDisabledByUser && parseTracks(ofType: "sub").contains(where: { $0.selected })
+    !subtitlesDisabledByUser && cachedSubtitleParsedTracks.contains(where: { $0.selected })
   }
 
   func subtitleTracks() -> [IosTrackOption] {
-    let subs = parseTracks(ofType: "sub")
-    return subs.enumerated().map { idx, t in
+    cachedSubtitleParsedTracks.enumerated().map { idx, t in
       var parts: [String] = []
       if let title = t.title { parts.append(title) }
       if let lang = t.lang, !parts.contains(lang) { parts.append(lang) }
@@ -584,21 +747,31 @@ final class IosMpvEngine {
   }
 
   func selectSubtitle(_ index: Int) {
-    guard let inst = instance else { return }
     if index < 0 {
       subtitlesDisabledByUser = true
-      _ = uzv_ios_mpv_set_property_string(inst, "sid", "no")
+      for i in cachedSubtitleParsedTracks.indices {
+        cachedSubtitleParsedTracks[i].selected = false
+      }
+      mpvQueue.async { [weak self] in
+        guard let self = self, let inst = self.workerInst else { return }
+        _ = uzv_ios_mpv_set_property_string_async(inst, 0, "sid", "no")
+      }
       return
     }
-    let subs = parseTracks(ofType: "sub")
-    guard index < subs.count else { return }
+    guard index < cachedSubtitleParsedTracks.count else { return }
     subtitlesDisabledByUser = false
-    _ = uzv_ios_mpv_set_property_int64(inst, "sid", Int64(subs[index].id))
+    let targetId = Int64(cachedSubtitleParsedTracks[index].id)
+    for i in cachedSubtitleParsedTracks.indices {
+      cachedSubtitleParsedTracks[i].selected = (i == index)
+    }
+    mpvQueue.async { [weak self] in
+      guard let self = self, let inst = self.workerInst else { return }
+      _ = uzv_ios_mpv_set_property_int64_async(inst, 0, "sid", targetId)
+    }
   }
 
   func audioTracks() -> [IosTrackOption] {
-    let audios = parseTracks(ofType: "audio")
-    return audios.enumerated().map { idx, t in
+    cachedAudioParsedTracks.enumerated().map { idx, t in
       var parts: [String] = []
       if let title = t.title { parts.append(title) }
       if let lang = t.lang, !parts.contains(lang) { parts.append(lang) }
@@ -614,31 +787,53 @@ final class IosMpvEngine {
   }
 
   func selectAudio(_ index: Int) {
-    guard let inst = instance else { return }
     if index < 0 {
-      _ = uzv_ios_mpv_set_property_string(inst, "aid", "auto")
+      mpvQueue.async { [weak self] in
+        guard let self = self, let inst = self.workerInst else { return }
+        _ = uzv_ios_mpv_set_property_string_async(inst, 0, "aid", "auto")
+      }
       return
     }
-    let audios = parseTracks(ofType: "audio")
-    guard index < audios.count else { return }
-    _ = uzv_ios_mpv_set_property_int64(inst, "aid", Int64(audios[index].id))
-  }
-
-  // MARK: - Screenshot
-
-  func captureVideoFrame() -> UIImage? {
-    guard let inst = instance, fileLoaded else { return nil }
-    let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
-      .appendingPathComponent("novaplay-mpv-shot-\(UUID().uuidString).jpg")
-    defer { try? FileManager.default.removeItem(at: tmpURL) }
-    let rc = uzv_ios_mpv_command3(inst, "screenshot-to-file", tmpURL.path, "video")
-    if rc >= 0, let data = try? Data(contentsOf: tmpURL), let img = UIImage(data: data) {
-      return img
+    guard index < cachedAudioParsedTracks.count else { return }
+    let targetId = Int64(cachedAudioParsedTracks[index].id)
+    for i in cachedAudioParsedTracks.indices {
+      cachedAudioParsedTracks[i].selected = (i == index)
     }
-    return nil
+    mpvQueue.async { [weak self] in
+      guard let self = self, let inst = self.workerInst else { return }
+      _ = uzv_ios_mpv_set_property_int64_async(inst, 0, "aid", targetId)
+    }
   }
 
-  // MARK: - Event Loop & Telemetry
+  // MARK: - Async Screenshot
+
+  func captureVideoFrame(completion: @escaping (UIImage?) -> Void) {
+    guard fileLoaded else {
+      completion(nil)
+      return
+    }
+    mpvQueue.async { [weak self] in
+      guard let self = self, let inst = self.workerInst, self.workerFileLoaded else {
+        DispatchQueue.main.async { completion(nil) }
+        return
+      }
+      let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        .appendingPathComponent("novaplay-mpv-shot-\(UUID().uuidString).jpg")
+      defer { try? FileManager.default.removeItem(at: tmpURL) }
+      let rc = uzv_ios_mpv_command3(inst, "screenshot-to-file", tmpURL.path, "video")
+      let img: UIImage?
+      if rc >= 0, let data = try? Data(contentsOf: tmpURL) {
+        img = UIImage(data: data)
+      } else {
+        img = nil
+      }
+      DispatchQueue.main.async {
+        completion(img)
+      }
+    }
+  }
+
+  // MARK: - Event Loop & Off-Main-Thread Telemetry
 
   private func runEventLoop(inst: OpaquePointer) {
     defer { eventExitGroup.leave() }
@@ -659,113 +854,199 @@ final class IosMpvEngine {
         continue
       }
 
-      DispatchQueue.main.async { [weak self] in
-        self?.handleEventOnMain(ev)
-      }
-    }
-  }
+      switch ev.event_id {
+      case 6: // START_FILE
+        let serial = currentLoadSerial()
+        DispatchQueue.main.async { [weak self] in
+          guard let self = self, self.currentLoadSerial() == serial else { return }
+          self.awaitingStartFile = false
+        }
 
-  private func handleEventOnMain(_ ev: UzvIosMpvEvent) {
-    guard let inst = instance else { return }
-    switch ev.event_id {
-    case 6: // START_FILE
-      awaitingStartFile = false
-    case 8: // FILE_LOADED
-      fileLoaded = true
-      loadingFile = false
-      isSeeking = false
-      pausedForCache = uzv_ios_mpv_get_property_flag(inst, "paused-for-cache", false)
-      if let extAudio = pendingExternalAudioUrl {
-        pendingExternalAudioUrl = nil
-        _ = uzv_ios_mpv_command3(inst, "audio-add", extAudio, "select")
-      }
-      for sub in pendingSidecars {
-        _ = uzv_ios_mpv_command5(inst, "sub-add", sub.url, "auto", sub.name, sub.language ?? "")
-      }
-      if UIApplication.shared.applicationState == .background {
-        userPaused = true
-        _ = uzv_ios_mpv_set_property_flag(inst, "pause", true)
-      } else {
-        userPaused = uzv_ios_mpv_get_property_flag(inst, "pause", userPaused)
-      }
-      refreshVideoMetadata(inst: inst)
-      mpvUsbLog.notice("[NovaPlay][MPV] FILE_LOADED codec=\(self.videoCodecName ?? "unknown", privacy: .public) size=\(Int(self.videoSize.width), privacy: .public)x\(Int(self.videoSize.height), privacy: .public)")
-      publishStateIfNeeded()
-      delegate?.mpvEngineDidUpdateMetrics()
-    case 7: // END_FILE
-      guard !awaitingStartFile else { return }
-      fileLoaded = false
-      isSeeking = false
-      if ev.end_reason == 0 { // EOF
-        reachedEof = true
-        loadingFile = false
-        publishStateIfNeeded()
-      } else if ev.end_reason == 2 || ev.end_reason == 3 { // STOP / QUIT
-        loadingFile = false
-        pausedForCache = false
-        publishStateIfNeeded()
-      } else if ev.end_reason == 4 { // ERROR
-        loadingFile = false
-        pausedForCache = false
-        let errStr = String(cString: uzv_ios_mpv_error_string(ev.end_error))
-        let logs = (copyStringAndFree(uzv_ios_mpv_copy_recent_logs(inst)) ?? "")
-          .components(separatedBy: .newlines)
-          .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-          .filter { !$0.isEmpty }
-          .suffix(3)
-          .joined(separator: " | ")
-        let shortMsg = "MPV " + IosPlayerUiText.t("播放失败", "playback failed") + " (\(errStr))"
-        let fullDiag = logs.isEmpty ? shortMsg : "\(shortMsg)\n\(logs)"
-        mpvUsbLog.error("[NovaPlay][MPV] END_FILE error: \(fullDiag, privacy: .public)")
-        delegate?.mpvEngineDidFail(message: shortMsg, diagnostic: fullDiag, code: Int(ev.end_error))
-      }
-    case 17: // VIDEO_RECONFIG
-      refreshVideoMetadata(inst: inst)
-      delegate?.mpvEngineDidUpdateMetrics()
-    case 20: // SEEK
-      isSeeking = true
-      publishStateIfNeeded()
-    case 21: // PLAYBACK_RESTART
-      isSeeking = false
-      pausedForCache = uzv_ios_mpv_get_property_flag(inst, "paused-for-cache", false)
-      publishStateIfNeeded()
-    case 22: // PROPERTY_CHANGE
-      switch ev.reply_userdata {
-      case Self.obsTimePos:
-        let sec = uzv_ios_mpv_get_property_double(inst, "time-pos", -1)
-        if sec >= 0 {
-          let nextPos = Int64((sec * 1000.0).rounded())
-          if isSeeking && nextPos != positionMs {
-            isSeeking = false
-            publishStateIfNeeded()
+      case 8: // FILE_LOADED
+        let serial = currentLoadSerial()
+        mpvQueue.async { [weak self] in
+          guard let self = self, self.currentLoadSerial() == serial, let qInst = self.workerInst else { return }
+          self.workerFileLoaded = true
+          if let extAudio = self.pendingWorkerExternalAudioUrl {
+            self.pendingWorkerExternalAudioUrl = nil
+            _ = uzv_ios_mpv_command_async3(qInst, 0, "audio-add", extAudio, "select")
           }
-          positionMs = nextPos
-          delegate?.mpvEngineDidUpdateMetrics()
+          for sub in self.pendingWorkerSidecars {
+            _ = uzv_ios_mpv_command_async5(qInst, 0, "sub-add", sub.url, "auto", sub.name, sub.language ?? "")
+          }
+          let cachePaused = uzv_ios_mpv_get_property_flag(qInst, "paused-for-cache", false)
+          let mpvPaused = uzv_ios_mpv_get_property_flag(qInst, "pause", false)
+          let meta = self.readVideoMetadataOnQueue(inst: qInst)
+          let tracks = self.parseAllTracksOnQueue(inst: qInst)
+          DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.currentLoadSerial() == serial else { return }
+            self.fileLoaded = true
+            self.loadingFile = false
+            self.isSeeking = false
+            self.pausedForCache = cachePaused
+            self.cachedSubtitleParsedTracks = tracks.subs
+            self.cachedAudioParsedTracks = tracks.audios
+            self.applyMetadataSnapshotOnMain(meta)
+            if UIApplication.shared.applicationState == .background {
+              self.pause()
+            } else {
+              self.userPaused = mpvPaused
+            }
+            mpvUsbLog.notice("[NovaPlay][MPV] FILE_LOADED codec=\(self.videoCodecName ?? "unknown", privacy: .public) size=\(Int(self.videoSize.width), privacy: .public)x\(Int(self.videoSize.height), privacy: .public)")
+            self.publishStateIfNeeded()
+            self.delegate?.mpvEngineDidUpdateMetrics()
+          }
         }
-      case Self.obsDuration:
-        let dur = uzv_ios_mpv_get_property_double(inst, "duration", -1)
-        if dur > 0 {
-          durationMs = Int64((dur * 1000.0).rounded())
-          delegate?.mpvEngineDidUpdateMetrics()
+
+      case 7: // END_FILE
+        let serial = currentLoadSerial()
+        let endReason = ev.end_reason
+        let endError = ev.end_error
+        var errDiag: (short: String, full: String)?
+        if endReason == 4 {
+          let errStr = String(cString: uzv_ios_mpv_error_string(endError))
+          let logs = (copyStringAndFree(uzv_ios_mpv_copy_recent_logs(inst)) ?? "")
+            .components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .suffix(3)
+            .joined(separator: " | ")
+          let shortMsg = "MPV " + IosPlayerUiText.t("播放失败", "playback failed") + " (\(errStr))"
+          let fullDiag = logs.isEmpty ? shortMsg : "\(shortMsg)\n\(logs)"
+          errDiag = (shortMsg, fullDiag)
         }
-      case Self.obsPause:
-        userPaused = uzv_ios_mpv_get_property_flag(inst, "pause", userPaused)
-        publishStateIfNeeded()
-      case Self.obsCacheStall:
-        pausedForCache = uzv_ios_mpv_get_property_flag(inst, "paused-for-cache", false)
-        publishStateIfNeeded()
-      case Self.obsVideoW, Self.obsVideoH, Self.obsVideoRotate:
-        refreshVideoMetadata(inst: inst)
-        delegate?.mpvEngineDidUpdateMetrics()
+        mpvQueue.async { [weak self] in
+          if self?.currentLoadSerial() == serial {
+            self?.workerFileLoaded = false
+          }
+        }
+        DispatchQueue.main.async { [weak self] in
+          guard let self = self, self.currentLoadSerial() == serial, !self.awaitingStartFile else { return }
+          self.fileLoaded = false
+          self.isSeeking = false
+          if endReason == 0 { // EOF
+            self.reachedEof = true
+            self.loadingFile = false
+            self.publishStateIfNeeded()
+          } else if endReason == 2 || endReason == 3 { // STOP / QUIT
+            self.loadingFile = false
+            self.pausedForCache = false
+            self.publishStateIfNeeded()
+          } else if endReason == 4, let diag = errDiag { // ERROR
+            self.loadingFile = false
+            self.pausedForCache = false
+            mpvUsbLog.error("[NovaPlay][MPV] END_FILE error: \(diag.full, privacy: .public)")
+            self.delegate?.mpvEngineDidFail(message: diag.short, diagnostic: diag.full, code: Int(endError))
+          }
+        }
+
+      case 17, 18: // VIDEO_RECONFIG / AUDIO_RECONFIG
+        let serial = currentLoadSerial()
+        mpvQueue.async { [weak self] in
+          guard let self = self, self.currentLoadSerial() == serial, let qInst = self.workerInst else { return }
+          let meta = self.readVideoMetadataOnQueue(inst: qInst)
+          let tracks = self.parseAllTracksOnQueue(inst: qInst)
+          DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.currentLoadSerial() == serial else { return }
+            self.cachedSubtitleParsedTracks = tracks.subs
+            self.cachedAudioParsedTracks = tracks.audios
+            self.applyMetadataSnapshotOnMain(meta)
+            self.delegate?.mpvEngineDidUpdateMetrics()
+          }
+        }
+
+      case 20: // SEEK
+        let serial = currentLoadSerial()
+        DispatchQueue.main.async { [weak self] in
+          guard let self = self, self.currentLoadSerial() == serial else { return }
+          self.isSeeking = true
+          self.publishStateIfNeeded()
+        }
+
+      case 21: // PLAYBACK_RESTART
+        let serial = currentLoadSerial()
+        mpvQueue.async { [weak self] in
+          guard let self = self, self.currentLoadSerial() == serial, let qInst = self.workerInst else { return }
+          let cachePaused = uzv_ios_mpv_get_property_flag(qInst, "paused-for-cache", false)
+          DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.currentLoadSerial() == serial else { return }
+            self.isSeeking = false
+            self.pausedForCache = cachePaused
+            self.publishStateIfNeeded()
+          }
+        }
+
+      case 22: // PROPERTY_CHANGE
+        let serial = currentLoadSerial()
+        switch ev.reply_userdata {
+        case Self.obsTimePos:
+          guard ev.prop_format == 5, ev.prop_double >= 0 else { break }
+          let nextPos = Int64((ev.prop_double * 1000.0).rounded())
+          DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.currentLoadSerial() == serial else { return }
+            if self.isSeeking && nextPos != self.positionMs {
+              self.isSeeking = false
+              self.publishStateIfNeeded()
+            }
+            self.positionMs = nextPos
+            self.delegate?.mpvEngineDidUpdateMetrics()
+          }
+        case Self.obsDuration:
+          guard ev.prop_format == 5, ev.prop_double > 0 else { break }
+          let nextDur = Int64((ev.prop_double * 1000.0).rounded())
+          DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.currentLoadSerial() == serial else { return }
+            self.durationMs = nextDur
+            self.delegate?.mpvEngineDidUpdateMetrics()
+          }
+        case Self.obsPause:
+          guard ev.prop_format == 3 else { break }
+          let pausedVal = ev.prop_flag
+          DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.currentLoadSerial() == serial else { return }
+            self.userPaused = pausedVal
+            self.publishStateIfNeeded()
+          }
+        case Self.obsCacheStall:
+          guard ev.prop_format == 3 else { break }
+          let cacheVal = ev.prop_flag
+          DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.currentLoadSerial() == serial else { return }
+            self.pausedForCache = cacheVal
+            self.publishStateIfNeeded()
+          }
+        case Self.obsVideoW, Self.obsVideoH, Self.obsVideoRotate:
+          mpvQueue.async { [weak self] in
+            guard let self = self, self.currentLoadSerial() == serial, let qInst = self.workerInst else { return }
+            let meta = self.readVideoMetadataOnQueue(inst: qInst)
+            DispatchQueue.main.async { [weak self] in
+              guard let self = self, self.currentLoadSerial() == serial else { return }
+              self.applyMetadataSnapshotOnMain(meta)
+              self.delegate?.mpvEngineDidUpdateMetrics()
+            }
+          }
+        case Self.obsTrackCount, Self.obsAid, Self.obsSid:
+          mpvQueue.async { [weak self] in
+            guard let self = self, self.currentLoadSerial() == serial, let qInst = self.workerInst else { return }
+            let tracks = self.parseAllTracksOnQueue(inst: qInst)
+            DispatchQueue.main.async { [weak self] in
+              guard let self = self, self.currentLoadSerial() == serial else { return }
+              self.cachedSubtitleParsedTracks = tracks.subs
+              self.cachedAudioParsedTracks = tracks.audios
+              self.delegate?.mpvEngineDidUpdateMetrics()
+            }
+          }
+        default:
+          break
+        }
+
       default:
         break
       }
-    default:
-      break
     }
   }
 
-  private func rotatedMpvDims(_ inst: OpaquePointer, _ wProp: String, _ hProp: String, _ rotProps: [String]) -> (Int64, Int64)? {
+  private func rotatedMpvDimsOnQueue(_ inst: OpaquePointer, _ wProp: String, _ hProp: String, _ rotProps: [String]) -> (Int64, Int64)? {
     var w = uzv_ios_mpv_get_property_int64(inst, wProp, 0)
     var h = uzv_ios_mpv_get_property_int64(inst, hProp, 0)
     guard w > 0 && h > 0 else { return nil }
@@ -779,31 +1060,43 @@ final class IosMpvEngine {
     return (w, h)
   }
 
-  private func refreshVideoMetadata(inst: OpaquePointer) {
-    let dims = rotatedMpvDims(inst, "video-out-params/dw", "video-out-params/dh", ["video-out-params/rotate"])
-      ?? rotatedMpvDims(inst, "video-params/dw", "video-params/dh", ["video-params/rotate"])
-      ?? rotatedMpvDims(inst, "video-params/w", "video-params/h", ["video-params/rotate", "current-tracks/video/demux-rotation", "track-list/0/demux-rotation"])
-    if let (w, h) = dims {
-      videoSize = CGSize(width: CGFloat(w), height: CGFloat(h))
-    }
+  private func readVideoMetadataOnQueue(inst: OpaquePointer) -> MpvMetadataSnapshot {
+    let dims = rotatedMpvDimsOnQueue(inst, "video-out-params/dw", "video-out-params/dh", ["video-out-params/rotate"])
+      ?? rotatedMpvDimsOnQueue(inst, "video-params/dw", "video-params/dh", ["video-params/rotate"])
+      ?? rotatedMpvDimsOnQueue(inst, "video-params/w", "video-params/h", ["video-params/rotate", "current-tracks/video/demux-rotation", "track-list/0/demux-rotation"])
+    let sz = dims.map { CGSize(width: CGFloat($0.0), height: CGFloat($0.1)) }
+
     let fpsEst = uzv_ios_mpv_get_property_double(inst, "estimated-vf-fps", 0)
     let fpsCont = uzv_ios_mpv_get_property_double(inst, "container-fps", 0)
     let bestFps = fpsEst > 0 ? fpsEst : fpsCont
-    if bestFps > 0 {
-      nominalFps = bestFps
-    }
+    let fps: Double? = bestFps > 0 ? bestFps : nil
+
+    var codec: String?
     if let fmt = getString(inst, "video-format")?.uppercased(), !fmt.isEmpty {
       switch fmt {
-      case "HEVC", "H265": videoCodecName = "HEVC"
-      case "H264", "AVC1": videoCodecName = "H.264"
-      default: videoCodecName = fmt
+      case "HEVC", "H265": codec = "HEVC"
+      case "H264", "AVC1": codec = "H.264"
+      default: codec = fmt
       }
+    }
+    return MpvMetadataSnapshot(videoSize: sz, nominalFps: fps, videoCodecName: codec)
+  }
+
+  private func applyMetadataSnapshotOnMain(_ snap: MpvMetadataSnapshot) {
+    if let sz = snap.videoSize, sz.width > 0 && sz.height > 0 {
+      videoSize = sz
+    }
+    if let fps = snap.nominalFps, fps > 0 {
+      nominalFps = fps
+    }
+    if let codec = snap.videoCodecName, !codec.isEmpty {
+      videoCodecName = codec
     }
   }
 
   private func startStatsTimer() {
     statsTimer?.invalidate()
-    let t = Timer(timeInterval: 0.3, repeats: true) { [weak self] _ in
+    let t = Timer(timeInterval: 0.4, repeats: true) { [weak self] _ in
       self?.sampleStats()
     }
     RunLoop.main.add(t, forMode: .common)
@@ -811,17 +1104,42 @@ final class IosMpvEngine {
   }
 
   private func sampleStats() {
-    guard let inst = instance, (fileLoaded || loadingFile) else { return }
-    let cacheSpeed = uzv_ios_mpv_get_property_double(inst, "cache-speed", 0)
-    downloadBytesPerSec = max(0, cacheSpeed)
-    if fileLoaded {
-      let vBitrate = uzv_ios_mpv_get_property_double(inst, "video-bitrate", 0)
-      videoBitrateBps = max(0, vBitrate)
-      if nominalFps == nil || videoSize == .zero {
-        refreshVideoMetadata(inst: inst)
+    guard fileLoaded || loadingFile else { return }
+    let needMeta = fileLoaded && (nominalFps == nil || videoSize == .zero)
+    let loadedNow = fileLoaded
+    let serial = currentLoadSerial()
+
+    lock.lock()
+    if statsInFlight || isDestroyed {
+      lock.unlock()
+      return
+    }
+    statsInFlight = true
+    lock.unlock()
+
+    mpvQueue.async { [weak self] in
+      guard let self = self else { return }
+      defer {
+        self.lock.lock()
+        self.statsInFlight = false
+        self.lock.unlock()
+      }
+      guard self.currentLoadSerial() == serial, let inst = self.workerInst else { return }
+      let cacheSpeed = max(0, uzv_ios_mpv_get_property_double(inst, "cache-speed", 0))
+      let vBitrate = loadedNow ? max(0, uzv_ios_mpv_get_property_double(inst, "video-bitrate", 0)) : 0
+      let meta = needMeta ? self.readVideoMetadataOnQueue(inst: inst) : nil
+      DispatchQueue.main.async { [weak self] in
+        guard let self = self, self.currentLoadSerial() == serial, (self.fileLoaded || self.loadingFile) else { return }
+        self.downloadBytesPerSec = cacheSpeed
+        if loadedNow {
+          self.videoBitrateBps = vBitrate
+          if let meta = meta {
+            self.applyMetadataSnapshotOnMain(meta)
+          }
+        }
+        self.delegate?.mpvEngineDidUpdateMetrics()
       }
     }
-    delegate?.mpvEngineDidUpdateMetrics()
   }
 
   private func computeState() -> String {
@@ -840,6 +1158,7 @@ final class IosMpvEngine {
   }
 
   func stopPlayback() {
+    _ = bumpLoadSerial()
     pendingLoadClosure = nil
     metalView?.onLayoutReady = nil
     awaitingStartFile = false
@@ -848,10 +1167,18 @@ final class IosMpvEngine {
     reachedEof = false
     isSeeking = false
     pausedForCache = false
-    if let inst = instance {
-      _ = uzv_ios_mpv_command_async2(inst, 0, "stop", nil)
-    }
+    cachedSubtitleParsedTracks = []
+    cachedAudioParsedTracks = []
     lastPublishedState = "idle"
+    mpvQueue.async { [weak self] in
+      guard let self = self else { return }
+      self.workerFileLoaded = false
+      self.pendingWorkerSidecars = []
+      self.pendingWorkerExternalAudioUrl = nil
+      if let inst = self.workerInst {
+        _ = uzv_ios_mpv_command_async2(inst, 0, "stop", nil)
+      }
+    }
   }
 
   func destroy() {
@@ -863,19 +1190,35 @@ final class IosMpvEngine {
     statsTimer = nil
     pendingLoadClosure = nil
     metalView?.onLayoutReady = nil
-
-    guard let inst = instance else { return }
-    instance = nil
+    _ = bumpLoadSerial()
 
     lock.lock()
+    if isDestroyed {
+      lock.unlock()
+      return
+    }
+    isDestroyed = true
     isRunningEvents = false
+    let wakeTarget = wakeupInst
+    wakeupInst = nil
     lock.unlock()
-    uzv_ios_mpv_wakeup(inst)
 
+    if let wakeTarget = wakeTarget {
+      uzv_ios_mpv_wakeup(wakeTarget)
+    }
+
+    let retainedLayer = metalLayerRef
+    metalLayerRef = nil
     let exitGroup = eventExitGroup
-    DispatchQueue.global(qos: .utility).async {
+    mpvQueue.async {
+      let inst = self.workerInst
+      self.workerInst = nil
+      self.workerFileLoaded = false
       _ = exitGroup.wait(timeout: .now() + 2.0)
-      uzv_ios_mpv_destroy(inst)
+      if let inst = inst {
+        uzv_ios_mpv_destroy(inst)
+      }
+      withExtendedLifetime(retainedLayer) {}
     }
   }
 

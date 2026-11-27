@@ -2117,10 +2117,10 @@ final class IosPlayerPanels {
           next.orientationMode = mode
           next.isPriorityLandscape = (mode != "portrait")
           self.controller.updatePlayback(next)
-          self.onOrientationModeChanged(mode)
           if self.host.isPanelOpen {
             self.showSettings(scrollY: y)
           }
+          self.onOrientationModeChanged(mode)
         }
       }
       list.addArrangedSubview(orientCard)

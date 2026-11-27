@@ -55,6 +55,12 @@ typedef struct {
     int playlist_insert_num_entries;
 } uzv_mpv_event_end_file;
 
+typedef struct {
+    const char *name;
+    int format;
+    void *data;
+} uzv_mpv_event_property;
+
 #define UZV_IOS_MPV_FN_LIST(X)                                                                           \
     X(mpv_create, mpv_handle *, (void))                                                                  \
     X(mpv_initialize, int, (mpv_handle * ctx))                                                           \
@@ -78,6 +84,7 @@ typedef struct {
     UZV_IOS_MPV_FN_LIST(DECL_FN)
 #undef DECL_FN
     int (*mpv_command_async)(mpv_handle *ctx, uint64_t reply_userdata, const char **args);
+    int (*mpv_set_property_async)(mpv_handle *ctx, uint64_t reply_userdata, const char *name, int format, void *data);
 } UzvIosMpvApi;
 
 struct uzv_mpv_instance {
@@ -112,6 +119,7 @@ static bool try_bind_symbols(void *lib_handle, const char *source_name) {
         return false;
     }
     *(void **)(&candidate.mpv_command_async) = dlsym(lib_handle, "mpv_command_async");
+    *(void **)(&candidate.mpv_set_property_async) = dlsym(lib_handle, "mpv_set_property_async");
     g_mpv = candidate;
     snprintf(g_load_detail, sizeof(g_load_detail), "Loaded libmpv from %s", source_name);
     return true;
@@ -301,6 +309,22 @@ int uzv_ios_mpv_command_async3(uzv_mpv_instance *inst, uint64_t userdata, const 
     return g_mpv.mpv_command(inst->handle, cmd);
 }
 
+int uzv_ios_mpv_command_async4(
+    uzv_mpv_instance *inst,
+    uint64_t userdata,
+    const char *a0,
+    const char *a1,
+    const char *a2,
+    const char *a3
+) {
+    if (!inst || !inst->handle || !a0) return -4;
+    const char *cmd[5] = {a0, a1, a2, a3, NULL};
+    if (g_mpv.mpv_command_async) {
+        return g_mpv.mpv_command_async(inst->handle, userdata, cmd);
+    }
+    return g_mpv.mpv_command(inst->handle, cmd);
+}
+
 int uzv_ios_mpv_command_async5(
     uzv_mpv_instance *inst,
     uint64_t userdata,
@@ -338,6 +362,42 @@ int uzv_ios_mpv_set_property_int64(uzv_mpv_instance *inst, const char *name, int
 int uzv_ios_mpv_set_property_double(uzv_mpv_instance *inst, const char *name, double value) {
     if (!inst || !inst->handle || !name) return -4;
     double v = value;
+    return g_mpv.mpv_set_property(inst->handle, name, UZV_MPV_FORMAT_DOUBLE, &v);
+}
+
+int uzv_ios_mpv_set_property_string_async(uzv_mpv_instance *inst, uint64_t userdata, const char *name, const char *value) {
+    if (!inst || !inst->handle || !name) return -4;
+    const char *s = value ? value : "";
+    if (g_mpv.mpv_set_property_async) {
+        return g_mpv.mpv_set_property_async(inst->handle, userdata, name, UZV_MPV_FORMAT_STRING, &s);
+    }
+    return g_mpv.mpv_set_property_string(inst->handle, name, s);
+}
+
+int uzv_ios_mpv_set_property_flag_async(uzv_mpv_instance *inst, uint64_t userdata, const char *name, bool value) {
+    if (!inst || !inst->handle || !name) return -4;
+    int flag = value ? 1 : 0;
+    if (g_mpv.mpv_set_property_async) {
+        return g_mpv.mpv_set_property_async(inst->handle, userdata, name, UZV_MPV_FORMAT_FLAG, &flag);
+    }
+    return g_mpv.mpv_set_property(inst->handle, name, UZV_MPV_FORMAT_FLAG, &flag);
+}
+
+int uzv_ios_mpv_set_property_int64_async(uzv_mpv_instance *inst, uint64_t userdata, const char *name, int64_t value) {
+    if (!inst || !inst->handle || !name) return -4;
+    int64_t v = value;
+    if (g_mpv.mpv_set_property_async) {
+        return g_mpv.mpv_set_property_async(inst->handle, userdata, name, UZV_MPV_FORMAT_INT64, &v);
+    }
+    return g_mpv.mpv_set_property(inst->handle, name, UZV_MPV_FORMAT_INT64, &v);
+}
+
+int uzv_ios_mpv_set_property_double_async(uzv_mpv_instance *inst, uint64_t userdata, const char *name, double value) {
+    if (!inst || !inst->handle || !name) return -4;
+    double v = value;
+    if (g_mpv.mpv_set_property_async) {
+        return g_mpv.mpv_set_property_async(inst->handle, userdata, name, UZV_MPV_FORMAT_DOUBLE, &v);
+    }
     return g_mpv.mpv_set_property(inst->handle, name, UZV_MPV_FORMAT_DOUBLE, &v);
 }
 
@@ -412,6 +472,18 @@ UzvIosMpvEvent uzv_ios_mpv_wait_event(uzv_mpv_instance *inst, double timeout_sec
         const uzv_mpv_event_end_file *ef = (const uzv_mpv_event_end_file *)ev->data;
         out.end_reason = ef->reason;
         out.end_error = ef->error;
+    } else if (ev->event_id == UZV_MPV_EVENT_PROPERTY_CHANGE && ev->data) {
+        const uzv_mpv_event_property *ep = (const uzv_mpv_event_property *)ev->data;
+        out.prop_format = ep->format;
+        if (ep->data) {
+            if (ep->format == UZV_MPV_FORMAT_FLAG) {
+                out.prop_flag = (*(const int *)ep->data) != 0;
+            } else if (ep->format == UZV_MPV_FORMAT_INT64) {
+                out.prop_int64 = *(const int64_t *)ep->data;
+            } else if (ep->format == UZV_MPV_FORMAT_DOUBLE) {
+                out.prop_double = *(const double *)ep->data;
+            }
+        }
     }
     return out;
 }

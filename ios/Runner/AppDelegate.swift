@@ -1,4 +1,5 @@
 import Flutter
+import novaplay_ios
 import UIKit
 
 @main
@@ -18,16 +19,6 @@ import UIKit
     _ application: UIApplication,
     supportedInterfaceOrientationsFor window: UIWindow?
   ) -> UIInterfaceOrientationMask {
-    if UIDevice.current.userInterfaceIdiom == .pad {
-      return .all
-    }
-    var cur = window?.rootViewController?.presentedViewController
-    while let p = cur {
-      if !p.isBeingDismissed && NSStringFromClass(type(of: p)).contains("NativePlayerViewController") {
-        return p.supportedInterfaceOrientations
-      }
-      cur = p.presentedViewController
-    }
-    return .portrait
+    return NovaPlayIosPlugin.supportedInterfaceOrientations(for: window)
   }
 }

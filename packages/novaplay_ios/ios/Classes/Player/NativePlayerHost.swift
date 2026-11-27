@@ -26,8 +26,12 @@ final class NativePlayerHost: NativePlayerHostApi {
       guard let self = self else { return }
       if let staleVC = self.pendingForegroundDismissVC {
         self.pendingForegroundDismissVC = nil
-        if staleVC.presentingViewController != nil {
-          staleVC.dismiss(animated: false)
+        if let stalePresenter = staleVC.presentingViewController {
+          stalePresenter.dismiss(animated: false) {
+            Self.enforceHostInterfaceOrientation()
+          }
+        } else {
+          Self.enforceHostInterfaceOrientation()
         }
       }
       self.syncIdleTimer(forceReassert: true)
@@ -150,8 +154,8 @@ final class NativePlayerHost: NativePlayerHostApi {
       self.openSerial += 1
       let serial = self.openSerial
       // Cleanly close any existing session (e.g. a leftover PiP session) before opening the new one
-      if let prevVC = self.activeViewController, prevVC.presentingViewController != nil {
-        prevVC.dismiss(animated: false)
+      if let prevVC = self.activeViewController, let prevPresenter = prevVC.presentingViewController {
+        prevPresenter.dismiss(animated: false)
       }
       if let prev = self.activeController, !prev.isClosed {
         prev.close(completed: false, dismissVC: false)
@@ -174,11 +178,11 @@ final class NativePlayerHost: NativePlayerHostApi {
         onDismissPage: { [weak self] in
           DispatchQueue.main.async {
             guard let vc = vcWeakRef else { return }
-            if vc.presentingViewController != nil {
+            if let presenter = vc.presentingViewController {
               let isActive = UIApplication.shared.applicationState == .active
               if !isActive {
                 self?.pendingForegroundDismissVC = vc
-                vc.dismiss(animated: false)
+                presenter.dismiss(animated: false)
               } else if !vc.isExitingPlayer {
                 vc.exitPlayerSmoothly(completed: true)
               }
@@ -238,25 +242,16 @@ final class NativePlayerHost: NativePlayerHostApi {
           initialLandscape: initialLandscape
         )
         playerVC.modalPresentationStyle = .fullScreen
-        playerVC.modalTransitionStyle = .crossDissolve
         vcWeakRef = playerVC
         self.activeViewController = playerVC
 
-        guard let presenter = Self.topViewController() else {
-          controller.close(completed: false, dismissVC: false)
-          completion(.success(()))
-          return
-        }
-        presenter.present(playerVC, animated: true) { [weak self] in
-          self?.syncIdleTimer(forceReassert: true)
-        }
-        if let src = effectiveSource {
-          controller.start(withInitialSource: src)
-        } else {
-          controller.start()
-        }
-        self.syncIdleTimer()
-        completion(.success(()))
+        self.presentPlayerVC(
+          playerVC,
+          serial: serial,
+          controller: controller,
+          initialSource: effectiveSource,
+          completion: completion
+        )
       }
 
       let budgetMs = min(max(Int64(0), request.probeBudgetMs ?? 0), 260)
@@ -343,14 +338,166 @@ final class NativePlayerHost: NativePlayerHostApi {
     return true
   }
 
-  static func keyWindow() -> UIWindow? {
+  /// Window-agnostic interface orientation mask used by `AppDelegate.application(_:supportedInterfaceOrientationsFor:)`.
+  /// Returning the active player's mask even when UIKit queries `nil` or `UITextEffectsWindow` prevents
+  /// `geometryUpdate denied` errors and keyboard/alert forced-portrait snaps.
+  func supportedInterfaceOrientations(for window: UIWindow?) -> UIInterfaceOrientationMask {
+    if let playerVC = activeViewController,
+       let ctrl = activeController,
+       !ctrl.isClosed,
+       !playerVC.isDismissedForPiP,
+       !playerVC.isBeingDismissed {
+      return playerVC.supportedInterfaceOrientations
+    }
     let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-    let activeScene = scenes.first(where: { $0.activationState == .foregroundActive }) ?? scenes.first
-    return activeScene?.windows.first(where: { $0.isKeyWindow }) ?? activeScene?.windows.first
+    for scene in scenes {
+      for win in scene.windows {
+        var cur = win.rootViewController?.presentedViewController
+        while let p = cur {
+          if let playerVC = p as? NativePlayerViewController,
+             !playerVC.isDismissedForPiP,
+             !playerVC.isBeingDismissed {
+            return playerVC.supportedInterfaceOrientations
+          }
+          cur = p.presentedViewController
+        }
+      }
+    }
+    return UIDevice.current.userInterfaceIdiom == .pad ? .all : .portrait
+  }
+
+  private func presentPlayerVC(
+    _ playerVC: NativePlayerViewController,
+    serial: Int,
+    controller: IosPlayerController,
+    initialSource: SourcePayload?,
+    retryCount: Int = 0,
+    completion: @escaping (Result<Void, Error>) -> Void
+  ) {
+    guard serial == openSerial, !controller.isClosed else {
+      completion(.success(()))
+      return
+    }
+    guard let root = Self.flutterWindow()?.rootViewController else {
+      controller.close(completed: false, dismissVC: false)
+      completion(.success(()))
+      return
+    }
+
+    var presenter = root
+    while let child = presenter.presentedViewController {
+      if child.isBeingDismissed || child.isBeingPresented {
+        if let coord = child.transitionCoordinator ?? presenter.transitionCoordinator, retryCount < 12 {
+          coord.animate(alongsideTransition: nil) { [weak self] _ in
+            DispatchQueue.main.async {
+              self?.presentPlayerVC(
+                playerVC,
+                serial: serial,
+                controller: controller,
+                initialSource: initialSource,
+                retryCount: retryCount + 1,
+                completion: completion
+              )
+            }
+          }
+          return
+        } else if retryCount < 12 {
+          DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+            self?.presentPlayerVC(
+              playerVC,
+              serial: serial,
+              controller: controller,
+              initialSource: initialSource,
+              retryCount: retryCount + 1,
+              completion: completion
+            )
+          }
+          return
+        }
+        break
+      }
+      presenter = child
+    }
+
+    if presenter.transitionCoordinator != nil, retryCount < 12 {
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+        self?.presentPlayerVC(
+          playerVC,
+          serial: serial,
+          controller: controller,
+          initialSource: initialSource,
+          retryCount: retryCount + 1,
+          completion: completion
+        )
+      }
+      return
+    }
+
+    presenter.present(playerVC, animated: false) { [weak self] in
+      self?.syncIdleTimer(forceReassert: true)
+    }
+
+    guard playerVC.presentingViewController != nil || playerVC.isBeingPresented else {
+      if retryCount < 8 {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { [weak self] in
+          self?.presentPlayerVC(
+            playerVC,
+            serial: serial,
+            controller: controller,
+            initialSource: initialSource,
+            retryCount: retryCount + 1,
+            completion: completion
+          )
+        }
+      } else {
+        controller.close(completed: false, dismissVC: false)
+        Self.enforceHostInterfaceOrientation()
+        completion(.success(()))
+      }
+      return
+    }
+
+    if let src = initialSource {
+      controller.start(withInitialSource: src)
+    } else {
+      controller.start()
+    }
+    syncIdleTimer()
+    completion(.success(()))
+  }
+
+  static func flutterWindow() -> UIWindow? {
+    let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+    let orderedScenes = scenes.sorted { a, b in
+      func rank(_ s: UIScene.ActivationState) -> Int {
+        switch s {
+        case .foregroundActive: return 0
+        case .foregroundInactive: return 1
+        default: return 2
+        }
+      }
+      return rank(a.activationState) < rank(b.activationState)
+    }
+    for scene in orderedScenes {
+      if let flutterWin = scene.windows.first(where: { !$0.isHidden && ($0.rootViewController is FlutterViewController) }) {
+        return flutterWin
+      }
+      if let flutterWin = scene.windows.first(where: { $0.rootViewController is FlutterViewController }) {
+        return flutterWin
+      }
+    }
+    let activeScene = orderedScenes.first
+    return activeScene?.windows.first(where: { $0.isKeyWindow && $0.rootViewController != nil })
+      ?? activeScene?.windows.first(where: { $0.rootViewController != nil })
+      ?? activeScene?.windows.first
+  }
+
+  static func keyWindow() -> UIWindow? {
+    flutterWindow()
   }
 
   static func topViewController() -> UIViewController? {
-    guard let root = keyWindow()?.rootViewController else {
+    guard let root = flutterWindow()?.rootViewController else {
       return nil
     }
     var top = root
@@ -358,5 +505,17 @@ final class NativePlayerHost: NativePlayerHostApi {
       top = presented
     }
     return top
+  }
+
+  static func enforceHostInterfaceOrientation() {
+    guard UIDevice.current.userInterfaceIdiom == .phone else { return }
+    guard let window = flutterWindow(), let root = window.rootViewController else { return }
+    if #available(iOS 16.0, *) {
+      root.setNeedsUpdateOfSupportedInterfaceOrientations()
+      window.windowScene?.requestGeometryUpdate(.iOS(interfaceOrientations: .portrait)) { _ in }
+    } else {
+      UIDevice.current.setValue(UIInterfaceOrientation.portrait.rawValue, forKey: "orientation")
+      UIViewController.attemptRotationToDeviceOrientation()
+    }
   }
 }

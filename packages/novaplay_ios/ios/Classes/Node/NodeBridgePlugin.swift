@@ -59,12 +59,24 @@ final class NodeBridgePlugin: NSObject, FlutterStreamHandler {
   private func handle(_ call: FlutterMethodCall, result: @escaping FlutterResult) {
     switch call.method {
     case "start":
-      do {
-        NodeHostIos.shared.attach(self)
-        try NodeHostIos.shared.start(registrar: registrar)
-        result(nil)
-      } catch {
-        result(FlutterError(code: "node_start_failed", message: error.localizedDescription, details: nil))
+      NodeHostIos.shared.attach(self)
+      let assetRel = registrar.lookupKey(forAsset: "assets/nodejs")
+      let bundlePath = Bundle.main.bundlePath
+      let info = Bundle.main.infoDictionary ?? [:]
+      let execPath = Bundle.main.executablePath
+      NodeHostIos.shared.startAsync(
+        assetRel: assetRel,
+        bundlePath: bundlePath,
+        info: info,
+        executablePath: execPath
+      ) { err in
+        DispatchQueue.main.async {
+          if let err = err {
+            result(FlutterError(code: "node_start_failed", message: err.localizedDescription, details: nil))
+          } else {
+            result(nil)
+          }
+        }
       }
     case "send":
       guard let args = call.arguments as? [String: Any],
@@ -131,6 +143,7 @@ private final class NodeHostIos {
   private var started = false
   private var readyLine: String?
   private var firstFailure: String?
+  private let startQueue = DispatchQueue(label: "app.novaplay.node.start", qos: .userInitiated)
   private let sendQueue = DispatchQueue(label: "app.novaplay.node.send")
   private let token: String = {
     var bytes = [UInt8](repeating: 0, count: 16)
@@ -173,7 +186,38 @@ private final class NodeHostIos {
     emit(channel: "status", message: line)
   }
 
-  func start(registrar: FlutterPluginRegistrar) throws {
+  func startAsync(
+    assetRel: String,
+    bundlePath: String,
+    info: [String: Any],
+    executablePath: String?,
+    completion: @escaping (Error?) -> Void
+  ) {
+    startQueue.async { [weak self] in
+      guard let self = self else {
+        completion(nil)
+        return
+      }
+      do {
+        try self.startSync(
+          assetRel: assetRel,
+          bundlePath: bundlePath,
+          info: info,
+          executablePath: executablePath
+        )
+        completion(nil)
+      } catch {
+        completion(error)
+      }
+    }
+  }
+
+  private func startSync(
+    assetRel: String,
+    bundlePath: String,
+    info: [String: Any],
+    executablePath: String?
+  ) throws {
     lock.lock()
     if started {
       let replay = readyLine
@@ -191,7 +235,12 @@ private final class NodeHostIos {
 
     let projectDir: URL
     do {
-      projectDir = try NodeAssetsIos.install(registrar: registrar)
+      projectDir = try NodeAssetsIos.install(
+        assetRel: assetRel,
+        bundlePath: bundlePath,
+        info: info,
+        executablePath: executablePath
+      )
     } catch {
       lock.lock()
       started = false
@@ -535,16 +584,20 @@ private final class NodeHostIos {
 }
 
 private enum NodeAssetsIos {
-  static func install(registrar: FlutterPluginRegistrar) throws -> URL {
+  static func install(
+    assetRel: String,
+    bundlePath: String,
+    info: [String: Any],
+    executablePath: String?
+  ) throws -> URL {
     let fm = FileManager.default
     let appSupport = try fm.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
     var target = appSupport.appendingPathComponent("nodejs-project", isDirectory: true)
     let stampFile = target.appendingPathComponent(".version")
 
-    let assetRel = registrar.lookupKey(forAsset: "assets/nodejs")
     let candidates = [
-      (Bundle.main.bundlePath as NSString).appendingPathComponent(assetRel),
-      (Bundle.main.bundlePath as NSString).appendingPathComponent("Frameworks/App.framework/flutter_assets/assets/nodejs")
+      (bundlePath as NSString).appendingPathComponent(assetRel),
+      (bundlePath as NSString).appendingPathComponent("Frameworks/App.framework/flutter_assets/assets/nodejs")
     ]
     guard let srcPath = candidates.first(where: { fm.fileExists(atPath: $0) }) else {
       throw NSError(
@@ -554,11 +607,10 @@ private enum NodeAssetsIos {
       )
     }
 
-    let info = Bundle.main.infoDictionary ?? [:]
     let shortVer = (info["CFBundleShortVersionString"] as? String) ?? "0.1.0"
     let buildVer = (info["CFBundleVersion"] as? String) ?? "1"
     let execMtime: TimeInterval = {
-      guard let execPath = Bundle.main.executablePath,
+      guard let execPath = executablePath,
             let attrs = try? fm.attributesOfItem(atPath: execPath),
             let date = attrs[.modificationDate] as? Date else { return 0 }
       return date.timeIntervalSince1970

@@ -37,6 +37,10 @@ public class NovaPlayIosPlugin: NSObject, FlutterPlugin {
     // 5. First-install first-launch network permission prompts (Wireless Data -> Local Network)
     IosFirstLaunchPermissions.shared.startIfNeeded()
   }
+
+  @objc public static func supportedInterfaceOrientations(for window: UIWindow?) -> UIInterfaceOrientationMask {
+    NativePlayerHost.shared.supportedInterfaceOrientations(for: window)
+  }
 }
 
 enum IosHaptics {
