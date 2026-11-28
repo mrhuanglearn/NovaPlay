@@ -105,7 +105,9 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     if let w = request.initialSource?.videoWidth ?? request.initialVideoWidth,
        let h = request.initialSource?.videoHeight ?? request.initialVideoHeight,
        w > 0, h > 0 {
-      self.probedVideoSize = CGSize(width: CGFloat(w), height: CGFloat(h))
+      let initialSize = CGSize(width: CGFloat(w), height: CGFloat(h))
+      self.probedVideoSize = initialSize
+      kernel.videoView.naturalVideoSize = initialSize
     }
 
     IosPlayerUiText.applyLocale(initialPlayback.uiLocale)
@@ -199,6 +201,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     if isEpisodeSwitch {
       probedVideoSize = .zero
       lastReportedDecodedSize = .zero
+      kernel.videoView.naturalVideoSize = .zero
       extraSubtitles.removeAll()
       danmakuAnimeTitle = nil
       danmakuEpisodeTitle = nil
@@ -258,7 +261,11 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     }
     lastPayload = payload
     if let w = payload.videoWidth, let h = payload.videoHeight, w > 0, h > 0 {
-      probedVideoSize = CGSize(width: CGFloat(w), height: CGFloat(h))
+      let pSize = CGSize(width: CGFloat(w), height: CGFloat(h))
+      probedVideoSize = pSize
+      if effectiveDisplayVideoSize == .zero {
+        kernel.videoView.naturalVideoSize = pSize
+      }
       uiDelegate?.controllerDidUpdateMetrics()
     }
 
@@ -301,6 +308,9 @@ final class IosPlayerController: IosPlayerKernelDelegate {
   func seedInitialProbedSize(_ size: CGSize) {
     guard size.width > 0 && size.height > 0 else { return }
     probedVideoSize = size
+    if effectiveDisplayVideoSize == .zero {
+      kernel.videoView.naturalVideoSize = size
+    }
   }
 
   func onProbedVideoSize(sessionId: String, lineIndex: Int, episodeIndex: Int, width: Int, height: Int) {
@@ -326,6 +336,9 @@ final class IosPlayerController: IosPlayerKernelDelegate {
       if isVlcTranspose {
         self.kernelDidUpdateMetrics()
       } else {
+        if self.effectiveDisplayVideoSize == .zero {
+          self.kernel.videoView.naturalVideoSize = nextProbed
+        }
         self.uiDelegate?.controllerDidUpdateMetrics()
       }
     }

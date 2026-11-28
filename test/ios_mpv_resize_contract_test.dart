@@ -133,6 +133,9 @@ assert obj[out_stroff + syms["_ra_ctx_vulkan_moltenvk"][3]:out_stroff + syms["_r
 
     final ctrlSwift = File('packages/novaplay_ios/ios/Classes/Player/IosPlayerController.swift').readAsStringSync();
     expect(ctrlSwift, contains('kernel.videoView.naturalVideoSize = kSize'));
+    expect(ctrlSwift, contains('kernel.videoView.naturalVideoSize = .zero'));
+    expect(vcSwift, contains('if overlayHost.isMenuOpen {'));
+    expect(vcSwift, contains('if overlayHost.isPanelOpen && (size.width > size.height) != (view.bounds.width > view.bounds.height)'));
   });
 
   test('uzv_moltenvk_resize_shim C state machine handles stale extent, 1x1 init, 1px rounding, and concurrent notify race', () async {

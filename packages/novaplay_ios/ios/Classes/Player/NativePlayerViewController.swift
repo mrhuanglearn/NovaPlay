@@ -353,6 +353,12 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     pendingGeometryRetryWork = nil
     isTransitioningOrientation = true
     inFlightGeometryUntil = 0
+    if overlayHost.isMenuOpen {
+      overlayHost.closeMenu()
+    }
+    if overlayHost.isPanelOpen && (size.width > size.height) != (view.bounds.width > view.bounds.height) {
+      overlayHost.closePanel()
+    }
     coordinator.animate(alongsideTransition: { [weak self] _ in
       self?.view.layoutIfNeeded()
     }) { [weak self] _ in
