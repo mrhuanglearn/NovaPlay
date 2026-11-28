@@ -184,6 +184,13 @@ final class PlayerVideoContainerView: UIView {
     applyFitLayout()
   }
 
+  func syncActiveBackendLayoutAfterTransition() {
+    setNeedsLayout()
+    layoutIfNeeded()
+    applyFitLayout()
+    mpvMetalView.syncDrawableSizeIfNeeded(forceNotify: activeBackend == "mpv")
+  }
+
   fileprivate func applyFitLayout() {
     // 1. AVPlayerLayer gravity
     switch fitMode {
@@ -196,7 +203,11 @@ final class PlayerVideoContainerView: UIView {
     }
 
     // 2. MPV Metal view always fills container bounds (aspect/panscan handled inside libmpv)
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
     mpvMetalView.frame = bounds
+    CATransaction.commit()
+    mpvMetalView.syncDrawableSizeIfNeeded()
 
     // 3. VLC drawable frame & aspect ratio
     guard bounds.width > 0, bounds.height > 0 else {

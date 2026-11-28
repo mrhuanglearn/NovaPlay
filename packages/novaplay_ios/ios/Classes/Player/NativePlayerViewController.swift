@@ -353,7 +353,9 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     pendingGeometryRetryWork = nil
     isTransitioningOrientation = true
     inFlightGeometryUntil = 0
-    coordinator.animate(alongsideTransition: nil) { [weak self] _ in
+    coordinator.animate(alongsideTransition: { [weak self] _ in
+      self?.view.layoutIfNeeded()
+    }) { [weak self] _ in
       guard let self = self else { return }
       self.isTransitioningOrientation = false
       self.inFlightGeometryStep = nil
@@ -361,6 +363,9 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
       self.geometryRetryCount = 0
       self.pendingGeometryRetryWork?.cancel()
       self.pendingGeometryRetryWork = nil
+      self.view.setNeedsLayout()
+      self.view.layoutIfNeeded()
+      self.controller.kernel.videoView.syncActiveBackendLayoutAfterTransition()
       self.syncOrientationForCurrentState()
     }
   }

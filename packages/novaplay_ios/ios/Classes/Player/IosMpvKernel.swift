@@ -6,15 +6,43 @@ import UIKit
 
 private let mpvUsbLog = Logger(subsystem: "app.novaplay.player", category: "mpv")
 
+/// `CAMetalLayer` subclass guarding against MoltenVK 1x1 drawable clobbers and off-main-thread EDR mutations.
+private final class NovaMpvMetalLayer: CAMetalLayer {
+  override var drawableSize: CGSize {
+    get { super.drawableSize }
+    set {
+      guard newValue.width > 1, newValue.height > 1 else { return }
+      super.drawableSize = newValue
+    }
+  }
+
+  override var wantsExtendedDynamicRangeContent: Bool {
+    get { super.wantsExtendedDynamicRangeContent }
+    set {
+      if Thread.isMainThread {
+        super.wantsExtendedDynamicRangeContent = newValue
+      } else {
+        DispatchQueue.main.async {
+          super.wantsExtendedDynamicRangeContent = newValue
+        }
+      }
+    }
+  }
+}
+
 /// Metal-backed drawable view (`CAMetalLayer`) used by `libmpv` (`vo=gpu-next`, `gpu-context=moltenvk`).
 final class MpvMetalView: UIView {
   override class var layerClass: AnyClass {
-    CAMetalLayer.self
+    NovaMpvMetalLayer.self
   }
 
   var metalLayer: CAMetalLayer {
     // swiftlint:disable:next force_cast
     layer as! CAMetalLayer
+  }
+
+  var layerWid: Int64 {
+    Int64(Int(bitPattern: Unmanaged.passUnretained(metalLayer).toOpaque()))
   }
 
   var onLayoutReady: (() -> Void)?
@@ -44,37 +72,55 @@ final class MpvMetalView: UIView {
   }
 
   func ensureDeviceAttached() {
-    guard metalLayer.device == nil else { return }
-    metalLayer.device = MTLCreateSystemDefaultDevice()
+    if metalLayer.device == nil {
+      metalLayer.device = MTLCreateSystemDefaultDevice()
+    }
     let scale = window?.screen.nativeScale ?? UIScreen.main.nativeScale
     let refBounds = (bounds.width > 1 && bounds.height > 1) ? bounds : UIScreen.main.bounds
-    metalLayer.contentsScale = scale
-    metalLayer.drawableSize = CGSize(
+    let target = CGSize(
       width: max(64, (refBounds.width * scale).rounded()),
       height: max(64, (refBounds.height * scale).rounded())
     )
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    metalLayer.contentsScale = scale
+    metalLayer.drawableSize = target
+    CATransaction.commit()
+    uzv_ios_mpv_notify_layer_resized(layerWid, Int32(target.width), Int32(target.height))
+  }
+
+  func syncDrawableSizeIfNeeded(forceNotify: Bool = false) {
+    guard !isHidden || metalLayer.device != nil else { return }
+    let scale = window?.screen.nativeScale ?? UIScreen.main.nativeScale
+    guard bounds.width > 1, bounds.height > 1 else { return }
+    let target = CGSize(
+      width: (bounds.width * scale).rounded(),
+      height: (bounds.height * scale).rounded()
+    )
+    let changed = (metalLayer.contentsScale != scale) || (metalLayer.drawableSize != target)
+    if changed {
+      CATransaction.begin()
+      CATransaction.setDisableActions(true)
+      if metalLayer.contentsScale != scale {
+        metalLayer.contentsScale = scale
+      }
+      if metalLayer.drawableSize != target {
+        metalLayer.drawableSize = target
+      }
+      CATransaction.commit()
+    }
+    if changed || forceNotify {
+      uzv_ios_mpv_notify_layer_resized(layerWid, Int32(target.width), Int32(target.height))
+    }
+    if let cb = onLayoutReady {
+      onLayoutReady = nil
+      cb()
+    }
   }
 
   override func layoutSubviews() {
     super.layoutSubviews()
-    guard !isHidden || metalLayer.device != nil else { return }
-    let scale = window?.screen.nativeScale ?? UIScreen.main.nativeScale
-    if metalLayer.contentsScale != scale {
-      metalLayer.contentsScale = scale
-    }
-    if bounds.width > 1 && bounds.height > 1 {
-      let target = CGSize(
-        width: (bounds.width * scale).rounded(),
-        height: (bounds.height * scale).rounded()
-      )
-      if metalLayer.drawableSize != target {
-        metalLayer.drawableSize = target
-      }
-      if let cb = onLayoutReady {
-        onLayoutReady = nil
-        cb()
-      }
-    }
+    syncDrawableSizeIfNeeded()
   }
 }
 
@@ -379,6 +425,7 @@ final class IosMpvEngine {
 
     DispatchQueue.main.async { [weak self] in
       guard let self = self, !self.isCurrentlyDestroyed() else { return }
+      self.metalView?.syncDrawableSizeIfNeeded(forceNotify: true)
       self.startStatsTimer()
     }
     mpvUsbLog.notice("[NovaPlay][MPV] initialized vo=\(activeVo, privacy: .public) hwdec=\(hw, privacy: .public)")
@@ -898,6 +945,7 @@ final class IosMpvEngine {
             self.cachedSubtitleParsedTracks = tracks.subs
             self.cachedAudioParsedTracks = tracks.audios
             self.applyMetadataSnapshotOnMain(meta)
+            self.metalView?.syncDrawableSizeIfNeeded(forceNotify: true)
             if UIApplication.shared.applicationState == .background {
               self.pause()
             } else {

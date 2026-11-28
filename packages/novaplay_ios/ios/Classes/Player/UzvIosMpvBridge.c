@@ -85,6 +85,7 @@ typedef struct {
 #undef DECL_FN
     int (*mpv_command_async)(mpv_handle *ctx, uint64_t reply_userdata, const char **args);
     int (*mpv_set_property_async)(mpv_handle *ctx, uint64_t reply_userdata, const char *name, int format, void *data);
+    void (*mpv_novaplay_notify_layer_resized)(int64_t wid, int32_t width, int32_t height);
 } UzvIosMpvApi;
 
 struct uzv_mpv_instance {
@@ -120,6 +121,7 @@ static bool try_bind_symbols(void *lib_handle, const char *source_name) {
     }
     *(void **)(&candidate.mpv_command_async) = dlsym(lib_handle, "mpv_command_async");
     *(void **)(&candidate.mpv_set_property_async) = dlsym(lib_handle, "mpv_set_property_async");
+    *(void **)(&candidate.mpv_novaplay_notify_layer_resized) = dlsym(lib_handle, "mpv_novaplay_notify_layer_resized");
     g_mpv = candidate;
     snprintf(g_load_detail, sizeof(g_load_detail), "Loaded libmpv from %s", source_name);
     return true;
@@ -248,6 +250,19 @@ int uzv_ios_mpv_initialize(uzv_mpv_instance *inst) {
 void uzv_ios_mpv_wakeup(uzv_mpv_instance *inst) {
     if (!inst || !inst->handle) return;
     g_mpv.mpv_wakeup(inst->handle);
+}
+
+void uzv_ios_mpv_notify_layer_resized(int64_t wid, int32_t width, int32_t height) {
+    if (wid == 0 || width <= 1 || height <= 1) return;
+    void (*fn)(int64_t, int32_t, int32_t) = NULL;
+    pthread_mutex_lock(&g_load_lock);
+    if (g_load_state == 1) {
+        fn = g_mpv.mpv_novaplay_notify_layer_resized;
+    }
+    pthread_mutex_unlock(&g_load_lock);
+    if (fn) {
+        fn(wid, width, height);
+    }
 }
 
 void uzv_ios_mpv_destroy(uzv_mpv_instance *inst) {

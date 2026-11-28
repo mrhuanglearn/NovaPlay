@@ -41,6 +41,9 @@ int uzv_ios_mpv_initialize(uzv_mpv_instance *inst);
 /// Wakes any blocked event waiter.
 void uzv_ios_mpv_wakeup(uzv_mpv_instance *inst);
 
+/// Notifies NovaMpv's MoltenVK context shim that the bound CAMetalLayer (`wid`) drawable size changed.
+void uzv_ios_mpv_notify_layer_resized(int64_t wid, int32_t width, int32_t height);
+
 /// Terminates and frees the mpv instance.
 void uzv_ios_mpv_destroy(uzv_mpv_instance *inst);
 

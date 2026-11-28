@@ -39,6 +39,7 @@ import pathlib
 import plistlib
 import re
 import shutil
+import struct
 import subprocess
 import sys
 
@@ -409,10 +410,13 @@ for tname, xcfws in extracted_items:
 
         file_desc = run(["file", "-b", str(bin_path)]).lower()
         if "ar archive" in file_desc or "mach-o 64-bit object" in file_desc or bin_path.suffix == ".a":
-            # Ensure multi-arch static archives are thinned to arm64 so nm & -force_load operate cleanly
+            # Ensure fat Mach-O static archives (including single-arch 0xcafebabe wrappers) are thinned to arm64
+            with bin_path.open("rb") as mfp:
+                head4 = mfp.read(4)
+            is_fat = head4 in (b"\xca\xfe\xba\xbe", b"\xbe\xba\xfe\xca", b"\xca\xfe\xba\xbf", b"\xbf\xba\xfe\xca")
             try:
                 archs_raw = run(["xcrun", "lipo", "-archs", str(bin_path)]).strip().split()
-                if len(archs_raw) > 1 and "arm64" in archs_raw:
+                if (len(archs_raw) > 1 or is_fat) and "arm64" in archs_raw:
                     thinned = work_dir / f"thin_{len(static_archives)}_{tname}_{bin_path.name}.a"
                     run(["xcrun", "lipo", str(bin_path), "-thin", "arm64", "-output", str(thinned)])
                     bin_path = thinned
@@ -452,8 +456,476 @@ print(
     flush=True,
 )
 
+iphoneos_sdk = run(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"]).strip()
+iphonesim_sdk = run(["xcrun", "--sdk", "iphonesimulator", "--show-sdk-path"]).strip()
+
+
+def parse_bsd_ar_members(ar_bytes):
+    if ar_bytes[:8] != b"!<arch>\n":
+        return []
+    pos = 8
+    n = len(ar_bytes)
+    members = []
+    while pos + 60 <= n:
+        hdr = ar_bytes[pos:pos + 60]
+        if hdr[58:60] != b"`\n":
+            break
+        raw_name = hdr[0:16].decode("latin1")
+        raw_size = int(hdr[48:58].decode("ascii").strip())
+        data_pos = pos + 60
+        data_end = data_pos + raw_size
+        if raw_name.startswith("#1/"):
+            ext_len = int(raw_name[3:].strip())
+            name = ar_bytes[data_pos:data_pos + ext_len].rstrip(b"\x00").decode("utf-8", errors="replace")
+            payload_pos = data_pos + ext_len
+        else:
+            name = raw_name.rstrip(" /")
+            payload_pos = data_pos
+        members.append((name, payload_pos, data_end - payload_pos))
+        pos = data_end + (data_end & 1)
+    return members
+
+
+def parse_macho64_obj(obj_bytes):
+    magic, _, _, filetype, ncmds, _, _, _ = struct.unpack_from("<IIIIIIII", obj_bytes, 0)
+    if magic != 0xFEEDFACF or filetype != 1:
+        raise RuntimeError(f"Unexpected Mach-O object header: magic={hex(magic)} type={filetype}")
+    sections = {}
+    symoff = nsyms = stroff = strsize = None
+    off = 32
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", obj_bytes, off)
+        if cmd == 0x19:  # LC_SEGMENT_64
+            nsects = struct.unpack_from("<I", obj_bytes, off + 64)[0]
+            sect_off = off + 72
+            for _ in range(nsects):
+                sectname = obj_bytes[sect_off:sect_off + 16].split(b"\x00", 1)[0]
+                segname = obj_bytes[sect_off + 16:sect_off + 32].split(b"\x00", 1)[0]
+                s_addr, s_size, s_offset, _, s_reloff, s_nreloc = struct.unpack_from("<QQIIII", obj_bytes, sect_off + 32)
+                sections[(segname, sectname)] = (s_addr, s_size, s_offset, s_reloff, s_nreloc)
+                sect_off += 80
+        elif cmd == 0x02:  # LC_SYMTAB
+            symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", obj_bytes, off + 8)
+        off += cmdsize
+    if symoff is None:
+        raise RuntimeError("Missing LC_SYMTAB in Mach-O object")
+    strtab = obj_bytes[stroff:stroff + strsize]
+    sym_list = []
+    syms = {}
+    for i in range(nsyms):
+        n_strx, n_type, n_sect, n_desc, n_value = struct.unpack_from("<IBBHQ", obj_bytes, symoff + i * 16)
+        end = strtab.find(b"\x00", n_strx)
+        name = strtab[n_strx:end].decode("utf-8", errors="replace")
+        sym_list.append(name)
+        syms[name] = (n_type, n_sect, n_value, n_strx)
+    return sections, sym_list, syms, stroff
+
+
+def maybe_build_moltenvk_resize_shim(libmpv_archive, sdk_path):
+    ar_bytes = libmpv_archive.read_bytes()
+    by_name = {name: (off, sz) for name, off, sz in parse_bsd_ar_members(ar_bytes)}
+    if "video_out_vulkan_context_moltenvk.m.o" not in by_name:
+        print("[fetch_mpvkit] video_out_vulkan_context_moltenvk.m.o not found; skipping resize shim.", flush=True)
+        return None
+    m_off, m_sz = by_name["video_out_vulkan_context_moltenvk.m.o"]
+    molten_bytes = ar_bytes[m_off:m_off + m_sz]
+    sections, sym_list, syms, stroff = parse_macho64_obj(molten_bytes)
+    if "_ra_ctx_vulkan_moltenvk" not in syms or "_moltenvk_control" not in syms or "_moltenvk_reconfig" not in syms:
+        print("[fetch_mpvkit] Unexpected symbols in moltenvk object; skipping resize shim.", flush=True)
+        return None
+
+    text_addr, _, text_fileoff, _, _ = sections[(b"__TEXT", b"__text")]
+    _, const_size, _, const_reloff, const_nreloc = sections[(b"__DATA", b"__const")]
+    ctrl_off = text_fileoff + (syms["_moltenvk_control"][2] - text_addr)
+    ctrl_insns = struct.unpack_from("<II", molten_bytes, ctrl_off)
+    if ctrl_insns != (0x12800040, 0xD65F03C0):
+        print("[fetch_mpvkit] _moltenvk_control already implemented upstream; skipping resize shim.", flush=True)
+        return None
+
+    reconfig_off = text_fileoff + (syms["_moltenvk_reconfig"][2] - text_addr)
+    priv_offset = None
+    layer_offset = None
+    priv_reg = None
+    for pos in range(reconfig_off, ctrl_off, 4):
+        insn = struct.unpack_from("<I", molten_bytes, pos)[0]
+        if (insn & 0xFFC00000) == 0xF9400000:
+            imm_bytes = ((insn >> 10) & 0xFFF) * 8
+            rn = (insn >> 5) & 0x1F
+            rt = insn & 0x1F
+            if priv_offset is None and rn in (0, 19):
+                priv_offset = imm_bytes
+                priv_reg = rt
+            elif priv_offset is not None and rn == priv_reg and rt == 0:
+                layer_offset = imm_bytes
+                break
+    if priv_offset is None or layer_offset is None:
+        raise RuntimeError("Could not extract priv/layer offsets from _moltenvk_reconfig")
+
+    vo_dwidth_offset = 248
+    if "video_out_vulkan_context.c.o" in by_name:
+        v_off, v_sz = by_name["video_out_vulkan_context.c.o"]
+        vk_bytes = ar_bytes[v_off:v_off + v_sz]
+        vk_sects, _, vk_syms, _ = parse_macho64_obj(vk_bytes)
+        if "_ra_vk_ctx_resize" in vk_syms and (b"__TEXT", b"__text") in vk_sects:
+            vt_addr, _, vt_off, _, _ = vk_sects[(b"__TEXT", b"__text")]
+            r_off = vt_off + (vk_syms["_ra_vk_ctx_resize"][2] - vt_addr)
+            for pos in range(r_off, min(len(vk_bytes), r_off + 128), 4):
+                insn = struct.unpack_from("<I", vk_bytes, pos)[0]
+                if (insn & 0xFFC00000) == 0x29000000:
+                    imm7 = (insn >> 15) & 0x7F
+                    if imm7 & 0x40:
+                        imm7 -= 0x80
+                    rn = (insn >> 5) & 0x1F
+                    if rn != 31 and imm7 * 4 >= 64:
+                        vo_dwidth_offset = imm7 * 4
+                        break
+
+    relocs = {}
+    for i in range(const_nreloc):
+        r_addr, r_info = struct.unpack_from("<II", molten_bytes, const_reloff + i * 8)
+        r_sym = r_info & 0x00FFFFFF
+        r_extern = (r_info >> 27) & 1
+        if r_extern and r_sym < len(sym_list):
+            relocs[sym_list[r_sym]] = r_addr
+
+    if const_size % 8 != 0:
+        raise RuntimeError(f"Unexpected _ra_ctx_vulkan_moltenvk size: {const_size}")
+    ptr_count = const_size // 8
+    type_idx = relocs.get("l_.str", 0) // 8
+    name_idx = relocs.get("l_.str.1", 8) // 8
+    reconfig_idx = relocs["_moltenvk_reconfig"] // 8
+    control_idx = relocs["_moltenvk_control"] // 8
+    init_idx = relocs["_moltenvk_init"] // 8
+    uninit_idx = relocs["_moltenvk_uninit"] // 8
+
+    old_sym = b"_ra_ctx_vulkan_moltenvk\x00"
+    new_sym = b"_uzv_orig_moltenvk_fns_\x00"
+    sym_pos = stroff + syms["_ra_ctx_vulkan_moltenvk"][3]
+    if molten_bytes[sym_pos:sym_pos + len(old_sym)] != old_sym:
+        raise RuntimeError("Symbol string mismatch in video_out_vulkan_context_moltenvk.m.o")
+
+    patched_ar = bytearray(ar_bytes)
+    patched_ar[m_off + sym_pos:m_off + sym_pos + len(new_sym)] = new_sym
+    patched_path = work_dir / "libmpv_moltenvk_patched.a"
+    patched_path.write_bytes(patched_ar)
+    run(["xcrun", "ranlib", str(patched_path)])
+
+    shim_m = work_dir / "uzv_moltenvk_resize_shim.m"
+    shim_o = work_dir / "uzv_moltenvk_resize_shim.o"
+    shim_m.write_text(
+        """#import <QuartzCore/QuartzCore.h>
+#include <math.h>
+#include <pthread.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+
+struct ra_ctx;
+struct vo;
+
+extern const void * const uzv_orig_moltenvk_fns_[UZV_FNS_PTR_COUNT];
+extern bool ra_vk_ctx_resize(struct ra_ctx *ctx, int width, int height);
+extern void vo_wakeup(struct vo *vo);
+
+#define UZV_VOCTRL_CHECK_EVENTS 2
+#define UZV_VO_TRUE 1
+#define UZV_VO_ERROR (-1)
+#define UZV_VO_NOTIMPL (-3)
+#define UZV_VO_EVENT_EXPOSE (1 << 0)
+#define UZV_VO_EVENT_RESIZE (1 << 1)
+#define UZV_MAX_SLOTS 16
+
+typedef struct {
+    struct ra_ctx *ctx;
+    struct vo *vo;
+    int64_t wid;
+    int last_w;
+    int last_h;
+    int notified_w;
+    int notified_h;
+    bool force_resize;
+} UzvMoltenvkSlot;
+
+static pthread_mutex_t g_shim_lock = PTHREAD_MUTEX_INITIALIZER;
+static UzvMoltenvkSlot g_slots[UZV_MAX_SLOTS];
+
+static CAMetalLayer *uzv_ctx_layer(struct ra_ctx *ctx) {
+    if (!ctx) return NULL;
+    void *priv = *(void * const *)((const char *)ctx + UZV_RA_CTX_PRIV_OFFSET);
+    if (!priv) return NULL;
+    return *(CAMetalLayer * const *)((const char *)priv + UZV_PRIV_LAYER_OFFSET);
+}
+
+static struct vo *uzv_ctx_vo(struct ra_ctx *ctx) {
+    if (!ctx) return NULL;
+    return *(struct vo * const *)ctx;
+}
+
+static void uzv_read_layer_drawable_size(
+    struct ra_ctx *ctx,
+    int fallback_w,
+    int fallback_h,
+    int *out_w,
+    int *out_h
+) {
+    int w = 0;
+    int h = 0;
+    CAMetalLayer *layer = uzv_ctx_layer(ctx);
+    if (layer != NULL) {
+        CGSize s = [layer drawableSize];
+        if (isfinite(s.width) && isfinite(s.height)) {
+            w = (int)llround(s.width);
+            h = (int)llround(s.height);
+        }
+    }
+    if ((w <= 1 || h <= 1) && fallback_w > 1 && fallback_h > 1) {
+        w = fallback_w;
+        h = fallback_h;
+    }
+    *out_w = w;
+    *out_h = h;
+}
+
+static bool uzv_sync_ctx_size(struct ra_ctx *ctx, bool is_reconfig, bool *out_resized) {
+    if (out_resized) *out_resized = false;
+    if (!ctx) return false;
+
+    int fallback_w = 0;
+    int fallback_h = 0;
+    int prev_w = 0;
+    int prev_h = 0;
+    bool forced = false;
+
+    pthread_mutex_lock(&g_shim_lock);
+    for (int i = 0; i < UZV_MAX_SLOTS; i++) {
+        if (g_slots[i].ctx == ctx) {
+            fallback_w = g_slots[i].notified_w;
+            fallback_h = g_slots[i].notified_h;
+            prev_w = g_slots[i].last_w;
+            prev_h = g_slots[i].last_h;
+            forced = g_slots[i].force_resize;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_shim_lock);
+
+    int w = 0;
+    int h = 0;
+    uzv_read_layer_drawable_size(ctx, fallback_w, fallback_h, &w, &h);
+    if (w <= 1 || h <= 1) {
+        return true;
+    }
+
+    struct vo *vo = uzv_ctx_vo(ctx);
+    if (vo != NULL) {
+        *(int *)((char *)vo + UZV_VO_DWIDTH_OFFSET) = w;
+        *(int *)((char *)vo + UZV_VO_DWIDTH_OFFSET + 4) = h;
+    }
+
+    bool need_resize = is_reconfig || forced || (w != prev_w) || (h != prev_h);
+    if (!need_resize) {
+        return true;
+    }
+
+    bool ok = ra_vk_ctx_resize(ctx, w, h);
+    if (vo != NULL) {
+        int rw = *(const int *)((const char *)vo + UZV_VO_DWIDTH_OFFSET);
+        int rh = *(const int *)((const char *)vo + UZV_VO_DWIDTH_OFFSET + 4);
+        if (rw <= 1 || rh <= 1) {
+            *(int *)((char *)vo + UZV_VO_DWIDTH_OFFSET) = w;
+            *(int *)((char *)vo + UZV_VO_DWIDTH_OFFSET + 4) = h;
+        }
+    }
+
+    if (ok) {
+        pthread_mutex_lock(&g_shim_lock);
+        for (int i = 0; i < UZV_MAX_SLOTS; i++) {
+            if (g_slots[i].ctx == ctx) {
+                g_slots[i].last_w = w;
+                g_slots[i].last_h = h;
+                g_slots[i].force_resize = false;
+                break;
+            }
+        }
+        pthread_mutex_unlock(&g_shim_lock);
+    }
+
+    if (out_resized) {
+        *out_resized = ok && (forced || w != prev_w || h != prev_h);
+    }
+    return ok;
+}
+
+static bool uzv_shim_moltenvk_init(struct ra_ctx *ctx) {
+    bool (*orig_init)(struct ra_ctx *) =
+        (bool (*)(struct ra_ctx *))uzv_orig_moltenvk_fns_[UZV_FNS_INIT_IDX];
+    if (!orig_init || !orig_init(ctx)) {
+        return false;
+    }
+
+    CAMetalLayer *layer = uzv_ctx_layer(ctx);
+    int64_t wid = (int64_t)(intptr_t)layer;
+    struct vo *vo = uzv_ctx_vo(ctx);
+
+    pthread_mutex_lock(&g_shim_lock);
+    UzvMoltenvkSlot *slot = NULL;
+    for (int i = 0; i < UZV_MAX_SLOTS; i++) {
+        if (g_slots[i].ctx == ctx || (g_slots[i].ctx == NULL && wid != 0 && g_slots[i].wid == wid)) {
+            slot = &g_slots[i];
+            break;
+        }
+    }
+    if (!slot) {
+        for (int i = 0; i < UZV_MAX_SLOTS; i++) {
+            if (g_slots[i].ctx == NULL && g_slots[i].wid == 0) {
+                slot = &g_slots[i];
+                break;
+            }
+        }
+    }
+    if (!slot) {
+        slot = &g_slots[0];
+        memset(slot, 0, sizeof(*slot));
+    }
+    slot->ctx = ctx;
+    slot->vo = vo;
+    slot->wid = wid;
+    slot->last_w = 0;
+    slot->last_h = 0;
+    slot->force_resize = true;
+    pthread_mutex_unlock(&g_shim_lock);
+
+    (void)uzv_sync_ctx_size(ctx, true, NULL);
+    return true;
+}
+
+static void uzv_shim_moltenvk_uninit(struct ra_ctx *ctx) {
+    pthread_mutex_lock(&g_shim_lock);
+    for (int i = 0; i < UZV_MAX_SLOTS; i++) {
+        if (g_slots[i].ctx == ctx) {
+            memset(&g_slots[i], 0, sizeof(g_slots[i]));
+        }
+    }
+    pthread_mutex_unlock(&g_shim_lock);
+
+    void (*orig_uninit)(struct ra_ctx *) =
+        (void (*)(struct ra_ctx *))uzv_orig_moltenvk_fns_[UZV_FNS_UNINIT_IDX];
+    if (orig_uninit) {
+        orig_uninit(ctx);
+    }
+}
+
+static bool uzv_shim_moltenvk_reconfig(struct ra_ctx *ctx) {
+    (void)uzv_sync_ctx_size(ctx, true, NULL);
+    return true;
+}
+
+static int uzv_shim_moltenvk_control(struct ra_ctx *ctx, int *events, int request, void *arg) {
+    if (request != UZV_VOCTRL_CHECK_EVENTS) {
+        int (*orig_ctrl)(struct ra_ctx *, int *, int, void *) =
+            (int (*)(struct ra_ctx *, int *, int, void *))uzv_orig_moltenvk_fns_[UZV_FNS_CONTROL_IDX];
+        return orig_ctrl ? orig_ctrl(ctx, events, request, arg) : UZV_VO_NOTIMPL;
+    }
+    bool resized = false;
+    if (!uzv_sync_ctx_size(ctx, false, &resized)) {
+        return UZV_VO_ERROR;
+    }
+    if (resized && events != NULL) {
+        *events |= (UZV_VO_EVENT_RESIZE | UZV_VO_EVENT_EXPOSE);
+    }
+    return UZV_VO_TRUE;
+}
+
+__attribute__((visibility("default")))
+void mpv_novaplay_notify_layer_resized(int64_t wid, int32_t width, int32_t height) {
+    if (wid == 0 || width <= 1 || height <= 1) {
+        return;
+    }
+    pthread_mutex_lock(&g_shim_lock);
+    UzvMoltenvkSlot *matched = NULL;
+    for (int i = 0; i < UZV_MAX_SLOTS; i++) {
+        if (g_slots[i].wid == wid) {
+            matched = &g_slots[i];
+            matched->notified_w = (int)width;
+            matched->notified_h = (int)height;
+            matched->force_resize = true;
+            if (matched->vo != NULL) {
+                vo_wakeup(matched->vo);
+            }
+        }
+    }
+    if (!matched) {
+        for (int i = 0; i < UZV_MAX_SLOTS; i++) {
+            if (g_slots[i].ctx == NULL && g_slots[i].wid == 0) {
+                g_slots[i].wid = wid;
+                g_slots[i].notified_w = (int)width;
+                g_slots[i].notified_h = (int)height;
+                g_slots[i].force_resize = true;
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&g_shim_lock);
+}
+
+const void * const ra_ctx_vulkan_moltenvk[UZV_FNS_PTR_COUNT] = {
+    [UZV_FNS_TYPE_IDX] = "vulkan",
+    [UZV_FNS_NAME_IDX] = "moltenvk",
+    [UZV_FNS_RECONFIG_IDX] = (const void *)uzv_shim_moltenvk_reconfig,
+    [UZV_FNS_CONTROL_IDX] = (const void *)uzv_shim_moltenvk_control,
+    [UZV_FNS_INIT_IDX] = (const void *)uzv_shim_moltenvk_init,
+    [UZV_FNS_UNINIT_IDX] = (const void *)uzv_shim_moltenvk_uninit,
+};
+""",
+        encoding="utf-8",
+    )
+    run([
+        "xcrun",
+        "--sdk",
+        "iphoneos",
+        "clang",
+        "-c",
+        "-x",
+        "objective-c",
+        "-arch",
+        "arm64",
+        "-isysroot",
+        sdk_path,
+        "-miphoneos-version-min=15.0",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-Werror",
+        f"-DUZV_FNS_PTR_COUNT={ptr_count}",
+        f"-DUZV_FNS_TYPE_IDX={type_idx}",
+        f"-DUZV_FNS_NAME_IDX={name_idx}",
+        f"-DUZV_FNS_RECONFIG_IDX={reconfig_idx}",
+        f"-DUZV_FNS_CONTROL_IDX={control_idx}",
+        f"-DUZV_FNS_INIT_IDX={init_idx}",
+        f"-DUZV_FNS_UNINIT_IDX={uninit_idx}",
+        f"-DUZV_RA_CTX_PRIV_OFFSET={priv_offset}",
+        f"-DUZV_PRIV_LAYER_OFFSET={layer_offset}",
+        f"-DUZV_VO_DWIDTH_OFFSET={vo_dwidth_offset}",
+        str(shim_m),
+        "-o",
+        str(shim_o),
+    ])
+    print(
+        f"[fetch_mpvkit] Applied MoltenVK resize shim (priv_off={priv_offset}, layer_off={layer_offset}, dwidth_off={vo_dwidth_offset}).",
+        flush=True,
+    )
+    return (patched_path, shim_o)
+
+
+shim_result = maybe_build_moltenvk_resize_shim(libmpv_static, iphoneos_sdk)
+moltenvk_shim_obj = None
+if shim_result is not None:
+    libmpv_static, moltenvk_shim_obj = shim_result
+
 # Build exported symbol list: ONLY `_mpv_*` (and `_vk*` if MoltenVK is static so libplacebo dlsym finds Vulkan)
 exp_syms = set()
+if moltenvk_shim_obj is not None:
+    exp_syms.add("_mpv_novaplay_notify_layer_resized")
 nm_mpv = run(["xcrun", "nm", "-arch", "arm64", "-gU", str(libmpv_static)])
 for line in nm_mpv.splitlines():
     toks = line.strip().split()
@@ -478,9 +950,6 @@ if not exp_syms:
 
 sym_file = work_dir / "exported_mpv.sym"
 sym_file.write_text("\n".join(sorted(exp_syms)) + "\n", encoding="utf-8")
-
-iphoneos_sdk = run(["xcrun", "--sdk", "iphoneos", "--show-sdk-path"]).strip()
-iphonesim_sdk = run(["xcrun", "--sdk", "iphonesimulator", "--show-sdk-path"]).strip()
 
 base_frameworks = [
     "Foundation",
@@ -547,8 +1016,10 @@ link_cmd = [
     "-install_name",
     "@rpath/NovaMpv.framework/NovaMpv",
     f"-Wl,-exported_symbols_list,{sym_file}",
-    f"-Wl,-force_load,{libmpv_static}",
 ]
+if moltenvk_shim_obj is not None:
+    link_cmd.append(str(moltenvk_shim_obj))
+link_cmd.append(f"-Wl,-force_load,{libmpv_static}")
 if has_static_vulkan:
     link_cmd.append("-Wl,-u,_vkGetInstanceProcAddr")
 
@@ -593,7 +1064,11 @@ with (dev_fw_dir / "Info.plist").open("wb") as fp:
 
 # Build lightweight iOS Simulator slice (arm64 + x86_64) so simulator builds also succeed cleanly
 sim_c = work_dir / "sim_stub.c"
-sim_c.write_text("int uzv_novampv_simulator_stub(void) { return 0; }\n", encoding="utf-8")
+sim_c.write_text(
+    "int uzv_novampv_simulator_stub(void) { return 0; }\n"
+    "void mpv_novaplay_notify_layer_resized(long long wid, int w, int h) { (void)wid; (void)w; (void)h; }\n",
+    encoding="utf-8",
+)
 sim_arm64 = work_dir / "sim_arm64.dylib"
 sim_x86 = work_dir / "sim_x86_64.dylib"
 for arch, out_p in [("arm64", sim_arm64), ("x86_64", sim_x86)]:
