@@ -116,5 +116,13 @@ assert obj[out_stroff + syms["_ra_ctx_vulkan_moltenvk"][3]:out_stroff + syms["_r
     expect(mpvSwift, contains('uzv_ios_mpv_notify_layer_resized('));
     expect(kernelSwift, contains('func syncActiveBackendLayoutAfterTransition()'));
     expect(vcSwift, contains('syncActiveBackendLayoutAfterTransition()'));
+
+    final syncBlockStart = vcSwift.indexOf('private func syncOrientationForCurrentState(');
+    expect(syncBlockStart, greaterThanOrEqualTo(0));
+    final syncBlock = vcSwift.substring(syncBlockStart, syncBlockStart + 600);
+    final manualIdx = syncBlock.indexOf('if manualOrientationThisEpisode {');
+    final switchIdx = syncBlock.indexOf('switch mode {');
+    expect(manualIdx, greaterThanOrEqualTo(0));
+    expect(switchIdx, greaterThan(manualIdx));
   });
 }

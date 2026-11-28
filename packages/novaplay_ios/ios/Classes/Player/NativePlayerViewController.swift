@@ -665,41 +665,35 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     guard !isExitingPlayer, !dismissedForPiP, !isBeingDismissed, !screenLocked else { return }
     let mode = IosPlayerUiText.effectiveOrientationMode(controller.playbackConfig)
     let desired: OrientationStep
-    switch mode {
-    case "landscape":
-      if let saved = pipSavedOrientationStep, saved.isLandscapeTarget {
-        desired = saved
-      } else {
-        desired = .sensorLandscape
-      }
+    if manualOrientationThisEpisode {
+      desired = pipSavedOrientationStep ?? orientationStep
       pipSavedOrientationStep = nil
-    case "portrait":
-      desired = .portrait
-      pipSavedOrientationStep = nil
-    default:
-      if !isPhone {
-        if manualOrientationThisEpisode {
-          desired = pipSavedOrientationStep ?? orientationStep
+    } else {
+      switch mode {
+      case "landscape":
+        if let saved = pipSavedOrientationStep, saved.isLandscapeTarget {
+          desired = saved
         } else {
-          desired = .all
+          desired = .sensorLandscape
         }
         pipSavedOrientationStep = nil
-      } else if manualOrientationThisEpisode {
-        if let saved = pipSavedOrientationStep {
-          desired = saved
+      case "portrait":
+        desired = .portrait
+        pipSavedOrientationStep = nil
+      default:
+        if !isPhone {
+          desired = .all
+          pipSavedOrientationStep = nil
+        } else if let size = effectiveVideoSizeForOrientation() {
+          if isViewLoaded && !ignoreOverlay && (overlayHost.isPanelOpen || overlayHost.isMenuOpen) {
+            return
+          }
+          desired = (size.width >= size.height) ? .sensorLandscape : .portrait
           pipSavedOrientationStep = nil
         } else {
-          desired = orientationStep
+          desired = pipSavedOrientationStep ?? .sensorLandscape
+          pipSavedOrientationStep = nil
         }
-      } else if let size = effectiveVideoSizeForOrientation() {
-        if isViewLoaded && !ignoreOverlay && (overlayHost.isPanelOpen || overlayHost.isMenuOpen) {
-          return
-        }
-        desired = (size.width >= size.height) ? .sensorLandscape : .portrait
-        pipSavedOrientationStep = nil
-      } else {
-        desired = pipSavedOrientationStep ?? .sensorLandscape
-        pipSavedOrientationStep = nil
       }
     }
     let stepMismatch = (orientationStep != desired)
@@ -765,16 +759,20 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     pipSavedOrientationStep = nil
     staleVideoSize = controller.effectiveDisplayVideoSize
     guard isViewLoaded, !dismissedForPiP, !screenLocked else { return }
-    if wasManual && isPhone && IosPlayerUiText.effectiveOrientationMode(controller.playbackConfig) == "auto" {
-      let targetLandscape = prevSize.map { $0.width >= $0.height } ?? true
-      let targetStep: OrientationStep = targetLandscape ? .sensorLandscape : .portrait
-      let stepMismatch = (orientationStep != targetStep)
-      let boundsMismatch = !currentGeometryMatches(targetStep)
-      if stepMismatch || boundsMismatch {
-        orientationStep = targetStep
-        if view.window != nil && !isBeingPresented {
-          applyOrientationStep()
+    if wasManual {
+      if isPhone && IosPlayerUiText.effectiveOrientationMode(controller.playbackConfig) == "auto" {
+        let targetLandscape = prevSize.map { $0.width >= $0.height } ?? true
+        let targetStep: OrientationStep = targetLandscape ? .sensorLandscape : .portrait
+        let stepMismatch = (orientationStep != targetStep)
+        let boundsMismatch = !currentGeometryMatches(targetStep)
+        if stepMismatch || boundsMismatch {
+          orientationStep = targetStep
+          if view.window != nil && !isBeingPresented {
+            applyOrientationStep()
+          }
         }
+      } else {
+        syncOrientationForCurrentState(applyNow: view.window != nil && !isBeingPresented)
       }
     }
   }
