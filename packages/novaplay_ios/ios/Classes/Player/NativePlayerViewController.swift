@@ -89,6 +89,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
 
   private var orientationStep: OrientationStep
   private var builtForLandscape: Bool?
+  private var lastSceneOrientation: UIInterfaceOrientation = .unknown
 
   // Orientation state (adapts immediately from fast-probed or decoded size; defaults to landscape when unknown)
   private let isPhone: Bool = UIDevice.current.userInterfaceIdiom == .phone
@@ -356,7 +357,7 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     if overlayHost.isMenuOpen {
       overlayHost.closeMenu()
     }
-    if overlayHost.isPanelOpen && (size.width > size.height) != (view.bounds.width > view.bounds.height) {
+    if overlayHost.isPanelOpen && size != view.bounds.size {
       overlayHost.closePanel()
     }
     coordinator.animate(alongsideTransition: { [weak self] _ in
@@ -376,13 +377,33 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     }
   }
 
+  private func syncSceneOrientationFlipIfNeeded() {
+    guard !isExitingPlayer,
+          let curOrient = view.window?.windowScene?.interfaceOrientation,
+          curOrient != .unknown else { return }
+    let prev = lastSceneOrientation
+    lastSceneOrientation = curOrient
+    guard prev != .unknown, prev != curOrient else { return }
+    if overlayHost.isMenuOpen {
+      overlayHost.closeMenu()
+    }
+    if !isTransitioningOrientation {
+      inFlightGeometryStep = nil
+      inFlightGeometryUntil = 0
+      controller.kernel.videoView.syncActiveBackendLayoutAfterTransition()
+      syncOrientationForCurrentState()
+    }
+  }
+
   override func viewSafeAreaInsetsDidChange() {
     super.viewSafeAreaInsetsDidChange()
+    syncSceneOrientationFlipIfNeeded()
     rebuildControlsIfNeeded(force: false)
   }
 
   override func viewDidLayoutSubviews() {
     super.viewDidLayoutSubviews()
+    syncSceneOrientationFlipIfNeeded()
     rebuildControlsIfNeeded(force: false)
     updateErrorDetailHeightIfNeeded()
   }
@@ -771,7 +792,10 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     }
     manualOrientationThisEpisode = false
     pipSavedOrientationStep = nil
-    staleVideoSize = controller.effectiveDisplayVideoSize
+    let curDisp = controller.effectiveDisplayVideoSize
+    if curDisp.width > 0 && curDisp.height > 0 {
+      staleVideoSize = curDisp
+    }
     guard isViewLoaded, !dismissedForPiP, !screenLocked else { return }
     if wasManual {
       if isPhone && IosPlayerUiText.effectiveOrientationMode(controller.playbackConfig) == "auto" {

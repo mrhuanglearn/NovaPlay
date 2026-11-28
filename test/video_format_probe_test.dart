@@ -1556,6 +1556,60 @@ high.m3u8
       );
       expect(dims, (width: 1080, height: 1920));
     });
+
+    test('fixed orientation mode on VLC kernel opens immediately and pushes background probed dimensions for Episode 1',
+        () async {
+      final router = PlayerSessionRouter();
+      final host = _RecordingHost();
+      final cfgStore = JsonStore('player_config.json', baseDir: dir);
+      final cfgRepo = PlayerConfigRepository(store: cfgStore);
+      final fixedVlc = defaultPlaybackConfig()
+        ..orientationMode = 'portrait'
+        ..isPriorityLandscape = false
+        ..kernel = 'vlc'
+        ..fitMode = 'zoom';
+      await cfgRepo.save(fixedVlc, defaultDanmakuConfig());
+
+      final probe = VideoFormatProbe(httpClientFactory: HttpClient.new);
+      addTearDown(probe.close);
+      final launcher = PlayerLauncher(
+        configs: cfgRepo,
+        sniffer: SnifferService(),
+        host: host,
+        router: router,
+        formatProbe: probe,
+        fastLaunchBudget: const Duration(milliseconds: 300),
+        installRouter: false,
+        enableWakelock: () async {},
+        disableWakelock: () async {},
+      );
+      final streamUrl = 'http://127.0.0.1:${mediaServer.port}/slow_vertical.m3u8';
+      final api = _DelayedPlayApi(() async => PlayResult(url: streamUrl));
+
+      // 1st open (cold cache): does not wait for the 180ms probe before openPlayerPage, then pushes 720x1280 in background.
+      final sw = Stopwatch()..start();
+      final f1 = launcher.play(site: site, api: api, detail: makeDetail('fixed_vlc_ep1'), history: history);
+      while (host.opened.isEmpty && sw.elapsedMilliseconds < 400) {
+        await Future<void>.delayed(const Duration(milliseconds: 10));
+      }
+      expect(host.opened, hasLength(1));
+      expect(sw.elapsedMilliseconds, lessThan(120), reason: 'fixed orientation mode must not block openPlayerPage on probe');
+      final open1 = host.opened.single;
+      expect(open1.initialSource?.videoWidth, isNull);
+
+      await Future<void>.delayed(const Duration(milliseconds: 220));
+      expect(host.videoSizes, [(open1.sessionId, 0, 0, 720, 1280)]);
+      await router.onPageClosed(PageClosedEvent(sessionId: open1.sessionId, positionSeconds: 2, completed: false));
+      await f1;
+
+      // 2nd open (warm probe cache): synchronously attaches 720x1280 to initialSource even in fixed orientation mode!
+      final f2 = launcher.play(site: site, api: api, detail: makeDetail('fixed_vlc_ep1_warm'), history: history);
+      await Future<void>.delayed(const Duration(milliseconds: 40));
+      expect(host.opened, hasLength(2));
+      expect((host.opened.last.initialSource?.videoWidth, host.opened.last.initialSource?.videoHeight), (720, 1280));
+      await router.onPageClosed(PageClosedEvent(sessionId: host.opened.last.sessionId, positionSeconds: 2, completed: false));
+      await f2;
+    });
   });
 }
 

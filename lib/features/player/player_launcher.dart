@@ -225,7 +225,7 @@ class PlayerLauncher {
 
       final fallbackDims = autoOrient ? await fallbackDimsFuture : null;
       var startedInitialProbe = false;
-      if (autoOrient && initialSource != null && initialSource.success) {
+      if (source.epg == null && initialSource != null && initialSource.success) {
         final url = initialSource.url?.trim() ?? '';
         if (url.isNotEmpty && (initialSource.videoWidth == null || initialSource.videoHeight == null)) {
           final cached = _formatProbe.cached(url);
@@ -233,11 +233,11 @@ class PlayerLauncher {
             initialSource.videoWidth = cached.width;
             initialSource.videoHeight = cached.height;
             source.onVideoDimensionsKnown(cached.width, cached.height);
-          } else if (fallbackDims != null) {
+          } else if (autoOrient && fallbackDims != null) {
             initialSource.videoWidth = fallbackDims.width;
             initialSource.videoHeight = fallbackDims.height;
             source.onVideoDimensionsKnown(fallbackDims.width, fallbackDims.height);
-          } else if (!VideoFormatProbe.shouldSkipProbe(url)) {
+          } else if (autoOrient && !VideoFormatProbe.shouldSkipProbe(url)) {
             startedInitialProbe = true;
             session.startInitialProbe(
               lineIndex: line,

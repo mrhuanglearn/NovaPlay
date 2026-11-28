@@ -383,14 +383,13 @@ final class IosPlayerOverlayHost {
     buildBody(stack)
     scroll.addSubview(stack)
 
-    let safeRight = isLandscape ? (containerView?.safeAreaInsets.right ?? 0) : 0
     let safeBottom = containerView?.safeAreaInsets.bottom ?? 0
     NSLayoutConstraint.activate([
       stack.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor, constant: 16),
-      stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -(16 + safeRight * 0.5)),
+      stack.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor, constant: -16),
       stack.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
       stack.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor, constant: -(20 + safeBottom)),
-      stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor, constant: -(32 + safeRight * 0.5))
+      stack.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor, constant: -32)
     ])
 
     showCustomPanel(header: header, content: scroll)
@@ -444,19 +443,19 @@ final class IosPlayerOverlayHost {
       sheet.addSubview(header)
       sheet.addSubview(content)
       NSLayoutConstraint.activate([
-        header.leadingAnchor.constraint(equalTo: sheet.leadingAnchor),
-        header.trailingAnchor.constraint(equalTo: sheet.trailingAnchor),
+        header.leadingAnchor.constraint(equalTo: sheet.safeAreaLayoutGuide.leadingAnchor),
+        header.trailingAnchor.constraint(equalTo: sheet.safeAreaLayoutGuide.trailingAnchor),
         header.topAnchor.constraint(equalTo: sheet.topAnchor),
-        content.leadingAnchor.constraint(equalTo: sheet.leadingAnchor),
-        content.trailingAnchor.constraint(equalTo: sheet.trailingAnchor),
+        content.leadingAnchor.constraint(equalTo: sheet.safeAreaLayoutGuide.leadingAnchor),
+        content.trailingAnchor.constraint(equalTo: sheet.safeAreaLayoutGuide.trailingAnchor),
         content.topAnchor.constraint(equalTo: header.bottomAnchor),
         content.bottomAnchor.constraint(equalTo: sheet.bottomAnchor)
       ])
     } else {
       sheet.addSubview(content)
       NSLayoutConstraint.activate([
-        content.leadingAnchor.constraint(equalTo: sheet.leadingAnchor),
-        content.trailingAnchor.constraint(equalTo: sheet.trailingAnchor),
+        content.leadingAnchor.constraint(equalTo: sheet.safeAreaLayoutGuide.leadingAnchor),
+        content.trailingAnchor.constraint(equalTo: sheet.safeAreaLayoutGuide.trailingAnchor),
         content.topAnchor.constraint(equalTo: sheet.topAnchor, constant: 6),
         content.bottomAnchor.constraint(equalTo: sheet.bottomAnchor)
       ])

@@ -263,10 +263,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
     if let w = payload.videoWidth, let h = payload.videoHeight, w > 0, h > 0 {
       let pSize = CGSize(width: CGFloat(w), height: CGFloat(h))
       probedVideoSize = pSize
-      if effectiveDisplayVideoSize == .zero {
-        kernel.videoView.naturalVideoSize = pSize
-      }
-      uiDelegate?.controllerDidUpdateMetrics()
+      kernel.videoView.naturalVideoSize = pSize
     }
 
     var start = pendingStartMs
@@ -288,11 +285,18 @@ final class IosPlayerController: IosPlayerKernelDelegate {
       subtitles: subs,
       autoPlay: autoPlay
     )
+    if probedVideoSize.width > 0 && probedVideoSize.height > 0 {
+      if effectiveDisplayVideoSize == .zero && kernel.videoView.naturalVideoSize != probedVideoSize {
+        kernel.videoView.naturalVideoSize = probedVideoSize
+      }
+      uiDelegate?.controllerDidUpdateMetrics()
+    }
   }
 
   /// Display-oriented decoded video dimensions, preferring container-rotated `probedVideoSize` when `MobileVLCKit`
   /// reports unrotated coded dimensions that are an exact 90°/270° transpose.
   var effectiveDisplayVideoSize: CGSize {
+    guard !resolvingSource else { return .zero }
     let kSize = kernel.videoSize
     guard kSize.width > 0 && kSize.height > 0 else { return .zero }
     if kernel.isUsingVlc,
@@ -323,7 +327,7 @@ final class IosPlayerController: IosPlayerKernelDelegate {
             width > 0,
             height > 0 else { return }
       let nextProbed = CGSize(width: CGFloat(width), height: CGFloat(height))
-      let kSize = self.kernel.videoSize
+      let kSize = self.resolvingSource ? .zero : self.kernel.videoSize
       let isVlcTranspose = self.kernel.isUsingVlc
         && kSize.width > 0
         && kSize.height > 0

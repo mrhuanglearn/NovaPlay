@@ -177,7 +177,9 @@ class PlayerSession implements NativePlayerFlutterApi {
       _pendingProbedDims = null;
     } else if (_initialProbe == null &&
         source.epg == null &&
-        (playback.orientationMode == 'auto' || (playback.orientationMode == null && playback.isPriorityLandscape)) &&
+        (playback.orientationMode == 'auto' ||
+            (playback.orientationMode == null && playback.isPriorityLandscape) ||
+            playback.kernel.trim().toLowerCase() == 'vlc') &&
         initialSource != null &&
         initialSource.success &&
         (initialSource.url?.trim().isNotEmpty ?? false)) {

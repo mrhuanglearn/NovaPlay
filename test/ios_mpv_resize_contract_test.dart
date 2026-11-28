@@ -132,10 +132,27 @@ assert obj[out_stroff + syms["_ra_ctx_vulkan_moltenvk"][3]:out_stroff + syms["_r
     expect(cycleBlock, contains('else if let inflight = inFlightGeometryStep'));
 
     final ctrlSwift = File('packages/novaplay_ios/ios/Classes/Player/IosPlayerController.swift').readAsStringSync();
+    final panelsSwift = File('packages/novaplay_ios/ios/Classes/Player/IosPlayerPanels.swift').readAsStringSync();
     expect(ctrlSwift, contains('kernel.videoView.naturalVideoSize = kSize'));
     expect(ctrlSwift, contains('kernel.videoView.naturalVideoSize = .zero'));
+
+    final effSizeStart = ctrlSwift.indexOf('var effectiveDisplayVideoSize: CGSize {');
+    expect(effSizeStart, greaterThanOrEqualTo(0));
+    expect(ctrlSwift.substring(effSizeStart, effSizeStart + 180), contains('guard !resolvingSource else { return .zero }'));
+
+    final loadPayloadStart = ctrlSwift.indexOf('private func loadPayload(');
+    expect(loadPayloadStart, greaterThanOrEqualTo(0));
+    expect(effSizeStart, greaterThan(loadPayloadStart));
+    final loadPayloadBlock = ctrlSwift.substring(loadPayloadStart, effSizeStart);
+    final kernelLoadIdx = loadPayloadBlock.indexOf('kernel.load(');
+    final postLoadMetricsIdx = loadPayloadBlock.indexOf('uiDelegate?.controllerDidUpdateMetrics()');
+    expect(kernelLoadIdx, greaterThan(0));
+    expect(postLoadMetricsIdx, greaterThan(kernelLoadIdx));
+
     expect(vcSwift, contains('if overlayHost.isMenuOpen {'));
-    expect(vcSwift, contains('if overlayHost.isPanelOpen && (size.width > size.height) != (view.bounds.width > view.bounds.height)'));
+    expect(vcSwift, contains('if overlayHost.isPanelOpen && size != view.bounds.size {'));
+    expect(vcSwift, contains('private func syncSceneOrientationFlipIfNeeded()'));
+    expect(panelsSwift, contains('sheet.safeAreaLayoutGuide.trailingAnchor'));
   });
 
   test('uzv_moltenvk_resize_shim C state machine handles stale extent, 1x1 init, 1px rounding, and concurrent notify race', () async {

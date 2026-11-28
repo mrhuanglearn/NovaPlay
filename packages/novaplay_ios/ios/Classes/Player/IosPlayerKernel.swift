@@ -1395,7 +1395,9 @@ final class IosPlayerKernel: NSObject, AVPictureInPictureControllerDelegate, Ios
       let sz = player.videoSize
       if sz.width > 0 && sz.height > 0 && sz != videoSize {
         videoSize = sz
-        videoView.naturalVideoSize = sz
+        if delegate == nil {
+          videoView.naturalVideoSize = sz
+        }
       }
     }
     let now = CACurrentMediaTime()
@@ -2627,7 +2629,9 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
         let sz = player.videoSize
         if sz.width > 0 && sz.height > 0 && sz != self.videoSize {
           self.videoSize = sz
-          self.videoView.naturalVideoSize = sz
+          if self.delegate == nil {
+            self.videoView.naturalVideoSize = sz
+          }
         }
         self.refreshVlcTracksCache()
         self.updateState("playing")
@@ -2695,7 +2699,9 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
         let sz = player.videoSize
         if sz.width > 0 && sz.height > 0 && sz != self.videoSize {
           self.videoSize = sz
-          self.videoView.naturalVideoSize = sz
+          if self.delegate == nil {
+            self.videoView.naturalVideoSize = sz
+          }
         }
         self.refreshVlcTracksCache()
         self.delegate?.kernelDidUpdateMetrics()
@@ -2719,7 +2725,9 @@ extension IosPlayerKernel: VLCMediaPlayerDelegate {
       let sz = player.videoSize
       if sz.width > 0 && sz.height > 0 && sz != self.videoSize {
         self.videoSize = sz
-        self.videoView.naturalVideoSize = sz
+        if self.delegate == nil {
+          self.videoView.naturalVideoSize = sz
+        }
       }
       if self.state == "buffering" && player.isPlaying && !self.isSeeking {
         self.updateState("playing")
