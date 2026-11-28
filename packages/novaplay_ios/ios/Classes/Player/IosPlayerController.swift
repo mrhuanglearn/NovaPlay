@@ -838,6 +838,9 @@ final class IosPlayerController: IosPlayerKernelDelegate {
 
   func kernelDidUpdateMetrics() {
     let kSize = effectiveDisplayVideoSize
+    if kSize.width > 0 && kSize.height > 0 && kernel.videoView.naturalVideoSize != kSize {
+      kernel.videoView.naturalVideoSize = kSize
+    }
     if !resolvingSource && kSize.width > 0 && kSize.height > 0 && kSize != lastReportedDecodedSize {
       lastReportedDecodedSize = kSize
       flutterApi.onVideoSizeDetected(

@@ -187,8 +187,21 @@ final class PlayerVideoContainerView: UIView {
   func syncActiveBackendLayoutAfterTransition() {
     setNeedsLayout()
     layoutIfNeeded()
+    CATransaction.begin()
+    CATransaction.setDisableActions(true)
+    avLayerView.frame = bounds
+    CATransaction.commit()
     applyFitLayout()
     mpvMetalView.syncDrawableSizeIfNeeded(forceNotify: activeBackend == "mpv")
+    if activeBackend == "vlc" {
+      vlcDrawableView.setNeedsLayout()
+      vlcDrawableView.layoutIfNeeded()
+      for sub in vlcDrawableView.subviews {
+        sub.frame = vlcDrawableView.bounds
+        sub.setNeedsLayout()
+        sub.layoutIfNeeded()
+      }
+    }
   }
 
   fileprivate func applyFitLayout() {

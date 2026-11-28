@@ -613,11 +613,26 @@ def maybe_build_moltenvk_resize_shim(libmpv_archive, sdk_path):
     shim_m = work_dir / "uzv_moltenvk_resize_shim.m"
     shim_o = work_dir / "uzv_moltenvk_resize_shim.o"
     shim_m.write_text(
-        """#import <QuartzCore/QuartzCore.h>
+        """#ifdef __OBJC__
+#import <QuartzCore/QuartzCore.h>
+typedef CAMetalLayer UzvMetalLayerRef;
+static void uzv_query_metal_drawable_size(UzvMetalLayerRef *layer, double *out_w, double *out_h) {
+    CGSize s = [layer drawableSize];
+    *out_w = (double)s.width;
+    *out_h = (double)s.height;
+}
+#else
+typedef void UzvMetalLayerRef;
+extern void uzv_test_query_metal_drawable_size(UzvMetalLayerRef *layer, double *out_w, double *out_h);
+static void uzv_query_metal_drawable_size(UzvMetalLayerRef *layer, double *out_w, double *out_h) {
+    uzv_test_query_metal_drawable_size(layer, out_w, out_h);
+}
+#endif
 #include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 struct ra_ctx;
@@ -634,26 +649,29 @@ extern void vo_wakeup(struct vo *vo);
 #define UZV_VO_EVENT_EXPOSE (1 << 0)
 #define UZV_VO_EVENT_RESIZE (1 << 1)
 #define UZV_MAX_SLOTS 16
+#define UZV_MAX_EXTENT_RETRIES 8
 
 typedef struct {
     struct ra_ctx *ctx;
     struct vo *vo;
     int64_t wid;
+    uint64_t notify_seq;
     int last_w;
     int last_h;
     int notified_w;
     int notified_h;
+    int pending_retries;
     bool force_resize;
 } UzvMoltenvkSlot;
 
 static pthread_mutex_t g_shim_lock = PTHREAD_MUTEX_INITIALIZER;
 static UzvMoltenvkSlot g_slots[UZV_MAX_SLOTS];
 
-static CAMetalLayer *uzv_ctx_layer(struct ra_ctx *ctx) {
+static UzvMetalLayerRef *uzv_ctx_layer(struct ra_ctx *ctx) {
     if (!ctx) return NULL;
     void *priv = *(void * const *)((const char *)ctx + UZV_RA_CTX_PRIV_OFFSET);
     if (!priv) return NULL;
-    return *(CAMetalLayer * const *)((const char *)priv + UZV_PRIV_LAYER_OFFSET);
+    return *(UzvMetalLayerRef * const *)((const char *)priv + UZV_PRIV_LAYER_OFFSET);
 }
 
 static struct vo *uzv_ctx_vo(struct ra_ctx *ctx) {
@@ -670,12 +688,14 @@ static void uzv_read_layer_drawable_size(
 ) {
     int w = 0;
     int h = 0;
-    CAMetalLayer *layer = uzv_ctx_layer(ctx);
+    UzvMetalLayerRef *layer = uzv_ctx_layer(ctx);
     if (layer != NULL) {
-        CGSize s = [layer drawableSize];
-        if (isfinite(s.width) && isfinite(s.height)) {
-            w = (int)llround(s.width);
-            h = (int)llround(s.height);
+        double sw = 0.0;
+        double sh = 0.0;
+        uzv_query_metal_drawable_size(layer, &sw, &sh);
+        if (isfinite(sw) && isfinite(sh)) {
+            w = (int)llround(sw);
+            h = (int)llround(sh);
         }
     }
     if ((w <= 1 || h <= 1) && fallback_w > 1 && fallback_h > 1) {
@@ -695,6 +715,7 @@ static bool uzv_sync_ctx_size(struct ra_ctx *ctx, bool is_reconfig, bool *out_re
     int prev_w = 0;
     int prev_h = 0;
     bool forced = false;
+    uint64_t seq_before = 0;
 
     pthread_mutex_lock(&g_shim_lock);
     for (int i = 0; i < UZV_MAX_SLOTS; i++) {
@@ -704,6 +725,7 @@ static bool uzv_sync_ctx_size(struct ra_ctx *ctx, bool is_reconfig, bool *out_re
             prev_w = g_slots[i].last_w;
             prev_h = g_slots[i].last_h;
             forced = g_slots[i].force_resize;
+            seq_before = g_slots[i].notify_seq;
             break;
         }
     }
@@ -717,33 +739,75 @@ static bool uzv_sync_ctx_size(struct ra_ctx *ctx, bool is_reconfig, bool *out_re
     }
 
     struct vo *vo = uzv_ctx_vo(ctx);
+    bool size_changed = (prev_w <= 1) || (prev_h <= 1) || (abs(w - prev_w) > 2) || (abs(h - prev_h) > 2);
+    bool need_resize = is_reconfig || forced || size_changed;
+    if (!need_resize) {
+        if (vo != NULL) {
+            int cur_dw = *(const int *)((const char *)vo + UZV_VO_DWIDTH_OFFSET);
+            int cur_dh = *(const int *)((const char *)vo + UZV_VO_DWIDTH_OFFSET + 4);
+            if (cur_dw <= 1 || cur_dh <= 1) {
+                *(int *)((char *)vo + UZV_VO_DWIDTH_OFFSET) = w;
+                *(int *)((char *)vo + UZV_VO_DWIDTH_OFFSET + 4) = h;
+            }
+        }
+        return true;
+    }
+
     if (vo != NULL) {
         *(int *)((char *)vo + UZV_VO_DWIDTH_OFFSET) = w;
         *(int *)((char *)vo + UZV_VO_DWIDTH_OFFSET + 4) = h;
     }
 
-    bool need_resize = is_reconfig || forced || (w != prev_w) || (h != prev_h);
-    if (!need_resize) {
-        return true;
-    }
-
     bool ok = ra_vk_ctx_resize(ctx, w, h);
+    int actual_w = w;
+    int actual_h = h;
     if (vo != NULL) {
         int rw = *(const int *)((const char *)vo + UZV_VO_DWIDTH_OFFSET);
         int rh = *(const int *)((const char *)vo + UZV_VO_DWIDTH_OFFSET + 4);
+        actual_w = rw;
+        actual_h = rh;
         if (rw <= 1 || rh <= 1) {
             *(int *)((char *)vo + UZV_VO_DWIDTH_OFFSET) = w;
             *(int *)((char *)vo + UZV_VO_DWIDTH_OFFSET + 4) = h;
         }
     }
 
+    bool extent_settled = ok && actual_w > 1 && actual_h > 1
+        && abs(actual_w - w) <= 2 && abs(actual_h - h) <= 2;
+
     if (ok) {
         pthread_mutex_lock(&g_shim_lock);
         for (int i = 0; i < UZV_MAX_SLOTS; i++) {
             if (g_slots[i].ctx == ctx) {
-                g_slots[i].last_w = w;
-                g_slots[i].last_h = h;
-                g_slots[i].force_resize = false;
+                if (extent_settled) {
+                    g_slots[i].last_w = w;
+                    g_slots[i].last_h = h;
+                    if (g_slots[i].notify_seq == seq_before) {
+                        g_slots[i].pending_retries = 0;
+                        g_slots[i].force_resize = false;
+                    } else {
+                        g_slots[i].force_resize = true;
+                    }
+                } else {
+                    if (actual_w > 1 && actual_h > 1) {
+                        g_slots[i].last_w = actual_w;
+                        g_slots[i].last_h = actual_h;
+                    }
+                    if (g_slots[i].notify_seq != seq_before) {
+                        g_slots[i].force_resize = true;
+                    } else if (g_slots[i].pending_retries > 0) {
+                        g_slots[i].pending_retries -= 1;
+                        g_slots[i].force_resize = (g_slots[i].pending_retries > 0);
+                        if (!g_slots[i].force_resize) {
+                            g_slots[i].last_w = w;
+                            g_slots[i].last_h = h;
+                        }
+                    } else {
+                        g_slots[i].force_resize = false;
+                        g_slots[i].last_w = w;
+                        g_slots[i].last_h = h;
+                    }
+                }
                 break;
             }
         }
@@ -751,7 +815,7 @@ static bool uzv_sync_ctx_size(struct ra_ctx *ctx, bool is_reconfig, bool *out_re
     }
 
     if (out_resized) {
-        *out_resized = ok && (forced || w != prev_w || h != prev_h);
+        *out_resized = ok && (forced || size_changed || actual_w != prev_w || actual_h != prev_h);
     }
     return ok;
 }
@@ -763,7 +827,7 @@ static bool uzv_shim_moltenvk_init(struct ra_ctx *ctx) {
         return false;
     }
 
-    CAMetalLayer *layer = uzv_ctx_layer(ctx);
+    UzvMetalLayerRef *layer = uzv_ctx_layer(ctx);
     int64_t wid = (int64_t)(intptr_t)layer;
     struct vo *vo = uzv_ctx_vo(ctx);
 
@@ -792,6 +856,7 @@ static bool uzv_shim_moltenvk_init(struct ra_ctx *ctx) {
     slot->wid = wid;
     slot->last_w = 0;
     slot->last_h = 0;
+    slot->pending_retries = UZV_MAX_EXTENT_RETRIES;
     slot->force_resize = true;
     pthread_mutex_unlock(&g_shim_lock);
 
@@ -816,6 +881,15 @@ static void uzv_shim_moltenvk_uninit(struct ra_ctx *ctx) {
 }
 
 static bool uzv_shim_moltenvk_reconfig(struct ra_ctx *ctx) {
+    pthread_mutex_lock(&g_shim_lock);
+    for (int i = 0; i < UZV_MAX_SLOTS; i++) {
+        if (g_slots[i].ctx == ctx) {
+            g_slots[i].pending_retries = UZV_MAX_EXTENT_RETRIES;
+            g_slots[i].force_resize = true;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&g_shim_lock);
     (void)uzv_sync_ctx_size(ctx, true, NULL);
     return true;
 }
@@ -846,8 +920,10 @@ void mpv_novaplay_notify_layer_resized(int64_t wid, int32_t width, int32_t heigh
     for (int i = 0; i < UZV_MAX_SLOTS; i++) {
         if (g_slots[i].wid == wid) {
             matched = &g_slots[i];
+            matched->notify_seq += 1;
             matched->notified_w = (int)width;
             matched->notified_h = (int)height;
+            matched->pending_retries = UZV_MAX_EXTENT_RETRIES;
             matched->force_resize = true;
             if (matched->vo != NULL) {
                 vo_wakeup(matched->vo);
@@ -858,8 +934,10 @@ void mpv_novaplay_notify_layer_resized(int64_t wid, int32_t width, int32_t heigh
         for (int i = 0; i < UZV_MAX_SLOTS; i++) {
             if (g_slots[i].ctx == NULL && g_slots[i].wid == 0) {
                 g_slots[i].wid = wid;
+                g_slots[i].notify_seq = 1;
                 g_slots[i].notified_w = (int)width;
                 g_slots[i].notified_h = (int)height;
+                g_slots[i].pending_retries = UZV_MAX_EXTENT_RETRIES;
                 g_slots[i].force_resize = true;
                 break;
             }

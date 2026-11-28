@@ -606,9 +606,16 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
   private func cycleOrientationStep() {
     manualOrientationThisEpisode = true
     pipSavedOrientationStep = nil
-    let actual = view.window?.windowScene?.interfaceOrientation
-      ?? (view.bounds.width > view.bounds.height ? .landscapeRight : .portrait)
-    switch actual {
+    let baseOrient: UIInterfaceOrientation
+    if isTransitioningOrientation {
+      baseOrient = orientationStep.legacyOrientation(preferring: UIDevice.current.orientation)
+    } else if let inflight = inFlightGeometryStep, CACurrentMediaTime() < inFlightGeometryUntil {
+      baseOrient = inflight.legacyOrientation(preferring: UIDevice.current.orientation)
+    } else {
+      baseOrient = view.window?.windowScene?.interfaceOrientation
+        ?? (view.bounds.width > view.bounds.height ? .landscapeRight : .portrait)
+    }
+    switch baseOrient {
     case .landscapeRight:
       orientationStep = .landscapeLeft
     case .landscapeLeft:
@@ -740,11 +747,12 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
         desired = .sensorLandscape
       }
     }
+    orientationStep = desired
+    guard !dismissedForPiP, !isBeingDismissed, !isExitingPlayer else { return }
     let currentlyLandscape = view.bounds.width > view.bounds.height
     if desired != .all && desired.isLandscapeTarget != currentlyLandscape && overlayHost.isPanelOpen {
       overlayHost.closePanel()
     }
-    orientationStep = desired
     applyOrientationStep()
   }
 
@@ -2689,6 +2697,9 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
     controller.kernel.setAutomaticPipInlineAllowed(true)
     NativePlayerHost.shared.syncIdleTimer(forceReassert: true)
     if presentingViewController != nil {
+      view.setNeedsLayout()
+      view.layoutIfNeeded()
+      controller.kernel.videoView.syncActiveBackendLayoutAfterTransition()
       syncOrientationForCurrentState(ignoreOverlay: true, applyNow: true)
       completion(true)
       return
@@ -2699,7 +2710,12 @@ final class NativePlayerViewController: UIViewController, IosPlayerControllerUiD
       return
     }
     top.present(self, animated: false) { [weak self] in
-      self?.syncOrientationForCurrentState(ignoreOverlay: true, applyNow: true)
+      if let self = self {
+        self.view.setNeedsLayout()
+        self.view.layoutIfNeeded()
+        self.controller.kernel.videoView.syncActiveBackendLayoutAfterTransition()
+        self.syncOrientationForCurrentState(ignoreOverlay: true, applyNow: true)
+      }
       completion(true)
     }
   }
