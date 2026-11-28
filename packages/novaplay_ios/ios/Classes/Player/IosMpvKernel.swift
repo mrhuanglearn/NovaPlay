@@ -6,26 +6,13 @@ import UIKit
 
 private let mpvUsbLog = Logger(subsystem: "app.novaplay.player", category: "mpv")
 
-/// `CAMetalLayer` subclass guarding against MoltenVK 1x1 drawable clobbers and off-main-thread EDR mutations.
+/// `CAMetalLayer` subclass guarding against MoltenVK 1x1 drawable clobbers.
 private final class NovaMpvMetalLayer: CAMetalLayer {
   override var drawableSize: CGSize {
     get { super.drawableSize }
     set {
       guard newValue.width > 1, newValue.height > 1 else { return }
       super.drawableSize = newValue
-    }
-  }
-
-  override var wantsExtendedDynamicRangeContent: Bool {
-    get { super.wantsExtendedDynamicRangeContent }
-    set {
-      if Thread.isMainThread {
-        super.wantsExtendedDynamicRangeContent = newValue
-      } else {
-        DispatchQueue.main.async {
-          super.wantsExtendedDynamicRangeContent = newValue
-        }
-      }
     }
   }
 }
